@@ -35,6 +35,10 @@ public enum QTaskLifecycleEventType: String, Codable, Sendable, Equatable {
     /// recorded via `modelAttemptRecorded`). Payload carries only counts/booleans/the early-exit
     /// reason's own raw value. Advisory/observability only.
     case modelOrchestrationCompleted = "task.model.orchestration.completed"
+    /// Phase 2C: the evidence → verification → critic → synthesis pipeline finished evaluating a
+    /// goal-evaluation result. Payload is `QEvidenceOutcomeMetadata.auditPayload` — enums and counts
+    /// only, never claim/evidence text, prompts, or responses. Advisory/observability only.
+    case evidenceEvaluated = "task.evidence.evaluated"
     case taskPaused = "task.paused"
     case taskResumed = "task.resumed"
     case taskCompleted = "task.completed"

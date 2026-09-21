@@ -296,6 +296,9 @@ public final class QCoreRuntime: @unchecked Sendable {
 
         // 5. Generate Initial Structured Plan
         var currentPlan: QPlan
+        // Phase 2C: the Phase 2B attempt record, kept so the post-execution evidence evaluation
+        // can bridge candidate identity into the Evidence Pool (identity/outcome only).
+        var orchestrationAttempts: [QModelAttempt] = []
         budget.recordModelCall()
         durableState.budget = budget
 
@@ -317,6 +320,7 @@ public final class QCoreRuntime: @unchecked Sendable {
                     modelProvider: candidateAwareModel
                 )
 
+                orchestrationAttempts = orchestrationResult.attempts
                 for orchestrationAttempt in orchestrationResult.attempts {
                     try? durableStore?.recordEvent(
                         QTaskLifecycleEvent(
@@ -586,6 +590,14 @@ public final class QCoreRuntime: @unchecked Sendable {
                     provenance: goalEvaluation.provenance,
                     executionSummary: goalEvaluation.explanation
                 )
+            )
+
+            await recordEvidenceEvaluation(
+                task: task,
+                sessionId: sessionId,
+                decisionPlan: decisionPlan,
+                goalEvaluation: goalEvaluation,
+                candidateAttempts: orchestrationAttempts
             )
 
             // Case A: Goal Satisfied -> Synthesize grounded success summary
@@ -1162,6 +1174,50 @@ public final class QCoreRuntime: @unchecked Sendable {
             try? durableStore?.saveTask(updatedDurable)
             return task
         }
+    }
+
+    // MARK: - Evidence Evaluation (Phase 2C, observe-only)
+
+    /// Runs the Phase 2C evidence pipeline over what this iteration already established and records
+    /// ONLY its audit-safe outcome metadata as a lifecycle event. Strictly observational: the
+    /// pipeline's result is never consulted to decide anything — task state, permissions, egress,
+    /// resources, approvals, replanning and completion are all decided by the unchanged
+    /// `QGoalEvaluator`/`QPlanExecutor`/`QPermissionGate`/`QResourceGuard`/`QActionVerifier` path
+    /// above. The goal evaluator's state is an execution observation (`trusted:system`); its
+    /// evidence strings live only in the transient in-memory pool as bounded, credential-screened
+    /// claims and are never persisted — only `QEvidenceOutcomeMetadata` (enums and counts) is.
+    private func recordEvidenceEvaluation(
+        task: QTask,
+        sessionId: String,
+        decisionPlan: QDecisionPlan,
+        goalEvaluation: QGoalEvaluation,
+        candidateAttempts: [QModelAttempt]
+    ) async {
+        var observations = [
+            QEvidenceObservation(sourceId: "goal-evaluator", subject: "goal.state", value: goalEvaluation.state.rawValue)
+        ]
+        for (index, evidenceText) in goalEvaluation.evidence.prefix(QEvidenceLimits.maxClaimsPerEvidenceItem).enumerated() {
+            observations.append(
+                QEvidenceObservation(sourceId: "goal-evidence-\(index)", subject: "execution.evidence.\(index)", value: String(evidenceText.prefix(QEvidenceLimits.maxClaimValueCharacters)))
+            )
+        }
+
+        let pipelineResult = await QEvidencePipeline().run(
+            QEvidencePipelineInput(
+                taskId: task.taskId,
+                decisionPlan: decisionPlan,
+                candidateAttempts: candidateAttempts,
+                observations: observations
+            )
+        )
+        try? durableStore?.recordEvent(
+            QTaskLifecycleEvent(
+                taskId: task.taskId,
+                sessionId: sessionId,
+                eventType: .evidenceEvaluated,
+                payload: pipelineResult.metadata.auditPayload
+            )
+        )
     }
 
     private func updateTask(_ task: QTask) {
