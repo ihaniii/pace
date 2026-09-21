@@ -28,9 +28,16 @@ import Foundation
 /// Phase 2E). Memory write-back inside it defaults to disabled.
 public struct QVerifiedResponseConfiguration: Sendable, Equatable {
     public let writeBack: QVerifiedMemoryWriteBackConfiguration
+    /// Second slice: whether to ask the model for a claims-only answer (default OFF; see
+    /// `QStructuredAnswer.swift`). Source-compatible: existing initializer calls are unchanged.
+    public let structuredAnswer: QStructuredAnswerConfiguration
 
-    public init(writeBack: QVerifiedMemoryWriteBackConfiguration = .disabled) {
+    public init(
+        writeBack: QVerifiedMemoryWriteBackConfiguration = .disabled,
+        structuredAnswer: QStructuredAnswerConfiguration = .disabled
+    ) {
         self.writeBack = writeBack
+        self.structuredAnswer = structuredAnswer
     }
 }
 

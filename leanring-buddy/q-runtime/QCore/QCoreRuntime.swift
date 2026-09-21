@@ -325,6 +325,11 @@ public final class QCoreRuntime: @unchecked Sendable {
         // plan was executed; later replan iterations use non-orchestrated planning and are not
         // attributed to it.
         var outcomeLearningRecorded = false
+        // Phase 3 second slice: the claims-only answer is requested at most ONCE per task (on the
+        // first goal evaluation) and reused, transiently, for later iterations of the same task.
+        var structuredAnswerAttempted = false
+        var structuredAnswerResult: QEvidenceModelResult?
+        var structuredAnswerState: QStructuredAnswerState = .notConfigured
         lock.lock()
         let activeCapabilityMemory = capabilityMemory
         lock.unlock()
@@ -644,12 +649,19 @@ public final class QCoreRuntime: @unchecked Sendable {
                 )
             )
 
+            if !structuredAnswerAttempted {
+                structuredAnswerAttempted = true
+                (structuredAnswerResult, structuredAnswerState) = await requestStructuredAnswer(task: task, decisionPlan: decisionPlan, model: model)
+            }
+
             let evidenceMetadata = await recordEvidenceEvaluation(
                 task: task,
                 sessionId: sessionId,
                 decisionPlan: decisionPlan,
                 goalEvaluation: goalEvaluation,
-                candidateAttempts: orchestrationAttempts
+                candidateAttempts: orchestrationAttempts,
+                structuredAnswer: structuredAnswerResult,
+                structuredAnswerState: structuredAnswerState
             )
 
             if !outcomeLearningRecorded, let activeCapabilityMemory, !orchestrationAttempts.isEmpty {
@@ -1266,7 +1278,9 @@ public final class QCoreRuntime: @unchecked Sendable {
         sessionId: String,
         decisionPlan: QDecisionPlan,
         goalEvaluation: QGoalEvaluation,
-        candidateAttempts: [QModelAttempt]
+        candidateAttempts: [QModelAttempt],
+        structuredAnswer: QEvidenceModelResult?,
+        structuredAnswerState: QStructuredAnswerState
     ) async -> QEvidenceOutcomeMetadata {
         var observations = [
             QEvidenceObservation(sourceId: "goal-evaluator", subject: "goal.state", value: goalEvaluation.state.rawValue)
@@ -1293,7 +1307,10 @@ public final class QCoreRuntime: @unchecked Sendable {
                 payload: pipelineResult.metadata.auditPayload
             )
         )
-        recordVerifiedResponse(from: pipelineResult, task: task, sessionId: sessionId)
+        await recordVerifiedResponse(
+            from: pipelineResult, task: task, sessionId: sessionId, decisionPlan: decisionPlan, observations: observations,
+            structuredAnswer: structuredAnswer, structuredAnswerState: structuredAnswerState
+        )
         return pipelineResult.metadata
     }
 
@@ -1305,16 +1322,36 @@ public final class QCoreRuntime: @unchecked Sendable {
     /// only if write-back was explicitly enabled AND the memory provider can store verified
     /// propositions — writes the independently verified ones. Nothing here changes task state or any
     /// authority; a missing/incapable memory provider simply means nothing is written.
-    private func recordVerifiedResponse(from pipelineResult: QEvidencePipelineResult, task: QTask, sessionId: String) {
+    private func recordVerifiedResponse(
+        from primaryResult: QEvidencePipelineResult,
+        task: QTask,
+        sessionId: String,
+        decisionPlan: QDecisionPlan,
+        observations: [QEvidenceObservation],
+        structuredAnswer: QEvidenceModelResult?,
+        structuredAnswerState: QStructuredAnswerState
+    ) async {
         lock.lock()
         let configuration = verifiedResponseConfiguration
         let memory = memoryProvider
         lock.unlock()
         guard let configuration else { return }
 
+        // The claims-only answer (if any) is evaluated in its OWN pipeline run. The primary run above
+        // — whose metadata feeds outcome learning — is deliberately left untouched, so unverified
+        // model claims can never change what capability memory learns.
+        var pipelineResult = primaryResult
+        if let structuredAnswer {
+            pipelineResult = await QEvidencePipeline().run(
+                QEvidencePipelineInput(taskId: task.taskId, decisionPlan: decisionPlan, modelResults: [structuredAnswer], observations: observations)
+            )
+        }
+
         let now = Date()
         let response = QVerifiedResponseAssembler.assemble(from: pipelineResult, now: now)
         var payload = response.auditPayload
+        payload["structuredAnswer"] = structuredAnswerState.rawValue
+        payload["answerClaimCount"] = "\(pipelineResult.pool.claims.filter { $0.originKind == .modelGenerated }.count)"
 
         var writeBackReport = QVerifiedWriteBackReport(isEnabled: false)
         if configuration.writeBack.isEnabled, let store = memory as? QVerifiedPropositionStoring {
@@ -1334,6 +1371,46 @@ public final class QCoreRuntime: @unchecked Sendable {
         try? durableStore?.recordEvent(
             QTaskLifecycleEvent(taskId: task.taskId, sessionId: sessionId, eventType: .responseAssembled, payload: payload)
         )
+    }
+
+    /// Phase 3 second slice: at most one bounded, claims-only local model call — only when the
+    /// structured answer path was explicitly enabled, the task is a non-execution type, and the
+    /// model provider offers it. It runs after execution/goal evaluation have already decided and
+    /// can only ADD (untrusted, unverified) claims to a separate evidence pool: every failure mode
+    /// yields "no answer", never a fabricated one, and nothing here touches task state or any authority.
+    private func requestStructuredAnswer(
+        task: QTask,
+        decisionPlan: QDecisionPlan,
+        model: QModelProvider
+    ) async -> (QEvidenceModelResult?, QStructuredAnswerState) {
+        lock.lock()
+        let configuration = verifiedResponseConfiguration?.structuredAnswer
+        lock.unlock()
+        guard let configuration, configuration.isEnabled else { return (nil, .notConfigured) }
+        guard QStructuredAnswerPolicy.isEligible(decisionPlan) else { return (nil, .notEligible) }
+        guard let provider = model as? QStructuredAnswerProvider else { return (nil, .providerUnsupported) }
+
+        let timeout = configuration.effectiveTimeoutSeconds
+        let outcome = await QEvidenceAsync.run(timeout: timeout) {
+            try await provider.generateStructuredAnswer(for: task, decisionPlan: decisionPlan, timeoutSeconds: timeout)
+        }
+        switch outcome {
+        case .value(let draft):
+            let boundedText = QStructuredAnswerPolicy.bounded(draft.outputText)
+            guard !boundedText.isEmpty else { return (nil, .empty) }
+            return (
+                QEvidenceModelResult(
+                    attemptId: QModelAttemptID(rawValue: "\(task.taskId)-answer-\(draft.backend.rawValue)"),
+                    candidateId: QModelCandidateID(backend: draft.backend),
+                    backend: draft.backend,
+                    outputText: boundedText
+                ),
+                .obtained
+            )
+        case .timedOut: return (nil, .timedOut)
+        case .cancelled: return (nil, .cancelled)
+        case .failed: return (nil, .unavailable)
+        }
     }
 
     /// The most recent verified response rendered for `taskId`, if a verified-response configuration
