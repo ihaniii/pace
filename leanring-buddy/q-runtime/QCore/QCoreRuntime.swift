@@ -194,13 +194,120 @@ public final class QCoreRuntime: @unchecked Sendable {
             memoryContext = contexts.joined(separator: "\n")
         }
 
+        // 4b. Decision Engine & Task Decomposition (Phase 2A.4)
+        //
+        // Decision Engine ≠ Model Router: this computes ADVISORY strategy context only — what
+        // kind of task this is, how complex, whether it needs decomposition — never which
+        // concrete model/backend runs inference (QModelRouter's own priorityOrder/
+        // selectBestBackend remain entirely untouched and authoritative) and never a permission,
+        // resource, or egress grant (QPermissionGate/QResourceGuard/QEgressBroker remain the sole
+        // authorities, entirely untouched below). Computed once, here, before planning begins —
+        // never mid-execution — using the same canonical `task` this function already built.
+        // Scope note: only the INITIAL plan generation below consults a decision plan; replan
+        // iterations (case .allow further down) intentionally keep calling the existing 3-arg
+        // `generateStructuredPlan(for:memoryContext:failureContext:)` unchanged, keeping this
+        // integration's blast radius to the smallest point that satisfies Phase 2A.4.
+        let decisionPlan = QDeterministicDecisionEngine().decide(for: task)
+        try? durableStore?.recordEvent(
+            QTaskLifecycleEvent(
+                taskId: task.taskId,
+                sessionId: sessionId,
+                eventType: .decisionEvaluated,
+                payload: [
+                    "taskType": decisionPlan.taskType.rawValue,
+                    "complexity": decisionPlan.complexity.rawValue,
+                    "modelStrategy": decisionPlan.modelStrategy.rawValue,
+                    "verificationRequirement": decisionPlan.verificationRequirement.rawValue,
+                    "provenanceRequirement": decisionPlan.provenanceRequirement.rawValue,
+                    "uncertainty": decisionPlan.uncertainty.rawValue,
+                    "reasoningStepBudget": "\(decisionPlan.reasoningStepBudget)"
+                ]
+            )
+        )
+
+        switch decisionPlan.decompositionDecision {
+        case .notRequired:
+            break
+
+        case .recommended(let maximumSubtasks):
+            // Not mandatory: the existing runtime has no mechanism to execute bounded subtasks
+            // yet (QPlan/QPlanStep is a single flat step list with no parent/child concept — see
+            // QPlan.swift), so per Phase 2A.4's explicit spec this preserves the original task
+            // and only RECORDS that decomposition was recommended but not executed. No fabricated
+            // execution, no invented subtask scheduler.
+            let decomposition = QDeterministicTaskDecomposer().decompose(task: task, decisionPlan: decisionPlan)
+            let validation = decomposition.validate(maximumSubtasks: maximumSubtasks)
+            let decompositionStatus: String
+            switch validation {
+            case .success:
+                decompositionStatus = "recommendedNotExecuted"
+            case .failure:
+                decompositionStatus = "recommendedInvalidSkipped"
+            }
+            try? durableStore?.recordEvent(
+                QTaskLifecycleEvent(
+                    taskId: task.taskId,
+                    sessionId: sessionId,
+                    eventType: .decisionEvaluated,
+                    payload: [
+                        "decompositionStatus": decompositionStatus,
+                        "subtaskCount": "\(decomposition.subtasks.count)"
+                    ]
+                )
+            )
+
+        case .required(let maximumSubtasks):
+            // FAIL CLOSED (Phase 2A.4 explicit spec): decomposition is mandatory for this task,
+            // but there is no existing, safe way for QPlanExecutor to represent or execute
+            // bounded subtasks yet. Do NOT invent an execution mechanism and do NOT pretend
+            // decomposition ran — refuse the task honestly, regardless of whether the proposed
+            // decomposition itself is structurally valid, because the gap is the runtime's
+            // ability to CONSUME any decomposition at all, not this specific one's shape.
+            let decomposition = QDeterministicTaskDecomposer().decompose(task: task, decisionPlan: decisionPlan)
+            _ = decomposition.validate(maximumSubtasks: maximumSubtasks)
+            let reason = "Task requires decomposition (\(decomposition.subtasks.count) bounded subtasks) but the current runtime cannot yet execute decomposed subtasks; failing closed rather than bypassing plan validation."
+            task.state = .failed(reason: reason)
+            updateTask(task)
+            durableState.lifecycleState = .failed
+            durableState.lastKnownError = reason
+            try? durableStore?.saveTask(durableState)
+            try? durableStore?.recordEvent(
+                QTaskLifecycleEvent(
+                    taskId: task.taskId,
+                    sessionId: sessionId,
+                    eventType: .taskFailed,
+                    payload: ["reason": "decomposition_required_unsupported", "subtaskCount": "\(decomposition.subtasks.count)"]
+                )
+            )
+            QAuditLogger.shared.record(
+                QAuditRecord(
+                    sessionId: sessionId,
+                    taskId: task.taskId,
+                    tool: "decision.decomposition_unsupported",
+                    riskLevel: .level0ReadOnly,
+                    rawArguments: "decompositionDecision=required",
+                    authorizationResult: "halt",
+                    provenance: "trusted:system",
+                    executionSummary: "Required decomposition failed closed: runtime cannot execute decomposed subtasks yet."
+                )
+            )
+            return task
+        }
+
         // 5. Generate Initial Structured Plan
         var currentPlan: QPlan
         budget.recordModelCall()
         durableState.budget = budget
 
         do {
-            if let structuredModel = model as? QStructuredModelProvider {
+            if let decisionAwareModel = model as? QDecisionContextAwareModelProvider {
+                currentPlan = try await decisionAwareModel.generateStructuredPlan(
+                    for: task,
+                    memoryContext: memoryContext,
+                    failureContext: nil,
+                    decisionPlan: decisionPlan
+                )
+            } else if let structuredModel = model as? QStructuredModelProvider {
                 currentPlan = try await structuredModel.generateStructuredPlan(
                     for: task,
                     memoryContext: memoryContext,

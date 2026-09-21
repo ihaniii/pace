@@ -107,7 +107,7 @@ public protocol QLocalModelBackend: Sendable {
 
 // MARK: - Local Model Router
 
-public final class QModelRouter: QStructuredModelProvider, @unchecked Sendable {
+public final class QModelRouter: QStructuredModelProvider, QDecisionContextAwareModelProvider, @unchecked Sendable {
     public static let shared = QModelRouter()
 
     private let lock = NSRecursiveLock()
@@ -292,7 +292,30 @@ public final class QModelRouter: QStructuredModelProvider, @unchecked Sendable {
         memoryContext: String? = nil,
         failureContext: String? = nil
     ) async throws -> QPlan {
-        var systemPrompt = """
+        try await generateStructuredPlan(
+            for: task,
+            memoryContext: memoryContext,
+            failureContext: failureContext,
+            decisionPlan: nil
+        )
+    }
+
+    /// Phase 2A.4 (`QDecisionContextAwareModelProvider`): identical to
+    /// `generateStructuredPlan(for:memoryContext:failureContext:)` above, with one additional,
+    /// optional, ADVISORY parameter — the `QDecisionPlan` `QCoreRuntime` already computed for
+    /// `task`, if any. `decisionPlan` never changes backend/provider selection (`routeInference`
+    /// below is untouched), never changes the required JSON schema, and never changes how the
+    /// returned `QPlan` is validated or authorized downstream — it only ever adds a few bounded,
+    /// non-sensitive descriptive lines to the user-facing prompt text, exactly like
+    /// `memoryContext`/`failureContext` already do. `decisionPlan: nil` (the default 3-arg
+    /// overload above) produces byte-identical prompts to before this phase.
+    public func generateStructuredPlan(
+        for task: QTask,
+        memoryContext: String? = nil,
+        failureContext: String? = nil,
+        decisionPlan: QDecisionPlan?
+    ) async throws -> QPlan {
+        let systemPrompt = """
         You are the Q autonomous task planner for macOS.
         Output ONLY valid JSON matching this schema:
         {
@@ -318,6 +341,23 @@ public final class QModelRouter: QStructuredModelProvider, @unchecked Sendable {
         }
         if let failure = failureContext, !failure.isEmpty {
             userPrompt += "\nPrior Execution Failure:\n\(failure)\nProvide a corrected multi-step plan."
+        }
+        if let decisionPlan {
+            // Advisory only — bounded, non-sensitive, structured metadata describing the task's
+            // own already-computed classification. Carries no credentials, raw screen content,
+            // OCR, secrets, approval tokens, or egress authorization; the model remains untrusted
+            // and whatever it returns still passes through the unmodified JSON-schema parse below
+            // and the full existing plan-validation/permission/resource/egress/verification
+            // pipeline in QCoreRuntime — this text cannot itself authorize anything.
+            userPrompt += """
+
+            Planning Context (advisory strategy signal only — does not grant tool access, \
+            permissions, or change the allowed schema above):
+            - Task type: \(decisionPlan.taskType.rawValue)
+            - Complexity: \(decisionPlan.complexity.rawValue)
+            - Reasoning step budget: \(decisionPlan.reasoningStepBudget)
+            - Suggested strategy: \(decisionPlan.modelStrategy.rawValue)
+            """
         }
 
         let infReq = QModelInferenceRequest(

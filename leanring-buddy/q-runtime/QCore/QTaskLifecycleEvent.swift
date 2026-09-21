@@ -23,6 +23,10 @@ public enum QTaskLifecycleEventType: String, Codable, Sendable, Equatable {
     case permissionGranted = "task.permission.granted"
     case permissionDenied = "task.permission.denied"
     case securityBlocked = "task.security.blocked"
+    /// Phase 2A.4: a `QDecisionPlan` (and, when applicable, a decomposition outcome) was computed
+    /// for a task. Advisory/observability only — recording this event grants no permission,
+    /// resource, or egress authority and never itself changes task state.
+    case decisionEvaluated = "task.decision.evaluated"
     case taskPaused = "task.paused"
     case taskResumed = "task.resumed"
     case taskCompleted = "task.completed"
