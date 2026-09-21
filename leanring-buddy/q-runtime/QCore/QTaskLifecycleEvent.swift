@@ -45,6 +45,10 @@ public enum QTaskLifecycleEventType: String, Codable, Sendable, Equatable {
     /// Phase 2E: outcome learning recorded capability observations for this task. Payload:
     /// `QOutcomeLearningReport.auditPayload` — counts and enum raw values only.
     case outcomeLearned = "task.outcome.learned"
+    /// Phase 3: a verified response was assembled from the evidence pool (and, only if explicitly
+    /// opted in, verified propositions were written to memory). Payload: counts, booleans, and enum
+    /// raw values only — never statement text, prompts, or responses. Informational only.
+    case responseAssembled = "task.response.assembled"
     case taskPaused = "task.paused"
     case taskResumed = "task.resumed"
     case taskCompleted = "task.completed"

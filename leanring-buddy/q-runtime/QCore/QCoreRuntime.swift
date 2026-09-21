@@ -23,6 +23,15 @@ public final class QCoreRuntime: @unchecked Sendable {
     /// advisory ordering — behaviour is identical to Phase 2C. It is advisory only: nothing read
     /// from it is ever consulted for permission, resource, egress, risk, or verification.
     private var capabilityMemory: QModelCapabilityMemory?
+    /// Phase 3: optional verified-response configuration. `nil` (the default) means nothing is
+    /// assembled and nothing is written — behaviour identical to Phase 2E. Informational only: the
+    /// assembled response never influences task state, permissions, egress, resources, approvals,
+    /// replanning, or completion.
+    private var verifiedResponseConfiguration: QVerifiedResponseConfiguration?
+    /// The most recent rendered verified responses (in memory only, never persisted), bounded.
+    private var verifiedResponsesByTask: [String: QRenderedResponse] = [:]
+    private var verifiedResponseTaskOrder: [String] = []
+    private static let maxRetainedVerifiedResponses = 32
     private let ipcChannel: QIPCChannel
     private var tasks: [String: QTask] = [:]
 
@@ -60,6 +69,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         executionProvider: QExecutionProvider? = nil,
         durableStore: (any QDurableTaskStoreProtocol)? = nil,
         capabilityMemory: QModelCapabilityMemory? = nil,
+        verifiedResponse: QVerifiedResponseConfiguration? = nil,
         endpointName: String = "q-core-\(UUID().uuidString.prefix(8))"
     ) {
         self.modelProvider = modelProvider
@@ -67,7 +77,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         self.executionProvider = executionProvider
         self.durableStore = durableStore ?? QDurableTaskStore.shared
         self.capabilityMemory = capabilityMemory
-         self.ipcChannel = QIPCChannel(endpointName: endpointName)
+        self.verifiedResponseConfiguration = verifiedResponse
+        self.ipcChannel = QIPCChannel(endpointName: endpointName)
         setupIPCHandlers()
     }
 
@@ -76,7 +87,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         memoryProvider: QMemoryProvider? = nil,
         executionProvider: QExecutionProvider? = nil,
         durableStore: (any QDurableTaskStoreProtocol)? = nil,
-        capabilityMemory: QModelCapabilityMemory? = nil
+        capabilityMemory: QModelCapabilityMemory? = nil,
+        verifiedResponse: QVerifiedResponseConfiguration? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -85,6 +97,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         if let executionProvider { self.executionProvider = executionProvider }
         if let durableStore { self.durableStore = durableStore }
         if let capabilityMemory { self.capabilityMemory = capabilityMemory }
+        if let verifiedResponse { self.verifiedResponseConfiguration = verifiedResponse }
     }
 
     private func setupIPCHandlers() {
@@ -1280,7 +1293,55 @@ public final class QCoreRuntime: @unchecked Sendable {
                 payload: pipelineResult.metadata.auditPayload
             )
         )
+        recordVerifiedResponse(from: pipelineResult, task: task, sessionId: sessionId)
         return pipelineResult.metadata
+    }
+
+    // MARK: - Verified Response (Phase 3, additive, informational only)
+
+    /// When (and only when) a `QVerifiedResponseConfiguration` was supplied, assembles the
+    /// deterministic verified response from the evidence pool this iteration already built, keeps
+    /// the rendered form in a small in-memory cache, records a content-free lifecycle event, and —
+    /// only if write-back was explicitly enabled AND the memory provider can store verified
+    /// propositions — writes the independently verified ones. Nothing here changes task state or any
+    /// authority; a missing/incapable memory provider simply means nothing is written.
+    private func recordVerifiedResponse(from pipelineResult: QEvidencePipelineResult, task: QTask, sessionId: String) {
+        lock.lock()
+        let configuration = verifiedResponseConfiguration
+        let memory = memoryProvider
+        lock.unlock()
+        guard let configuration else { return }
+
+        let now = Date()
+        let response = QVerifiedResponseAssembler.assemble(from: pipelineResult, now: now)
+        var payload = response.auditPayload
+
+        var writeBackReport = QVerifiedWriteBackReport(isEnabled: false)
+        if configuration.writeBack.isEnabled, let store = memory as? QVerifiedPropositionStoring {
+            writeBackReport = QVerifiedMemoryWriter(store: store, configuration: configuration.writeBack)
+                .write(response: response, pool: pipelineResult.pool, now: now)
+        }
+        for (key, value) in writeBackReport.auditPayload { payload[key] = value }
+
+        lock.lock()
+        if verifiedResponsesByTask[task.taskId] == nil { verifiedResponseTaskOrder.append(task.taskId) }
+        verifiedResponsesByTask[task.taskId] = QVerifiedResponseRenderer.render(response, pool: pipelineResult.pool)
+        while verifiedResponseTaskOrder.count > Self.maxRetainedVerifiedResponses {
+            verifiedResponsesByTask.removeValue(forKey: verifiedResponseTaskOrder.removeFirst())
+        }
+        lock.unlock()
+
+        try? durableStore?.recordEvent(
+            QTaskLifecycleEvent(taskId: task.taskId, sessionId: sessionId, eventType: .responseAssembled, payload: payload)
+        )
+    }
+
+    /// The most recent verified response rendered for `taskId`, if a verified-response configuration
+    /// was supplied and the task reached goal evaluation. In-memory only (bounded to the latest 32).
+    public func verifiedResponse(forTask taskId: String) -> QRenderedResponse? {
+        lock.lock()
+        defer { lock.unlock() }
+        return verifiedResponsesByTask[taskId]
     }
 
     /// Records EXPLICIT user feedback (a correction or confirmation) about a task Q already

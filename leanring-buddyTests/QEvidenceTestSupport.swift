@@ -37,7 +37,8 @@ enum EvidenceFixtures {
     static func modelDraft(
         sourceId: String,
         backend: QModelBackendType = .ollama,
-        content: String
+        content: String,
+        taskId: String = EvidenceFixtures.taskId
     ) -> QEvidenceDraft {
         QEvidenceDraft(
             taskId: taskId,
@@ -63,7 +64,7 @@ enum EvidenceFixtures {
         )
     }
 
-    static func executionDraft(sourceId: String = "exec-1", content: String) -> QEvidenceDraft {
+    static func executionDraft(sourceId: String = "exec-1", content: String, taskId: String = EvidenceFixtures.taskId) -> QEvidenceDraft {
         QEvidenceDraft(taskId: taskId, sourceId: sourceId, kind: .executionObserved, provenance: .trustedSystem, content: content)
     }
 
@@ -88,6 +89,11 @@ enum EvidenceFixtures {
     static func addExecutionClaim(_ pool: inout QEvidencePool, sourceId: String = "exec-1", subject: String, value: String) -> QClaimID? {
         let result = pool.ingest(executionDraft(sourceId: sourceId, content: "\(subject): \(value)"))
         return result.claimIds.first
+    }
+
+    @discardableResult
+    static func addUserClaim(_ pool: inout QEvidencePool, subject: String, value: String) -> QClaimID? {
+        pool.ingest(userDraft(content: "\(subject): \(value)")).claimIds.first
     }
 
     @discardableResult

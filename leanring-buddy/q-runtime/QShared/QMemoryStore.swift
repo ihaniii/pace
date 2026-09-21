@@ -61,14 +61,21 @@ public protocol QMemoryStore: Sendable {
 // MARK: - SQLite Implementation
 
 public final class QSQLiteMemoryStore: QMemoryStore, QMemoryProvider, @unchecked Sendable {
-    private var db: OpaquePointer?
+    // `db`/`lock` are module-internal (not private) so the Phase 3 verified-proposition table lives in
+    // THIS store — same file, same WAL connection, same lock — via `QVerifiedMemoryStore.swift`,
+    // instead of a second database.
+    var db: OpaquePointer?
     private let dbPath: String
-    private let lock = NSRecursiveLock()
+    let lock = NSRecursiveLock()
+    /// False when the on-disk verified-proposition schema is NEWER than this build understands (or
+    /// unreadable): reads return nothing and writes are refused; existing data is left untouched.
+    var verifiedPropositionSchemaSupported = true
 
     public init(databasePath: String = ":memory:", inMemory: Bool = false) throws {
         self.dbPath = inMemory ? ":memory:" : databasePath
         try openDatabase()
         try applyMigrations()
+        ensureVerifiedPropositionSchema()
     }
 
     deinit {
@@ -344,7 +351,11 @@ public final class QSQLiteMemoryStore: QMemoryStore, QMemoryProvider, @unchecked
             taskId: task.taskId,
             key: "task_completion:\(task.taskId)",
             content: result,
-            provenanceKind: "trusted:system",
+            // The completion text is model-generated prose (or a system fallback that embeds it);
+            // labelling it `trusted:system` would launder unverified text into trusted memory. The
+            // honest label is a model-derived, untrusted one. Older rows keep whatever label they
+            // were written with — retrieval never trusts a bare label (see QVerifiedMemoryStore).
+            provenanceKind: QProvenanceKind.untrustedTool(toolName: "model_summary").rawTag,
             provenanceSource: "core_runtime"
         )
         try insert(record: rec)
