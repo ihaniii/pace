@@ -22,6 +22,34 @@ public final class QCoreRuntime: @unchecked Sendable {
     private let ipcChannel: QIPCChannel
     private var tasks: [String: QTask] = [:]
 
+    // Bug fix (post-Phase 2I): the durable plan snapshot a step halts into `awaitingApproval`
+    // with has ALWAYS had its declared-sensitive arguments (QSensitiveArgumentPolicy) masked
+    // before being written to disk — correct for persistence, but `resolveApproval`'s `.granted`
+    // path used to resume execution FROM that same redacted snapshot, meaning any tool with a
+    // sensitive argument (today: only `ui.set_text_value`'s `value`) would actually dispatch with
+    // the literal string "[REDACTED_SENSITIVE_ARGUMENT:length=N]" instead of the real value the
+    // model/user intended, the moment it got approved. This cache keeps the real, live, still-
+    // in-memory QPlan (the one with the actual unredacted arguments) available for same-process
+    // resume, keyed by plan id, consumed (removed) the moment it's used or the approval is
+    // otherwise resolved. It is a pure in-memory convenience, never persisted — a genuine crash/
+    // process restart still correctly falls back to the durable (redacted) snapshot, exactly as
+    // before, because there is no way to recover a literal that was never written to disk.
+    private var livePlansAwaitingApproval: [String: QPlan] = [:]
+
+    private func cacheLivePlanAwaitingApproval(_ plan: QPlan) {
+        lock.lock()
+        defer { lock.unlock() }
+        livePlansAwaitingApproval[plan.id.uuidString] = plan
+    }
+
+    @discardableResult
+    private func consumeLivePlanAwaitingApproval(planId: String?) -> QPlan? {
+        guard let planId else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return livePlansAwaitingApproval.removeValue(forKey: planId)
+    }
+
     public init(
         modelProvider: QModelProvider? = nil,
         memoryProvider: QMemoryProvider? = nil,
@@ -351,6 +379,7 @@ public final class QCoreRuntime: @unchecked Sendable {
                 )
                 task.state = .awaitingApproval(approvalReq)
                 updateTask(task)
+                cacheLivePlanAwaitingApproval(executedPlan)
                 durableState.lifecycleState = .awaitingApproval
                 durableState.securityBlockReason = reason
                 // Note: the plan snapshot (with this step's .waitingForPermission state) was
@@ -754,6 +783,8 @@ public final class QCoreRuntime: @unchecked Sendable {
 
         switch resolution {
         case .notFound, .expired:
+            // Never resumed — drop the cached live plan rather than leak it.
+            consumeLivePlanAwaitingApproval(planId: durableState.currentPlanId)
             let reasonText = resolution == .expired
                 ? "Approval request \(approvalId) expired before it was resolved."
                 : "Approval request \(approvalId) is not pending for task \(taskId) (unknown, already resolved, or from a prior process)."
@@ -768,6 +799,8 @@ public final class QCoreRuntime: @unchecked Sendable {
             return task
 
         case .rejected(let reason):
+            // Never resumed — drop the cached live plan rather than leak it.
+            consumeLivePlanAwaitingApproval(planId: durableState.currentPlanId)
             let reasonText = "Approval denied: \(reason)"
             durableState.lifecycleState = .failed
             durableState.lastKnownError = reasonText
@@ -781,6 +814,8 @@ public final class QCoreRuntime: @unchecked Sendable {
 
         case .granted(let fingerprint):
             guard let planId = durableState.currentPlanId, let planSnapshot = try? durableStore.getPlan(planId: planId) else {
+                // Never resumed — drop the cached live plan rather than leak it.
+                consumeLivePlanAwaitingApproval(planId: durableState.currentPlanId)
                 let reasonText = "Approval granted (fingerprint=\(fingerprint)) but plan snapshot is missing; cannot resume."
                 durableState.lifecycleState = .failed
                 durableState.lastKnownError = reasonText
@@ -798,13 +833,19 @@ public final class QCoreRuntime: @unchecked Sendable {
             durableState.securityBlockReason = nil
             try? durableStore.saveTask(durableState)
 
-            return try await executeResumedPlan(taskState: durableState, planSnapshot: planSnapshot, observer: observer)
+            return try await executeResumedPlan(
+                taskState: durableState,
+                planSnapshot: planSnapshot,
+                livePlan: consumeLivePlanAwaitingApproval(planId: planId),
+                observer: observer
+            )
         }
     }
 
     private func executeResumedPlan(
         taskState: QDurableTaskState,
         planSnapshot: QDurablePlanSnapshot,
+        livePlan: QPlan? = nil,
         observer: (any QPlanExecutionObserver)? = nil
     ) async throws -> QTask {
         var task = taskState.toTask()
@@ -833,7 +874,24 @@ public final class QCoreRuntime: @unchecked Sendable {
             return task
         }
 
-        let plan = try planSnapshot.validate()
+        // Prefer the real, live, still-in-memory plan (its arguments were never redacted) over
+        // the durable snapshot (whose declared-sensitive arguments — e.g. ui.set_text_value's
+        // "value" — were masked before being written to disk, per QSensitiveArgumentPolicy).
+        // `livePlan` is only present for a same-process approval resume; a genuine crash/restart
+        // has no live plan to offer, and correctly falls back to the snapshot exactly as before.
+        var plan = try livePlan ?? planSnapshot.validate()
+        // The live plan was cached at the exact moment it entered `.waitingForPermission` and
+        // still carries that top-level state verbatim — `QPlanExecutor.execute` only permits
+        // `.pending -> .running`, never `.waitingForPermission -> .running`. The durable-snapshot
+        // path never hits this: `QDurablePlanSnapshot.validate()` already defaults any
+        // non-terminal plan-level state to `.pending` (see its `reconstructedPlanState` logic).
+        // Normalize the live plan's top-level state the same way here, WITHOUT touching any
+        // step's own state (the halted step correctly stays `.waitingForPermission` at the step
+        // level either way, exactly like the durable-snapshot reconstruction already leaves it —
+        // QPlanExecutor resumes from that step's state, not the plan's).
+        if case .waitingForPermission = plan.state {
+            plan.state = .pending
+        }
         let executor = QPlanExecutor(executionProvider: exec)
         let goalEvaluator = QGoalEvaluator.shared
 
@@ -891,6 +949,7 @@ public final class QCoreRuntime: @unchecked Sendable {
             )
             task.state = .awaitingApproval(approvalReq)
             updateTask(task)
+            cacheLivePlanAwaitingApproval(executedPlan)
 
             var updatedDurable = taskState
             updatedDurable.lifecycleState = .awaitingApproval
