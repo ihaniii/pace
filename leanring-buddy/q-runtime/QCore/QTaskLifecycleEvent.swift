@@ -27,6 +27,14 @@ public enum QTaskLifecycleEventType: String, Codable, Sendable, Equatable {
     /// for a task. Advisory/observability only — recording this event grants no permission,
     /// resource, or egress authority and never itself changes task state.
     case decisionEvaluated = "task.decision.evaluated"
+    /// Phase 2B: one bounded candidate attempt the model orchestrator made. Payload carries only
+    /// identity/outcome-label/duration metadata (`QModelAttemptOutcome.auditLabel`) — never raw
+    /// model output, never prompt text. Advisory/observability only.
+    case modelAttemptRecorded = "task.model.attempt"
+    /// Phase 2B: one orchestration call finished (all its attempts are already individually
+    /// recorded via `modelAttemptRecorded`). Payload carries only counts/booleans/the early-exit
+    /// reason's own raw value. Advisory/observability only.
+    case modelOrchestrationCompleted = "task.model.orchestration.completed"
     case taskPaused = "task.paused"
     case taskResumed = "task.resumed"
     case taskCompleted = "task.completed"

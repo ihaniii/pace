@@ -107,7 +107,7 @@ public protocol QLocalModelBackend: Sendable {
 
 // MARK: - Local Model Router
 
-public final class QModelRouter: QStructuredModelProvider, QDecisionContextAwareModelProvider, @unchecked Sendable {
+public final class QModelRouter: QStructuredModelProvider, QDecisionContextAwareModelProvider, QModelCandidateAwareProvider, @unchecked Sendable {
     public static let shared = QModelRouter()
 
     private let lock = NSRecursiveLock()
@@ -200,6 +200,18 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
         lock.lock()
         defer { lock.unlock() }
         return registeredBackends[type]
+    }
+
+    /// Phase 2B (`QModelCandidateAwareProvider`): the backends currently REGISTERED, in this
+    /// router's own priority order — never a claim about which are actually available right now
+    /// (callers still call `getBackend(type:)` + `.isAvailable()` per candidate, exactly like
+    /// `selectBestBackend` already does) and never a quality/capability ranking, just "these
+    /// exist, in this order." A caller wanting only genuinely-registered candidates already
+    /// combines this with `getBackend(type:)`, which returns `nil` for anything not registered.
+    public func candidateBackends() -> [QModelBackendType] {
+        lock.lock()
+        defer { lock.unlock() }
+        return priorityOrder
     }
 
     public func selectBestBackend(needsVision: Bool = false) async -> QLocalModelBackend? {
@@ -315,6 +327,33 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
         failureContext: String? = nil,
         decisionPlan: QDecisionPlan?
     ) async throws -> QPlan {
+        try await generateStructuredPlan(
+            for: task,
+            memoryContext: memoryContext,
+            failureContext: failureContext,
+            decisionPlan: decisionPlan,
+            preferredBackend: nil
+        )
+    }
+
+    /// Phase 2B (`QModelCandidateAwareProvider`): identical to the 4-arg `decisionPlan`-aware
+    /// overload above, with one additional, optional parameter — a specific backend to target, so
+    /// a bounded orchestration layer above this router (`QModelOrchestrator`) can attempt a
+    /// SPECIFIC registered candidate rather than always letting `routeInference`'s own
+    /// `priorityOrder` auto-selection run. Never changes what selection means when
+    /// `preferredBackend == nil` (byte-identical to the 4-arg overload's own behavior); never
+    /// bypasses `routeInference`'s own availability/egress checks for the preferred backend — see
+    /// that function's existing `preferredBackend` handling, unchanged by this phase. The
+    /// orchestrator, not this method, is responsible for only ever passing a backend it already
+    /// confirmed is local/available via `candidateBackends()` — this method makes no such
+    /// assumption itself and still fails closed exactly like `routeInference` always has.
+    public func generateStructuredPlan(
+        for task: QTask,
+        memoryContext: String? = nil,
+        failureContext: String? = nil,
+        decisionPlan: QDecisionPlan?,
+        preferredBackend: QModelBackendType?
+    ) async throws -> QPlan {
         let systemPrompt = """
         You are the Q autonomous task planner for macOS.
         Output ONLY valid JSON matching this schema:
@@ -367,7 +406,7 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
             maxTokens: 1024
         )
 
-        let res = try await routeInference(request: infReq)
+        let res = try await routeInference(request: infReq, preferredBackend: preferredBackend)
 
         // Try parsing JSON model response
         do {

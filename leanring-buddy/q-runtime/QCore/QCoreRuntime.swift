@@ -300,7 +300,60 @@ public final class QCoreRuntime: @unchecked Sendable {
         durableState.budget = budget
 
         do {
-            if let decisionAwareModel = model as? QDecisionContextAwareModelProvider {
+            if let candidateAwareModel = model as? QModelCandidateAwareProvider {
+                // Phase 2B: bounded multi-model orchestration. QDeterministicModelOrchestrator
+                // sits strictly above QModelRouter — see its own file header — and every attempt
+                // it makes still goes through the unmodified QModelRouter.generateStructuredPlan
+                // (and therefore the unmodified routeInference availability/egress checks) for
+                // whichever specific backend it targets. The orchestrator itself never selects a
+                // backend on its own authority and never executes anything; it only returns a
+                // typed result describing which of the (already router-registered) candidates, if
+                // any, produced a schema/risk-valid QPlan.
+                let orchestrator = QDeterministicModelOrchestrator()
+                let orchestrationResult = try await orchestrator.orchestrate(
+                    task: task,
+                    decisionPlan: decisionPlan,
+                    memoryContext: memoryContext,
+                    modelProvider: candidateAwareModel
+                )
+
+                for orchestrationAttempt in orchestrationResult.attempts {
+                    try? durableStore?.recordEvent(
+                        QTaskLifecycleEvent(
+                            taskId: task.taskId,
+                            sessionId: sessionId,
+                            eventType: .modelAttemptRecorded,
+                            payload: [
+                                "attemptId": orchestrationAttempt.attemptId.rawValue,
+                                "candidateId": orchestrationAttempt.candidateId.rawValue,
+                                "backend": orchestrationAttempt.backend.rawValue,
+                                "outcome": orchestrationAttempt.outcome.auditLabel,
+                                "durationMs": "\(Int(orchestrationAttempt.durationSeconds * 1000))"
+                            ]
+                        )
+                    )
+                }
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(
+                        taskId: task.taskId,
+                        sessionId: sessionId,
+                        eventType: .modelOrchestrationCompleted,
+                        payload: [
+                            "attemptCount": "\(orchestrationResult.attempts.count)",
+                            "didRace": "\(orchestrationResult.didRace)",
+                            "earlyExitReason": orchestrationResult.earlyExitReason.rawValue,
+                            "succeeded": "\(orchestrationResult.isSuccess)"
+                        ]
+                    )
+                )
+
+                guard let winningPlan = orchestrationResult.winningPlan else {
+                    throw QModelOrchestrationError.allCandidatesFailed(
+                        attemptIds: orchestrationResult.attempts.map { $0.attemptId }
+                    )
+                }
+                currentPlan = winningPlan
+            } else if let decisionAwareModel = model as? QDecisionContextAwareModelProvider {
                 currentPlan = try await decisionAwareModel.generateStructuredPlan(
                     for: task,
                     memoryContext: memoryContext,

@@ -23,6 +23,33 @@ struct MockRemoteCloudBackend: QLocalModelBackend {
     }
 }
 
+// Mock local backend that declares a mismatched (downgraded) risk level for a known-Level-3 tool
+// — the exact scenario QControlledActionsTests test 2 proves QModelPlanParser rejects.
+struct MockRiskMismatchBackend: QLocalModelBackend {
+    let capabilities = QModelCapabilities(backend: .llamaCpp, modelIdentifier: "risk-mismatch-test")
+
+    func isAvailable() async -> Bool { true }
+    func complete(request: QModelInferenceRequest) async throws -> QModelInferenceResponse {
+        QModelInferenceResponse(
+            text: """
+            {
+              "taskPrompt": "Quit Calculator",
+              "steps": [
+                {
+                  "actionName": "app.quit",
+                  "toolFamily": "app",
+                  "riskLevel": "level0ReadOnly",
+                  "description": "Quit Calculator",
+                  "targetResources": ["Calculator"]
+                }
+              ]
+            }
+            """,
+            providerUsed: .llamaCpp
+        )
+    }
+}
+
 @Suite("QModelRouterTests")
 struct QModelRouterTests {
 
@@ -131,5 +158,28 @@ struct QModelRouterTests {
         } catch {
             #expect(Bool(false), "Unexpected exception: \(error)")
         }
+    }
+
+    // MARK: - Phase 2B — preferredBackend still routes through unmodified QModelPlanParser authority
+
+    @Test("Phase 2B: generateStructuredPlan(...,preferredBackend:) still rejects a candidate's self-declared (downgraded) risk level — capability risk authority is unchanged for orchestrated attempts")
+    func preferredBackendStillEnforcesRiskAuthority() async throws {
+        let router = QModelRouter(localOnly: true)
+        router.clearBackends()
+        router.register(backend: MockRiskMismatchBackend())
+        let task = QTask(intent: "Quit Calculator")
+
+        let plan = try await router.generateStructuredPlan(
+            for: task,
+            memoryContext: nil,
+            failureContext: nil,
+            decisionPlan: nil,
+            preferredBackend: .llamaCpp
+        )
+
+        // QModelPlanParser rejects the mismatched risk claim (unchanged, unmodified by Phase 2B),
+        // so generateStructuredPlan falls back to its existing deterministic generator — the
+        // malicious downgraded-risk step must never appear in the returned plan.
+        #expect(!plan.steps.contains { $0.action.actionName == "app.quit" && $0.action.riskLevel == .level0ReadOnly })
     }
 }
