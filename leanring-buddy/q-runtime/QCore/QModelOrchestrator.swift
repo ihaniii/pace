@@ -103,7 +103,15 @@ public struct QDeterministicModelOrchestrator: QModelOrchestrator, Sendable {
     /// phase's own spec, taken literally.
     public static let maxConcurrentCandidates = 2
 
-    public init() {}
+    /// Optional, ADVISORY candidate-order source (Phase 2D capability memory). It can only reorder
+    /// candidates this orchestrator has already filtered to registered + local + available; it can
+    /// neither add nor remove one, and every attempt still runs the unmodified router checks.
+    /// `nil` (the default) leaves candidate order exactly as the provider reported it.
+    private let routingAdvisor: (any QModelRoutingAdvisor)?
+
+    public init(routingAdvisor: (any QModelRoutingAdvisor)? = nil) {
+        self.routingAdvisor = routingAdvisor
+    }
 
     public func orchestrate(
         task: QTask,
@@ -118,11 +126,12 @@ public struct QDeterministicModelOrchestrator: QModelOrchestrator, Sendable {
         // orchestrator refuses to ever attempt a non-local candidate, full stop, regardless of
         // what any provider reports as "available." No cloud fallback is possible from here even
         // if a future provider mis-registers a non-local backend as available.
-        let localAvailableCandidates = candidates.filter { $0.isLocalOnDevice && $0.isAvailable }
+        let vettedCandidates = candidates.filter { $0.isLocalOnDevice && $0.isAvailable }
 
-        guard !localAvailableCandidates.isEmpty else {
+        guard !vettedCandidates.isEmpty else {
             throw QModelOrchestrationError.noCandidatesAvailable
         }
+        let localAvailableCandidates = applyAdvisoryOrder(to: vettedCandidates, decisionPlan: decisionPlan)
 
         let eligibility = Self.racingEligibility(
             decisionPlan: decisionPlan,
@@ -174,6 +183,31 @@ public struct QDeterministicModelOrchestrator: QModelOrchestrator, Sendable {
             )
             return fallbackResult
         }
+    }
+
+    // MARK: - Advisory Ordering
+
+    /// Applies the advisor's order to ALREADY-VETTED candidates. The result is always a permutation
+    /// of `candidates`: unknown or duplicate backends in the advice are ignored, and any candidate
+    /// the advice omits keeps its relative position at the end — advice can never inject, drop, or
+    /// substitute a candidate.
+    private func applyAdvisoryOrder(to candidates: [QModelCandidate], decisionPlan: QDecisionPlan) -> [QModelCandidate] {
+        guard let routingAdvisor, candidates.count > 1 else { return candidates }
+        let advice = routingAdvisor.advise(
+            taskType: decisionPlan.taskType,
+            complexity: decisionPlan.complexity,
+            candidates: candidates.map { $0.backend },
+            now: Date()
+        )
+        var remaining = candidates
+        var ordered: [QModelCandidate] = []
+        for backend in advice.orderedBackends {
+            if let index = remaining.firstIndex(where: { $0.backend == backend }) {
+                ordered.append(remaining.remove(at: index))
+            }
+        }
+        ordered.append(contentsOf: remaining)
+        return ordered
     }
 
     // MARK: - Candidate Construction

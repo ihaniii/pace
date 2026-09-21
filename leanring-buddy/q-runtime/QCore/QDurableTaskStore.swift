@@ -23,9 +23,15 @@ public protocol QDurableTaskStoreProtocol: Sendable {
 public final class QDurableTaskStore: QDurableTaskStoreProtocol, @unchecked Sendable {
     public static let shared = try! QDurableTaskStore()
 
-    private var db: OpaquePointer?
+    // `db`/`lock` are module-internal (not private) so the Phase 2D capability-observation tables
+    // live in THIS store — same file, same WAL connection, same lock — via
+    // `QModelCapabilityStore.swift`, instead of a second database.
+    var db: OpaquePointer?
     private let dbPath: String
-    private let lock = NSRecursiveLock()
+    let lock = NSRecursiveLock()
+    /// False when the on-disk capability schema is NEWER than this build understands: reads return
+    /// nothing and writes are refused, and no existing data is touched.
+    var capabilitySchemaSupported = true
     private let jsonEncoder = JSONEncoder()
     private let jsonDecoder = JSONDecoder()
 
@@ -41,6 +47,7 @@ public final class QDurableTaskStore: QDurableTaskStoreProtocol, @unchecked Send
 
         try openDatabase()
         try createTables()
+        ensureCapabilitySchema()
     }
 
     deinit {

@@ -39,6 +39,12 @@ public enum QTaskLifecycleEventType: String, Codable, Sendable, Equatable {
     /// goal-evaluation result. Payload is `QEvidenceOutcomeMetadata.auditPayload` — enums and counts
     /// only, never claim/evidence text, prompts, or responses. Advisory/observability only.
     case evidenceEvaluated = "task.evidence.evaluated"
+    /// Phase 2D: what the capability-memory routing ADVISOR suggested for this task's candidate
+    /// order. Payload: counts, booleans, backend identifiers only. Advisory/observability only.
+    case modelRoutingAdvised = "task.model.routing.advised"
+    /// Phase 2E: outcome learning recorded capability observations for this task. Payload:
+    /// `QOutcomeLearningReport.auditPayload` — counts and enum raw values only.
+    case outcomeLearned = "task.outcome.learned"
     case taskPaused = "task.paused"
     case taskResumed = "task.resumed"
     case taskCompleted = "task.completed"

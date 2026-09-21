@@ -118,12 +118,24 @@ public final class QRuntimeBootstrap: @unchecked Sendable {
         // 9. Initialize Capability Bridge Adapters
         activeComponents.append("QBridgeAdapters (Native SCK/AX/Vision/Speech)")
 
+        // 9b. Model Capability Memory (Phase 2D/2E) — ADVISORY routing memory only. Backed by the
+        // existing `QDurableTaskStore` (SQLite WAL) in its default on-disk location; a caller that
+        // supplies a custom `databasePath` (tests/tools) gets a non-persistent in-memory store so
+        // no unrelated file is written. A failure to open it simply disables learning — it never
+        // blocks boot and never touches an authority.
+        var capabilityMemory: QModelCapabilityMemory?
+        if let capabilityStore = try? QDurableTaskStore(databasePath: databasePath == nil ? "default" : ":memory:") {
+            capabilityMemory = QModelCapabilityMemory(store: capabilityStore)
+            activeComponents.append("QModelCapabilityMemory (Advisory, Bounded)")
+        }
+
         // 10. Assemble Core Runtime
         if let store = self.memoryStore {
             let core = QCoreRuntime(
                 modelProvider: router,
                 memoryProvider: store,
                 executionProvider: exec,
+                capabilityMemory: capabilityMemory,
                 endpointName: "q-core-main"
             )
             self.coreRuntime = core

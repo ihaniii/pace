@@ -19,6 +19,10 @@ public final class QCoreRuntime: @unchecked Sendable {
     private var memoryProvider: QMemoryProvider?
     private var executionProvider: QExecutionProvider?
     private var durableStore: (any QDurableTaskStoreProtocol)?
+    /// Phase 2D/2E: optional capability memory. `nil` (the default) means no learning and no
+    /// advisory ordering — behaviour is identical to Phase 2C. It is advisory only: nothing read
+    /// from it is ever consulted for permission, resource, egress, risk, or verification.
+    private var capabilityMemory: QModelCapabilityMemory?
     private let ipcChannel: QIPCChannel
     private var tasks: [String: QTask] = [:]
 
@@ -55,13 +59,15 @@ public final class QCoreRuntime: @unchecked Sendable {
         memoryProvider: QMemoryProvider? = nil,
         executionProvider: QExecutionProvider? = nil,
         durableStore: (any QDurableTaskStoreProtocol)? = nil,
+        capabilityMemory: QModelCapabilityMemory? = nil,
         endpointName: String = "q-core-\(UUID().uuidString.prefix(8))"
     ) {
         self.modelProvider = modelProvider
         self.memoryProvider = memoryProvider
         self.executionProvider = executionProvider
         self.durableStore = durableStore ?? QDurableTaskStore.shared
-        self.ipcChannel = QIPCChannel(endpointName: endpointName)
+        self.capabilityMemory = capabilityMemory
+         self.ipcChannel = QIPCChannel(endpointName: endpointName)
         setupIPCHandlers()
     }
 
@@ -69,7 +75,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         modelProvider: QModelProvider? = nil,
         memoryProvider: QMemoryProvider? = nil,
         executionProvider: QExecutionProvider? = nil,
-        durableStore: (any QDurableTaskStoreProtocol)? = nil
+        durableStore: (any QDurableTaskStoreProtocol)? = nil,
+        capabilityMemory: QModelCapabilityMemory? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -77,6 +84,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         if let memoryProvider { self.memoryProvider = memoryProvider }
         if let executionProvider { self.executionProvider = executionProvider }
         if let durableStore { self.durableStore = durableStore }
+        if let capabilityMemory { self.capabilityMemory = capabilityMemory }
     }
 
     private func setupIPCHandlers() {
@@ -299,6 +307,14 @@ public final class QCoreRuntime: @unchecked Sendable {
         // Phase 2C: the Phase 2B attempt record, kept so the post-execution evidence evaluation
         // can bridge candidate identity into the Evidence Pool (identity/outcome only).
         var orchestrationAttempts: [QModelAttempt] = []
+        var orchestrationWinningAttemptId: QModelAttemptID?
+        // Outcome learning attributes the FIRST goal evaluation to the orchestrated candidate whose
+        // plan was executed; later replan iterations use non-orchestrated planning and are not
+        // attributed to it.
+        var outcomeLearningRecorded = false
+        lock.lock()
+        let activeCapabilityMemory = capabilityMemory
+        lock.unlock()
         budget.recordModelCall()
         durableState.budget = budget
 
@@ -312,7 +328,10 @@ public final class QCoreRuntime: @unchecked Sendable {
                 // backend on its own authority and never executes anything; it only returns a
                 // typed result describing which of the (already router-registered) candidates, if
                 // any, produced a schema/risk-valid QPlan.
-                let orchestrator = QDeterministicModelOrchestrator()
+                // Phase 2D: capability memory may only ADVISE candidate order (never add/remove a
+                // candidate, never touch permission/resource/egress/risk/verification).
+                let routingAdvisor = activeCapabilityMemory.map { QRecordingRoutingAdvisor(wrapping: $0) }
+                let orchestrator = QDeterministicModelOrchestrator(routingAdvisor: routingAdvisor)
                 let orchestrationResult = try await orchestrator.orchestrate(
                     task: task,
                     decisionPlan: decisionPlan,
@@ -321,6 +340,26 @@ public final class QCoreRuntime: @unchecked Sendable {
                 )
 
                 orchestrationAttempts = orchestrationResult.attempts
+                if let executedPlan = orchestrationResult.winningPlan {
+                    orchestrationWinningAttemptId = orchestrationResult.attempts.first { attempt in
+                        if case .accepted(let candidatePlan) = attempt.outcome { return candidatePlan == executedPlan }
+                        return false
+                    }?.attemptId
+                }
+                if let advice = routingAdvisor?.lastRecommendation {
+                    try? durableStore?.recordEvent(
+                        QTaskLifecycleEvent(
+                            taskId: task.taskId,
+                            sessionId: sessionId,
+                            eventType: .modelRoutingAdvised,
+                            payload: [
+                                "reordered": "\(advice.reordered)",
+                                "advisedOrder": advice.orderedBackends.map { $0.rawValue }.joined(separator: ","),
+                                "rankedCandidateCount": "\(advice.basis.values.filter { if case .observedOutcomes = $0 { return true } else { return false } }.count)"
+                            ]
+                        )
+                    )
+                }
                 for orchestrationAttempt in orchestrationResult.attempts {
                     try? durableStore?.recordEvent(
                         QTaskLifecycleEvent(
@@ -592,13 +631,36 @@ public final class QCoreRuntime: @unchecked Sendable {
                 )
             )
 
-            await recordEvidenceEvaluation(
+            let evidenceMetadata = await recordEvidenceEvaluation(
                 task: task,
                 sessionId: sessionId,
                 decisionPlan: decisionPlan,
                 goalEvaluation: goalEvaluation,
                 candidateAttempts: orchestrationAttempts
             )
+
+            if !outcomeLearningRecorded, let activeCapabilityMemory, !orchestrationAttempts.isEmpty {
+                outcomeLearningRecorded = true
+                let learningReport = QOutcomeLearningService(memory: activeCapabilityMemory).learn(
+                    QOutcomeLearningInput(
+                        taskId: task.taskId,
+                        decisionPlan: decisionPlan,
+                        evidenceMetadata: evidenceMetadata,
+                        attempts: orchestrationAttempts,
+                        winningAttemptId: orchestrationWinningAttemptId,
+                        goalState: goalEvaluation.state
+                    ),
+                    now: Date()
+                )
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(
+                        taskId: task.taskId,
+                        sessionId: sessionId,
+                        eventType: .outcomeLearned,
+                        payload: learningReport.auditPayload
+                    )
+                )
+            }
 
             // Case A: Goal Satisfied -> Synthesize grounded success summary
             if goalEvaluation.isSatisfied {
@@ -1192,7 +1254,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         decisionPlan: QDecisionPlan,
         goalEvaluation: QGoalEvaluation,
         candidateAttempts: [QModelAttempt]
-    ) async {
+    ) async -> QEvidenceOutcomeMetadata {
         var observations = [
             QEvidenceObservation(sourceId: "goal-evaluator", subject: "goal.state", value: goalEvaluation.state.rawValue)
         ]
@@ -1218,6 +1280,19 @@ public final class QCoreRuntime: @unchecked Sendable {
                 payload: pipelineResult.metadata.auditPayload
             )
         )
+        return pipelineResult.metadata
+    }
+
+    /// Records EXPLICIT user feedback (a correction or confirmation) about a task Q already
+    /// observed. Never inferred from silence or behaviour; refused — never invented — for a task
+    /// with no observed outcome. Feedback only ever becomes a capability observation.
+    @discardableResult
+    public func recordUserFeedback(taskId: String, feedback: QExplicitUserFeedback) -> [QObservationRecordResult] {
+        lock.lock()
+        let memory = capabilityMemory
+        lock.unlock()
+        guard let memory else { return [.storeUnavailable] }
+        return QOutcomeLearningService(memory: memory).recordUserFeedback(taskId: taskId, feedback: feedback)
     }
 
     private func updateTask(_ task: QTask) {
