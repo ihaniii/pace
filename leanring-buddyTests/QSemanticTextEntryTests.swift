@@ -114,6 +114,189 @@ private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool)
     return condition()
 }
 
+// MARK: - Real macOS E2E fixture: a genuinely separate, out-of-process TextEdit instance
+//
+// Tests 11 and 18 exercise the FULL runtime pipeline (submitIntent -> approve -> real AX write
+// -> independent real AX closed-loop verification) — the only two tests in this file that touch
+// this capability's production AX bridge twice in one run. Self-targeting the Pace test host's
+// own process for that (the convention every other test in this file still uses, since those
+// only ever make a single direct QBridgeAccessibility call) is what produced the documented
+// off-main-thread self-process AppKit/AX hang (NSMenu _lockForMainMenuItemArray, ViewBridge
+// uncommitted-CATransaction teardown) — the production AX walker's `Task.detached` pattern is
+// correct for driving a REAL other application (out-of-process AX IPC), and only unsafe when the
+// "other application" is actually this same process. Tests 11/18 therefore target a genuinely
+// separate TextEdit.app process instead — mirroring the exact, already-established
+// NSWorkspace.shared.openApplication real-E2E convention QSemanticClickTests (Calculator) and
+// QSemanticApplicationActivationTests/QSemanticApplicationHiddenStateTests (TextEdit) already use
+// for other capabilities in this suite. No production code changes; only these two tests' own
+// fixture setup changes.
+//
+// TextEdit's document text view carries a stable, built-in AppKit identifier — "First Text
+// View" — that is not user data, not randomly generated, and not something this test fabricates:
+// it is the same real AXIdentifier a fresh Untitled TextEdit document has always exposed, empirically
+// confirmed live against this exact build. Matching against it uses the identical
+// role+identifier semantic-matching path (`collectMatches`/`snapshotIfMatches`) every other test
+// in this file already relies on — no fake AX roles, subroles, or identifiers of any kind.
+
+/// Launches a genuinely separate TextEdit process with exactly one fresh, empty "Untitled"
+/// document and waits for real, independently-observed AX evidence (the system-wide focused
+/// element's real AXIdentifier) that its document text view is both resolvable and genuinely
+/// focused — never assumed, never fabricated. Deliberately refuses to launch (returns `nil`,
+/// exactly like every other environmental-limitation no-op in this file) if TextEdit is already
+/// running: a second window would make "First Text View" ambiguous across windows, and any
+/// pre-existing TextEdit window may be the user's own real, unrelated work, which this fixture
+/// must never touch.
+@MainActor
+private func launchIsolatedTextEditFixture(timeout: TimeInterval = 6.0) async -> NSRunningApplication? {
+    guard AXIsProcessTrusted() else { return nil }
+    guard !NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.apple.TextEdit" }) else {
+        return nil
+    }
+    guard let bundleUrl = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.TextEdit") else {
+        return nil
+    }
+    let config = NSWorkspace.OpenConfiguration()
+    config.createsNewApplicationInstance = false
+    guard let app = try? await NSWorkspace.shared.openApplication(at: bundleUrl, configuration: config) else {
+        return nil
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        app.activate(options: [])
+        if rawAXFocusedIdentifier() == "First Text View" { return app }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+    return rawAXFocusedIdentifier() == "First Text View" ? app : nil
+}
+
+/// Force-terminates the isolated TextEdit fixture launched by `launchIsolatedTextEditFixture`.
+/// Deliberately `forceTerminate()`, never a graceful `.terminate()`/window close: the fixture
+/// document is disposable, test-written content (never real user data), and a graceful close
+/// would raise TextEdit's native "Do you want to save the changes…?" alert — an unhandled modal
+/// dialog that would itself hang the test, exactly the failure mode this whole fixture exists to
+/// eliminate.
+private func terminateTextEditFixture(_ app: NSRunningApplication?) {
+    app?.forceTerminate()
+}
+
+/// Best-effort, read-only re-resolution of TextEdit's document text view by its real AXIdentifier
+/// (mirroring `QBridgeAccessibility`'s own `collectMatches`/`snapshotIfMatches` role+identifier
+/// matching exactly), used only so these tests can independently confirm — via a second, raw AX
+/// read entirely outside the production capability under test — what the capability actually
+/// wrote. Returns `nil` if TextEdit is not running or the element is not uniquely resolvable.
+private func rawTextEditDocumentValue() -> String? {
+    guard let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.TextEdit" }) else {
+        return nil
+    }
+    let appElement = AXUIElementCreateApplication(running.processIdentifier)
+
+    func axString(_ attribute: String, _ element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+    func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AXUIElement] else { return [] }
+        return children
+    }
+    func findDocumentTextArea(_ element: AXUIElement, depth: Int) -> AXUIElement? {
+        guard depth <= 12 else { return nil }
+        if axString(kAXRoleAttribute as String, element) == "AXTextArea",
+           axString("AXIdentifier", element) == "First Text View" {
+            return element
+        }
+        for child in axChildren(element) {
+            if let found = findDocumentTextArea(child, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+    guard let textArea = findDocumentTextArea(appElement, depth: 0) else { return nil }
+    return axString(kAXValueAttribute as String, textArea)
+}
+
+// MARK: - Real macOS E2E fixture: a genuinely separate, out-of-process Safari instance
+//
+// Test 2 specifically requires a genuine AXTextField (not AXTextArea, which TextEdit's document
+// view already covers for tests 3/11/18). Safari's toolbar address/search field is a genuine
+// AXTextField carrying a real, stable, hand-assigned AppKit/Safari identifier —
+// "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" — empirically confirmed live against this exact build
+// (real AXTextField role, real settable AXValue, real non-fake identifier). Mirrors the
+// TextEdit fixture above exactly; no new abstraction.
+
+/// Launches a genuinely separate Safari process and waits for real AX evidence that its toolbar
+/// address/search field is both resolvable and genuinely focused. Mirrors
+/// `launchIsolatedTextEditFixture` exactly. Deliberately refuses to launch (returns `nil`) if
+/// Safari is already running — Safari is commonly already open with the user's own real
+/// browsing session, and this fixture must never touch a pre-existing window: a second window
+/// would also make the identifier ambiguous across windows, exactly like TextEdit's
+/// "First Text View".
+@MainActor
+private func launchIsolatedSafariFixture(timeout: TimeInterval = 6.0) async -> NSRunningApplication? {
+    guard AXIsProcessTrusted() else { return nil }
+    guard !NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == "com.apple.Safari" }) else {
+        return nil
+    }
+    guard let bundleUrl = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Safari") else {
+        return nil
+    }
+    let config = NSWorkspace.OpenConfiguration()
+    config.createsNewApplicationInstance = false
+    guard let app = try? await NSWorkspace.shared.openApplication(at: bundleUrl, configuration: config) else {
+        return nil
+    }
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        app.activate(options: [])
+        if rawAXFocusedIdentifier() == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" { return app }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+    }
+    return rawAXFocusedIdentifier() == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" ? app : nil
+}
+
+/// Force-terminates the isolated Safari fixture launched by `launchIsolatedSafariFixture` —
+/// mirrors `terminateTextEditFixture`. Only ever terminates the process this fixture itself
+/// launched: `launchIsolatedSafariFixture` never returns non-nil for a pre-existing instance, so
+/// this can never touch a Safari process the test didn't itself start.
+private func terminateSafariFixture(_ app: NSRunningApplication?) {
+    app?.forceTerminate()
+}
+
+/// Best-effort, read-only re-resolution of Safari's toolbar address/search field by its real
+/// AXIdentifier — mirrors `rawTextEditDocumentValue` exactly.
+private func rawSafariAddressBarValue() -> String? {
+    guard let running = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.Safari" }) else {
+        return nil
+    }
+    let appElement = AXUIElementCreateApplication(running.processIdentifier)
+
+    func axString(_ attribute: String, _ element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+    func axChildren(_ element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success,
+              let children = value as? [AXUIElement] else { return [] }
+        return children
+    }
+    func findAddressField(_ element: AXUIElement, depth: Int) -> AXUIElement? {
+        guard depth <= 14 else { return nil }
+        if axString(kAXRoleAttribute as String, element) == "AXTextField",
+           axString("AXIdentifier", element) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" {
+            return element
+        }
+        for child in axChildren(element) {
+            if let found = findAddressField(child, depth: depth + 1) { return found }
+        }
+        return nil
+    }
+    guard let field = findAddressField(appElement, depth: 0) else { return nil }
+    return axString(kAXValueAttribute as String, field)
+}
+
 @Suite("QSemanticTextEntryTests")
 struct QSemanticTextEntryTests {
 
@@ -168,19 +351,26 @@ struct QSemanticTextEntryTests {
     @Test("2. A valid, focused AXTextField target is written exactly once via AX only")
     @MainActor
     func validTextFieldTargetIsWritten() async throws {
-        guard AXIsProcessTrusted() else { return }
-        let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "field-\(suffix)", initialValue: "before")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "field-\(suffix)") else { return }
+        // Real macOS cross-process E2E: a genuinely separate Safari process, never this test
+        // host's own process. Test 2 specifically requires a genuine AXTextField (TextEdit's
+        // document view is AXTextArea, covered separately by tests 3/11/18) — Safari's toolbar
+        // address/search field is the real, empirically-confirmed AXTextField fixture for this.
+        guard let safariApp = await launchIsolatedSafariFixture() else { return }
+        defer { terminateSafariFixture(safariApp) }
+
+        // The field's starting content is whatever Safari's fresh window happens to show (its
+        // configured start page URL, or empty) — never assumed, always independently read via a
+        // real AX call, exactly like every other independent-verification read in this file.
+        guard let previousValue = rawSafariAddressBarValue() else { return }
+        let newValue = "https://example.invalid/QSemanticTextEntryTests-test-2"
 
         let outcome = try await QBridgeAccessibility.shared.setTextValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "field-\(suffix)", title: nil, newValue: "after"
+            applicationName: "Safari", role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", title: nil, newValue: newValue
         )
         #expect(outcome.valueChanged == true)
-        #expect(outcome.previousLength == "before".count)
-        #expect(outcome.currentLength == "after".count)
-        #expect(field.stringValue == "after")
+        #expect(outcome.previousLength == previousValue.count)
+        #expect(outcome.currentLength == newValue.count)
+        #expect(rawSafariAddressBarValue() == newValue)
     }
 
     // MARK: - 3. Valid AXTextArea resolves and is written
@@ -283,22 +473,30 @@ struct QSemanticTextEntryTests {
     @Test("7. A valid, resolvable target that is NOT focused fails closed and is never mutated by any fallback path")
     @MainActor
     func wrongFocusFailsClosed() async throws {
-        guard AXIsProcessTrusted() else { return }
-        let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "unfocused-\(suffix)", initialValue: "unchanged")
-        defer { window.close() }
-        // Deliberately do NOT call makeFirstResponder / establish focus.
+        // Real macOS cross-process E2E: reuses the same isolated Safari fixture as test 2. Unlike
+        // test 2, this test needs a target that is genuinely resolvable but NOT the system's
+        // currently focused element. The fixture's own launch/ready-check always confirms real
+        // focus first (never an unverified assumption), so "not focused" here is produced by
+        // deliberately stealing focus back to this test host immediately afterward — a genuine
+        // state change, not a skipped focus step.
+        guard let safariApp = await launchIsolatedSafariFixture() else { return }
+        defer { terminateSafariFixture(safariApp) }
+
+        NSApp.activate(ignoringOtherApps: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
+        guard rawAXFocusedIdentifier() != "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" else { return }
+
+        guard let previousValue = rawSafariAddressBarValue() else { return }
 
         do {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "unfocused-\(suffix)", title: nil, newValue: "hacked"
+                applicationName: "Safari", role: "AXTextField", identifier: "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD", title: nil, newValue: "hacked"
             )
             // If the real environment happens to have already focused this field for some
             // window-server reason outside this test's control, that's not this test's concern —
             // but if we get here on a genuinely unfocused field, that's the bug this test exists
             // to catch, so only assert the negative when we can independently confirm non-focus.
-            if rawAXFocusedIdentifier() != "unfocused-\(suffix)" {
+            if rawAXFocusedIdentifier() != "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" {
                 Issue.record("setTextValue succeeded against a target that was not the focused AX element")
             }
         } catch let axError as QAXInteractionError {
@@ -306,7 +504,7 @@ struct QSemanticTextEntryTests {
         }
         // Regardless of outcome, the field's content must be untouched — no CGEvent/keyboard
         // fallback, no coordinate click, ever mutated it behind the focus check.
-        #expect(field.stringValue == "unchanged")
+        #expect(rawSafariAddressBarValue() == previousValue)
     }
 
     // MARK: - 8. Already-equal value is an idempotent no-op
@@ -444,11 +642,12 @@ struct QSemanticTextEntryTests {
     @Test("11. Approving the request writes the target exactly once and completes with real, closed-loop AX verification")
     @MainActor
     func allowWritesExactlyOnceAndVerifies() async throws {
-        guard AXIsProcessTrusted() else { return }
-        let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "allow-target-\(suffix)", initialValue: "start")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "allow-target-\(suffix)") else { return }
+        // Real macOS cross-process E2E (see the fixture block above this suite): a genuinely
+        // separate TextEdit.app process, never this test host's own process — this is the one
+        // test in this file (with test 18) that drives the FULL runtime pipeline, which is what
+        // exposed the self-process AppKit/AX threading hazard documented above.
+        guard let textEditApp = await launchIsolatedTextEditFixture() else { return }
+        defer { terminateTextEditFixture(textEditApp) }
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -460,7 +659,7 @@ struct QSemanticTextEntryTests {
                   "actionName": "ui.set_text_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified text field's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "allow-target-\(suffix)", "value": "finished"}
+                  "parameters": {"applicationName": "TextEdit", "role": "AXTextArea", "identifier": "First Text View", "value": "finished"}
                 }
               ]
             }
@@ -484,7 +683,7 @@ struct QSemanticTextEntryTests {
             return
         }
         #expect(!summary.isEmpty)
-        #expect(field.stringValue == "finished")
+        #expect(rawTextEditDocumentValue() == "finished")
         // Redaction across model/replan/goal-evaluation context (Phase 2I remediation): the
         // final grounded summary text is built from verified evidence, never the literal.
         #expect(summary.contains("finished") == false)
@@ -597,15 +796,14 @@ struct QSemanticTextEntryTests {
     @Test("15. Verification against a mismatched intended value fails, even though the underlying write succeeded")
     @MainActor
     func verificationFailsOnMismatch() async throws {
-        guard AXIsProcessTrusted() else { return }
-        let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "mismatch-\(suffix)", initialValue: "start")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "mismatch-\(suffix)") else { return }
+        // Real macOS cross-process E2E: reuses the same isolated TextEdit fixture as tests
+        // 11/18 — same helper, no new abstraction.
+        guard let textEditApp = await launchIsolatedTextEditFixture() else { return }
+        defer { terminateTextEditFixture(textEditApp) }
 
         // Real write via the actual capability.
         let outcome = try await QBridgeAccessibility.shared.setTextValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "mismatch-\(suffix)", title: nil, newValue: "actual"
+            applicationName: "TextEdit", role: "AXTextArea", identifier: "First Text View", title: nil, newValue: "actual"
         )
         #expect(outcome.valueChanged == true)
 
@@ -614,9 +812,9 @@ struct QSemanticTextEntryTests {
         // model's declared intent didn't match what actually landed) — must fail, not fabricate.
         let wrongIntendedHash = "0000000000000000000000000000000000000000000000000000000000000000"
         let strategy = QVerificationStrategy.axTextValueChanged(
-            applicationName: currentProcessAppName,
-            role: "AXTextField",
-            matchIdentifier: "mismatch-\(suffix)",
+            applicationName: "TextEdit",
+            role: "AXTextArea",
+            matchIdentifier: "First Text View",
             matchTitle: nil,
             targetIdentity: outcome.targetIdentity,
             previousLength: outcome.previousLength,
@@ -722,12 +920,13 @@ struct QSemanticTextEntryTests {
     @Test("18. A real successful text-entry run leaves no literal value in durable state, memory, or audit")
     @MainActor
     func realRunLeavesNoLiteralInPersistedSurfaces() async throws {
-        guard AXIsProcessTrusted() else { return }
+        // Real macOS cross-process E2E — see the fixture block above this suite. Test 18 is the
+        // other (with test 11) full-runtime-pipeline test in this file, and carries the identical
+        // self-process AppKit/AX threading hazard test 11 did before this fix.
+        guard let textEditApp = await launchIsolatedTextEditFixture() else { return }
+        defer { terminateTextEditFixture(textEditApp) }
         let suffix = UUID().uuidString
         let secret = "SECRET_TEST_VALUE_\(suffix)"
-        let (window, field) = makeTextFieldWindow(identifier: "redact-\(suffix)", initialValue: "before")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "redact-\(suffix)") else { return }
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -739,7 +938,7 @@ struct QSemanticTextEntryTests {
                   "actionName": "ui.set_text_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified text field's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "redact-\(suffix)", "value": "\(secret)"}
+                  "parameters": {"applicationName": "TextEdit", "role": "AXTextArea", "identifier": "First Text View", "value": "\(secret)"}
                 }
               ]
             }
@@ -765,7 +964,7 @@ struct QSemanticTextEntryTests {
             #expect(Bool(false), "Expected completion, got: \(resolved.state)")
             return
         }
-        #expect(field.stringValue == secret)
+        #expect(rawTextEditDocumentValue() == secret)
 
         // Durable state: arguments["value"] must be masked, never the literal.
         guard let planId = try store.getTask(taskId: task.taskId)?.currentPlanId,
