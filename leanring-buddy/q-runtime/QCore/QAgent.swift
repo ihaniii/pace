@@ -83,7 +83,14 @@ public final class QAgent: Sendable {
     public func run(
         task: String,
         sessionId: String = UUID().uuidString,
-        observer: (any QAgentStateObserver)? = nil
+        observer: (any QAgentStateObserver)? = nil,
+        /// Phase 3, tenth slice: mirrors `QCoreRuntime.submitIntent`'s own `selectedFiles`
+        /// parameter (third slice) up to this public wrapper — the last of the three
+        /// `QCoreRuntime` entry points that accept it (`submitIntent`/`resumeTask`/
+        /// `resolveApproval`) without a `QAgent`-layer counterpart. Bounded identically one layer
+        /// down; only consulted at all when local evidence collection is explicitly enabled
+        /// (default off).
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QAgentResult {
         let start = Date()
 
@@ -123,7 +130,7 @@ public final class QAgent: Sendable {
         let executedTask: QTask
         do {
             let planObserver = observer as? (any QPlanExecutionObserver)
-            executedTask = try await core.submitIntent(prompt: task, sessionId: sessionId, observer: planObserver)
+            executedTask = try await core.submitIntent(prompt: task, sessionId: sessionId, observer: planObserver, selectedFiles: selectedFiles)
         } catch {
             let duration = Date().timeIntervalSince(start)
             observer?.agentDidTransition(state: .error, message: error.localizedDescription)

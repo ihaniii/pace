@@ -2,16 +2,20 @@
 //  QAgentResponseSurfaceTests.swift
 //  leanring-buddyTests
 //
-//  Q × Pace Decision Engine — Phase 3, eighth and ninth slices: the QAgent response-path surface.
-//  `QAgent.verifiedResponse(forTask:)` is the first entry point through which any caller outside a
-//  test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice) — before slice
-//  eight, `QCoreRuntime.verifiedResponse(forTask:)` had zero callers outside tests. `QAgent.resume`
-//  also gained the seventh slice's own `selectedFiles:` parameter, previously only reachable by
-//  constructing `QCoreRuntime` directly. Slice nine closes the one asymmetry slice eight left:
-//  `QAgent.approve`/`QCoreRuntime.resolveApproval` gain the identical `selectedFiles:` parameter, so
-//  an approval-grant resume can supply local evidence exactly like a crash-recovery resume already
-//  could. These tests prove every surface forwards faithfully (never invents, never alters), adds no
-//  new pipeline run/model call/authority, and is refused (not fabricated) when nothing was assembled.
+//  Q × Pace Decision Engine — Phase 3, eighth through tenth slices: the QAgent response-path
+//  surface. `QAgent.verifiedResponse(forTask:)` is the first entry point through which any caller
+//  outside a test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice) —
+//  before slice eight, `QCoreRuntime.verifiedResponse(forTask:)` had zero callers outside tests.
+//  `QAgent.resume` also gained the seventh slice's own `selectedFiles:` parameter, previously only
+//  reachable by constructing `QCoreRuntime` directly. Slice nine closed the asymmetry slice eight
+//  left: `QAgent.approve`/`QCoreRuntime.resolveApproval` gained the identical `selectedFiles:`
+//  parameter, so an approval-grant resume can supply local evidence exactly like a crash-recovery
+//  resume already could. Slice ten closes the last one: `QAgent.run` — the original, most-used
+//  public entry point (Phase 1F, predating Phase 3 entirely) — gains the same `selectedFiles:`
+//  parameter, completing symmetry with all three `QCoreRuntime` entry points that accept it
+//  (`submitIntent`/`resumeTask`/`resolveApproval`). These tests prove every surface forwards
+//  faithfully (never invents, never alters), adds no new pipeline run/model call/authority, and is
+//  refused (not fabricated) when nothing was assembled.
 //
 
 import Testing
@@ -244,6 +248,58 @@ struct QAgentResponseSurfaceTests {
         #expect(true)   // reaching this point without a crash/hang is the assertion
     }
 
+    // MARK: - Phase 3, tenth slice: run(selectedFiles:) forwards faithfully
+
+    @Test("QAgent.run threads selectedFiles through to QCoreRuntime.submitIntent, and its evidence reaches the verified response")
+    func runThreadsSelectedFilesThrough() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q-agent-run-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("note.txt")
+        try "capital of france: paris".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let core = QCoreRuntime(
+            modelProvider: FakeModelCandidateProvider(backends: [.ollama]), executionProvider: MockExecutionProvider(),
+            durableStore: try QDurableTaskStore(inMemory: true),
+            verifiedResponse: QVerifiedResponseConfiguration(localEvidence: .init(isEnabled: true)),
+            endpointName: "ars-\(UUID().uuidString)"
+        )
+        let agent = QAgent(coreRuntime: core)
+
+        let result = try await agent.run(task: "What is the capital of France?", selectedFiles: [QSelectedFileHandle(path: fileURL.path)])
+        #expect(result.isSuccess)
+
+        let rendered = try #require(try await agent.verifiedResponse(forTask: result.taskId))
+        #expect(rendered.text.contains("capital of france: paris"))
+    }
+
+    @Test("QAgent.run without selectedFiles (the default) behaves exactly as it did before this slice")
+    func runWithoutSelectedFilesIsUnchanged() async throws {
+        let core = QCoreRuntime(
+            modelProvider: FakeModelCandidateProvider(backends: [.ollama]), executionProvider: MockExecutionProvider(),
+            durableStore: try QDurableTaskStore(inMemory: true), endpointName: "ars-\(UUID().uuidString)"
+        )
+        let agent = QAgent(coreRuntime: core)
+
+        let result = try await agent.run(task: "What is the capital of France?")
+        #expect(result.isSuccess)
+    }
+
+    @Test("selectedFiles supplied to QAgent.run are bounded the same way submitIntent's are")
+    func runSelectedFilesAreBounded() async throws {
+        let core = QCoreRuntime(
+            modelProvider: FakeModelCandidateProvider(backends: [.ollama]), executionProvider: MockExecutionProvider(),
+            durableStore: try QDurableTaskStore(inMemory: true),
+            verifiedResponse: QVerifiedResponseConfiguration(localEvidence: .init(isEnabled: true)),
+            endpointName: "ars-\(UUID().uuidString)"
+        )
+        let agent = QAgent(coreRuntime: core)
+
+        let tooMany = (0..<(QLocalEvidenceLimits.maxSelectedFilesPerRequest + 5)).map { QSelectedFileHandle(path: "/nonexistent-\($0).txt") }
+        let result = try await agent.run(task: "What is the capital of France?", selectedFiles: tooMany)
+        #expect(result.isSuccess)   // reaching a normal completion without a crash/hang is the assertion
+    }
+
     // MARK: - Static audit: no IPC exposure, no new authority
 
     @Test("Static audit: the response surface adds a plain method, never wired into QIPCChannel, and references no authority type")
@@ -254,9 +310,10 @@ struct QAgentResponseSurfaceTests {
             encoding: .utf8
         )
         #expect(source.contains("func verifiedResponse(forTask"))
+        #expect(source.contains("func run("))
         #expect(source.contains("func approve("))
         let selectedFilesCount = source.components(separatedBy: "selectedFiles: [QSelectedFileHandle] = []").count - 1
-        #expect(selectedFilesCount == 2, "expected exactly two default-empty selectedFiles parameters (resume and approve), found \(selectedFilesCount)")
+        #expect(selectedFilesCount == 3, "expected exactly three default-empty selectedFiles parameters (run, resume, and approve), found \(selectedFilesCount)")
         #expect(!source.contains("QIPCMessageType.verifiedResponse"))
         #expect(!source.contains("registerHandler(for: .verifiedResponse"))
         let codeLines = source.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
