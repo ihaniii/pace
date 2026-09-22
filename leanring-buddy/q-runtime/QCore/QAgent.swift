@@ -217,10 +217,36 @@ public final class QAgent: Sendable {
         return core.recordUserFeedback(taskId: taskId, feedback: feedback)
     }
 
+    /// Phase 3, eighth slice: the response-path surface. Forwards VERBATIM to
+    /// `QCoreRuntime.verifiedResponse(forTask:)` — the first entry point through which any caller
+    /// outside a test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice).
+    /// It adds no logic of its own: `QRenderedResponse` is returned exactly as the pool-backed
+    /// assembler/renderer produced it (or `nil` if nothing was assembled, e.g. the Verified
+    /// Response path isn't configured, or the task is unknown). This is purely a READ of state
+    /// `QCoreRuntime` already computed elsewhere — it triggers no new pipeline run, no model call,
+    /// and changes no task state, permission, egress, or resource authority. Deliberately a plain
+    /// Swift method, not a new `QIPCMessageType` case, matching the sixth slice's own precedent.
+    public func verifiedResponse(forTask taskId: String) async throws -> QRenderedResponse? {
+        let bootstrap = QRuntimeBootstrap.shared
+        if customCore == nil && bootstrap.getCoreRuntime() == nil {
+            await bootstrap.bootstrap()
+        }
+        guard let core = customCore ?? bootstrap.getCoreRuntime() else {
+            throw QAgentError.runtimeNotBootstrapped("Q Runtime failed to initialize core orchestrator.")
+        }
+        return core.verifiedResponse(forTask: taskId)
+    }
+
     /// Resumes an interrupted or incomplete task from durable storage after crash or restart.
     public func resume(
         taskId: String,
-        observer: (any QAgentStateObserver)? = nil
+        observer: (any QAgentStateObserver)? = nil,
+        /// Phase 3, eighth slice: mirrors `QCoreRuntime.resumeTask`'s own `selectedFiles`
+        /// parameter (added in the seventh slice for resume-path parity) up to this public
+        /// wrapper — previously only reachable by constructing `QCoreRuntime` directly. Bounded
+        /// identically one layer down (`QLocalEvidenceLimits.maxSelectedFilesPerRequest`); only
+        /// consulted at all when local evidence collection is explicitly enabled (default off).
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QAgentResult {
         let start = Date()
         observer?.agentDidTransition(state: .starting, message: "Resuming durable task \(taskId)")
@@ -236,7 +262,7 @@ public final class QAgent: Sendable {
         }
 
         let planObserver = observer as? (any QPlanExecutionObserver)
-        let resumedTask = try await core.resumeTask(taskId: taskId, observer: planObserver)
+        let resumedTask = try await core.resumeTask(taskId: taskId, observer: planObserver, selectedFiles: selectedFiles)
         let duration = Date().timeIntervalSince(start)
 
         switch resumedTask.state {
