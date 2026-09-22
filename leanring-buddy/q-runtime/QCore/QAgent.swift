@@ -317,7 +317,12 @@ public final class QAgent: Sendable {
         taskId: String,
         approvalId: UUID,
         decision: QApprovalDecision,
-        observer: (any QAgentStateObserver)? = nil
+        observer: (any QAgentStateObserver)? = nil,
+        /// Phase 3, ninth slice: mirrors `QCoreRuntime.resolveApproval`'s own `selectedFiles`
+        /// parameter up to this public wrapper — closes the asymmetry the eighth slice's own
+        /// `resume(selectedFiles:)` left at this call. Bounded identically one layer down; only
+        /// consulted at all when local evidence collection is explicitly enabled (default off).
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QAgentResult {
         let start = Date()
         observer?.agentDidTransition(state: .starting, message: "Resolving approval \(approvalId) for task \(taskId)")
@@ -333,7 +338,7 @@ public final class QAgent: Sendable {
         }
 
         let planObserver = observer as? (any QPlanExecutionObserver)
-        let resolvedTask = try await core.resolveApproval(taskId: taskId, approvalId: approvalId, decision: decision, observer: planObserver)
+        let resolvedTask = try await core.resolveApproval(taskId: taskId, approvalId: approvalId, decision: decision, observer: planObserver, selectedFiles: selectedFiles)
         let duration = Date().timeIntervalSince(start)
 
         switch resolvedTask.state {

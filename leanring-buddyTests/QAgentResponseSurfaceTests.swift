@@ -2,14 +2,16 @@
 //  QAgentResponseSurfaceTests.swift
 //  leanring-buddyTests
 //
-//  Q × Pace Decision Engine — Phase 3, eighth slice: the QAgent response-path surface.
+//  Q × Pace Decision Engine — Phase 3, eighth and ninth slices: the QAgent response-path surface.
 //  `QAgent.verifiedResponse(forTask:)` is the first entry point through which any caller outside a
-//  test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice) — before this
-//  slice, `QCoreRuntime.verifiedResponse(forTask:)` had zero callers outside tests. `QAgent.resume`
+//  test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice) — before slice
+//  eight, `QCoreRuntime.verifiedResponse(forTask:)` had zero callers outside tests. `QAgent.resume`
 //  also gained the seventh slice's own `selectedFiles:` parameter, previously only reachable by
-//  constructing `QCoreRuntime` directly. These tests prove both surfaces forward faithfully (never
-//  invent, never alter), add no new pipeline run/model call/authority, and are refused (not
-//  fabricated) when nothing was assembled.
+//  constructing `QCoreRuntime` directly. Slice nine closes the one asymmetry slice eight left:
+//  `QAgent.approve`/`QCoreRuntime.resolveApproval` gain the identical `selectedFiles:` parameter, so
+//  an approval-grant resume can supply local evidence exactly like a crash-recovery resume already
+//  could. These tests prove every surface forwards faithfully (never invents, never alters), adds no
+//  new pipeline run/model call/authority, and is refused (not fabricated) when nothing was assembled.
 //
 
 import Testing
@@ -135,6 +137,113 @@ struct QAgentResponseSurfaceTests {
         #expect(result.isSuccess)
     }
 
+    // MARK: - Phase 3, ninth slice: approve(selectedFiles:) forwards faithfully
+
+    @Test("QAgent.approve threads selectedFiles through to QCoreRuntime.resolveApproval, and its evidence reaches the verified response — closing the asymmetry the eighth slice left at this call")
+    func approveThreadsSelectedFilesThrough() async throws {
+        // Deliberately MockExecutionProvider (never a real execution path): this test only needs
+        // to prove selectedFiles reaches the post-approval verified response, not that the
+        // underlying clipboard step itself succeeds — its own verification legitimately reads the
+        // REAL system pasteboard regardless of execution provider (see QPlanExecutor), so with a
+        // mock write it correctly does not verify. That is expected and irrelevant here: slice 7
+        // already established that recordEvidenceEvaluation (and therefore local evidence
+        // collection) runs for BOTH outcomes, satisfied or not.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("q-agent-approve-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("note.txt")
+        try "capital of france: paris".write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let store = try QDurableTaskStore(inMemory: true)
+        let model = RecordingDecisionAwareModelProvider()
+        model.structuredPlansToReturn = [
+            """
+            {
+              "taskPrompt": "Write marker to clipboard",
+              "steps": [
+                { "actionName": "system.clipboard.write", "toolFamily": "system", "description": "Write a marker", "parameters": {"text": "q-agent-approve-marker"} }
+              ]
+            }
+            """
+        ]
+        let core = QCoreRuntime(
+            modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store,
+            verifiedResponse: QVerifiedResponseConfiguration(localEvidence: .init(isEnabled: true)),
+            endpointName: "ars-\(UUID().uuidString)"
+        )
+        let agent = QAgent(coreRuntime: core)
+        let task = try await core.submitIntent(prompt: "Write marker to clipboard")
+        guard case .awaitingApproval(let approval) = task.state else {
+            Issue.record("expected .awaitingApproval, got \(task.state)")
+            return
+        }
+
+        _ = try await agent.approve(
+            taskId: task.taskId, approvalId: approval.id, decision: .approved,
+            selectedFiles: [QSelectedFileHandle(path: fileURL.path)]
+        )
+
+        let rendered = try #require(try await agent.verifiedResponse(forTask: task.taskId))
+        #expect(rendered.text.contains("capital of france: paris"))
+    }
+
+    @Test("QAgent.approve without selectedFiles (the default) behaves exactly as it did before this slice")
+    func approveWithoutSelectedFilesIsUnchanged() async throws {
+        let store = try QDurableTaskStore(inMemory: true)
+        let model = RecordingDecisionAwareModelProvider()
+        model.structuredPlansToReturn = [
+            """
+            {
+              "taskPrompt": "Write marker to clipboard",
+              "steps": [
+                { "actionName": "system.clipboard.write", "toolFamily": "system", "description": "Write a marker", "parameters": {"text": "q-agent-approve-marker-2"} }
+              ]
+            }
+            """
+        ]
+        let core = QCoreRuntime(modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store, endpointName: "ars-\(UUID().uuidString)")
+        let agent = QAgent(coreRuntime: core)
+        let task = try await core.submitIntent(prompt: "Write marker to clipboard")
+        guard case .awaitingApproval(let approval) = task.state else {
+            Issue.record("expected .awaitingApproval, got \(task.state)")
+            return
+        }
+
+        let result = try await agent.approve(taskId: task.taskId, approvalId: approval.id, decision: .approved)
+        #expect(result.taskId == task.taskId)   // reaching a real, matching QAgentResult without a crash/hang is the assertion
+    }
+
+    @Test("selectedFiles supplied to QAgent.approve are bounded the same way resumeTask's are")
+    func approveSelectedFilesAreBounded() async throws {
+        let store = try QDurableTaskStore(inMemory: true)
+        let model = RecordingDecisionAwareModelProvider()
+        model.structuredPlansToReturn = [
+            """
+            {
+              "taskPrompt": "Write marker to clipboard",
+              "steps": [
+                { "actionName": "system.clipboard.write", "toolFamily": "system", "description": "Write a marker", "parameters": {"text": "q-agent-approve-marker-3"} }
+              ]
+            }
+            """
+        ]
+        let core = QCoreRuntime(
+            modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store,
+            verifiedResponse: QVerifiedResponseConfiguration(localEvidence: .init(isEnabled: true)),
+            endpointName: "ars-\(UUID().uuidString)"
+        )
+        let agent = QAgent(coreRuntime: core)
+        let task = try await core.submitIntent(prompt: "Write marker to clipboard")
+        guard case .awaitingApproval(let approval) = task.state else {
+            Issue.record("expected .awaitingApproval, got \(task.state)")
+            return
+        }
+
+        let tooMany = (0..<(QLocalEvidenceLimits.maxSelectedFilesPerRequest + 5)).map { QSelectedFileHandle(path: "/nonexistent-\($0).txt") }
+        _ = try await agent.approve(taskId: task.taskId, approvalId: approval.id, decision: .approved, selectedFiles: tooMany)
+        #expect(true)   // reaching this point without a crash/hang is the assertion
+    }
+
     // MARK: - Static audit: no IPC exposure, no new authority
 
     @Test("Static audit: the response surface adds a plain method, never wired into QIPCChannel, and references no authority type")
@@ -145,7 +254,9 @@ struct QAgentResponseSurfaceTests {
             encoding: .utf8
         )
         #expect(source.contains("func verifiedResponse(forTask"))
-        #expect(source.contains("selectedFiles: [QSelectedFileHandle] = []"))
+        #expect(source.contains("func approve("))
+        let selectedFilesCount = source.components(separatedBy: "selectedFiles: [QSelectedFileHandle] = []").count - 1
+        #expect(selectedFilesCount == 2, "expected exactly two default-empty selectedFiles parameters (resume and approve), found \(selectedFilesCount)")
         #expect(!source.contains("QIPCMessageType.verifiedResponse"))
         #expect(!source.contains("registerHandler(for: .verifiedResponse"))
         let codeLines = source.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }

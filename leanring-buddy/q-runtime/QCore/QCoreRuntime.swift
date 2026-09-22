@@ -1029,8 +1029,16 @@ public final class QCoreRuntime: @unchecked Sendable {
         taskId: String,
         approvalId: UUID,
         decision: QApprovalDecision,
-        observer: (any QPlanExecutionObserver)? = nil
+        observer: (any QPlanExecutionObserver)? = nil,
+        /// Phase 3, ninth slice: mirrors `resumeTask`'s own `selectedFiles` parameter (seventh
+        /// slice), closing the one asymmetry it left — an approval-grant resume could not supply
+        /// local evidence for THIS resume attempt even though a crash-recovery resume could.
+        /// Bounded the same way, one layer down in `executeResumedPlan`; only consulted at all
+        /// when local evidence collection is explicitly enabled (default off), and irrelevant
+        /// entirely on a denial (no resume occurs).
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QTask {
+        let boundedSelectedFiles = Array(selectedFiles.prefix(QLocalEvidenceLimits.maxSelectedFilesPerRequest))
         guard let durableStore else {
             var task = QTask(taskId: taskId, sessionId: "approval", intent: "Unknown Task")
             task.state = .failed(reason: "Cannot resolve approval: no durable store configured.")
@@ -1111,7 +1119,8 @@ public final class QCoreRuntime: @unchecked Sendable {
                 taskState: durableState,
                 planSnapshot: planSnapshot,
                 livePlan: consumeLivePlanAwaitingApproval(planId: planId),
-                observer: observer
+                observer: observer,
+                selectedFiles: boundedSelectedFiles
             )
         }
     }
