@@ -1343,6 +1343,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         lock.lock()
         let configuration = verifiedResponseConfiguration
         let memory = memoryProvider
+        let capability = capabilityMemory
         lock.unlock()
         guard let configuration else { return }
 
@@ -1383,6 +1384,16 @@ public final class QCoreRuntime: @unchecked Sendable {
         payload["answerClaimCount"] = "\(pipelineResult.pool.claims.filter { $0.originKind == .modelGenerated }.count)"
         payload["localEvidenceEnabled"] = "\(configuration.localEvidence.isEnabled)"
         payload["collectedEvidenceCount"] = "\(pipelineResult.pool.items.filter { $0.source.kind == .retrievedExternal }.count)"
+
+        // Phase 3 (fourth slice): candidate-level attribution of this pool's model-generated claims —
+        // additive, and entirely separate from the task-level learning `recordEvidenceEvaluation`
+        // already performed on the PRIMARY pool above. Only runs when capability memory exists;
+        // never adds a model call, and never touches task state, permissions, egress, or resources.
+        if let capability {
+            let attributionReport = QOutcomeLearningService(memory: capability)
+                .learnCandidateAttribution(pool: pipelineResult.pool, decisionPlan: decisionPlan, now: now)
+            for (key, value) in attributionReport.auditPayload { payload[key] = value }
+        }
 
         var writeBackReport = QVerifiedWriteBackReport(isEnabled: false)
         if configuration.writeBack.isEnabled, let store = memory as? QVerifiedPropositionStoring {

@@ -139,6 +139,44 @@ public enum QOutcomeDerivation {
 
 // MARK: - Service
 
+/// Additive report for `QOutcomeLearningService.learnCandidateAttribution` — entirely separate from
+/// `QOutcomeLearningReport` (task-level). Counts and enum-derived values only.
+public struct QCandidateAttributionReport: Sendable, Equatable {
+    public var recorded = 0
+    public var duplicates = 0
+    public var conflicts = 0
+    public var storeUnavailable = 0
+    public var rejections: [QObservationRejection: Int] = [:]
+    /// Claims whose verification never produced a verdict (`.pending`/`.notRequired`) — counted, never recorded.
+    public var notEvaluatedCount = 0
+    /// Claims whose origin carried no candidate/attempt/backend identity — counted, never recorded.
+    public var attributionUnavailableCount = 0
+
+    public var rejectedCount: Int { rejections.values.reduce(0, +) }
+
+    mutating func tally(_ result: QObservationRecordResult) {
+        switch result {
+        case .recorded, .upgraded: recorded += 1
+        case .duplicate: duplicates += 1
+        case .conflictingDuplicate: conflicts += 1
+        case .rejected(let reason): rejections[reason, default: 0] += 1
+        case .storeUnavailable: storeUnavailable += 1
+        }
+    }
+
+    /// Counts only — safe for a lifecycle event payload.
+    public var auditPayload: [String: String] {
+        [
+            "candidateAttributionRecorded": "\(recorded)",
+            "candidateAttributionDuplicates": "\(duplicates)",
+            "candidateAttributionConflicts": "\(conflicts)",
+            "candidateAttributionRejected": "\(rejectedCount)",
+            "candidateAttributionNotEvaluated": "\(notEvaluatedCount)",
+            "candidateAttributionUnavailable": "\(attributionUnavailableCount)"
+        ]
+    }
+}
+
 public struct QOutcomeLearningService: Sendable {
     public let memory: QModelCapabilityMemory
 
@@ -203,6 +241,68 @@ public struct QOutcomeLearningService: Sendable {
     @discardableResult
     public func recordUserFeedback(taskId: String, feedback: QExplicitUserFeedback, now: Date = Date()) -> [QObservationRecordResult] {
         memory.recordUserFeedback(taskId: taskId, feedback: feedback, now: now)
+    }
+
+    /// Phase 3 (fourth slice): resolves candidate attribution from `pool` (`QCandidateAttributionResolver`,
+    /// pure) and records a bounded observation for every claim where a candidate is both KNOWN and
+    /// has an actual verdict (`.verified`/`.contradicted`/`.unresolved`). A claim that was never
+    /// evaluated (`.notEvaluated`) or whose origin carries no candidate identity
+    /// (`.attributionUnavailable`) is counted but never recorded — there is neither a verdict nor a
+    /// backend to attribute a capability observation to.
+    ///
+    /// Entirely additive: `learn(_:now:)` above (task-level learning) is never called from here and
+    /// is completely unaffected by this method existing or being called. Idempotent for the same
+    /// reason `learn` is — identity is deterministic (`taskId` + a claim-specific attempt marker +
+    /// `backend` + `.claimAttribution`), so re-resolving the same pool twice reports `.duplicate` the
+    /// second time, never extra weight. Every write still passes through the EXISTING
+    /// `QModelCapabilityMemory`/store safety rules unchanged: the shared per-(task, backend)
+    /// observation cap already limits how many rows (of ANY source) one task can create for one
+    /// backend, so a task whose answer produced many claims cannot let that one task dominate a
+    /// candidate's profile — recorded here as `.rejected(.perTaskLimitReached)`, not silently dropped.
+    @discardableResult
+    public func learnCandidateAttribution(pool: QEvidencePool, decisionPlan: QDecisionPlan, now: Date) -> QCandidateAttributionReport {
+        var report = QCandidateAttributionReport()
+        for record in QCandidateAttributionResolver.resolve(pool: pool, now: now) {
+            switch record.outcome {
+            case .notEvaluated:
+                report.notEvaluatedCount += 1
+                continue
+            case .attributionUnavailable:
+                report.attributionUnavailableCount += 1
+                continue
+            case .verified, .contradicted, .unresolved:
+                break
+            }
+            // Structurally guaranteed by the resolver (only `.attributionUnavailable` omits it);
+            // checked again here as defense in depth rather than force-unwrapped.
+            guard let backend = record.backend else {
+                report.attributionUnavailableCount += 1
+                continue
+            }
+            let verification: QObservedVerification
+            switch record.outcome {
+            case .verified: verification = .verified
+            case .contradicted: verification = .contradicted
+            case .unresolved: verification = .unresolved
+            case .notEvaluated, .attributionUnavailable: verification = .unavailable   // unreachable
+            }
+            let observation = QModelCapabilityObservation(
+                taskId: record.taskId,
+                // A claim-specific marker — never a real Phase 2B attemptId reused across claims —
+                // so each claim gets its OWN deterministic identity and its own row.
+                attemptId: "\(record.attemptId ?? "attempt-unknown")-claim-\(record.claimId)",
+                source: .claimAttribution,
+                taskType: decisionPlan.taskType, complexity: decisionPlan.complexity,
+                backend: backend, strategy: decisionPlan.modelStrategy,
+                attemptOutcome: .accepted, verification: verification,
+                evidenceCompleteness: .none,
+                contradiction: record.contradiction == QContradictionState.conflicting.rawValue ? .unresolved : .none,
+                resource: .completed, execution: .notApplicable,
+                latencyMilliseconds: nil, observedAt: now
+            )
+            report.tally(memory.record(observation, now: now))
+        }
+        return report
     }
 
     private static func attemptVerification(_ outcome: QObservedAttemptOutcome) -> QObservedVerification {

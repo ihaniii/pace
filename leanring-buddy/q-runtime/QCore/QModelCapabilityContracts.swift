@@ -129,6 +129,11 @@ public enum QObservationSource: String, Codable, Sendable, Equatable, CaseIterab
     case taskOutcome
     /// Explicit user feedback about a task already observed.
     case userFeedback
+    /// Phase 3 (fourth slice): one model-generated CLAIM's verification outcome, attributed to the
+    /// specific candidate/backend the Evidence Pool's own provenance says produced it. See
+    /// `QCandidateAttributionContracts.swift`/`QOutcomeLearningService.learnCandidateAttribution`.
+    /// Never produced by `QOutcomeLearningService.learn` (task-level learning is unchanged).
+    case claimAttribution
 }
 
 /// Explicit user feedback ONLY. It is never inferred from silence, message length, sentiment, or
@@ -155,6 +160,14 @@ public enum QOutcomeClassifier {
     ) -> QLearnedOutcome {
         if source == .userFeedback {
             return feedback == .correction ? .correctedByUser : .unresolved
+        }
+        // A claim-attribution row carries only a verification verdict — never an attempt/resource/
+        // execution fact — so it is classified from `verification` alone, before any of the
+        // attempt-outcome-based rules below (which do not apply to it) can run.
+        if source == .claimAttribution {
+            if verification == .contradicted { return .verificationFailed }
+            if verification == .verified { return .success }
+            return .unresolved
         }
         if resource == .timedOut || attemptOutcome == .timedOut { return .timedOut }
         if resource == .cancelled || attemptOutcome == .cancelled { return .cancelled }
