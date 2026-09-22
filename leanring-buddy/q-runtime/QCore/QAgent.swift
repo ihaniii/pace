@@ -194,6 +194,29 @@ public final class QAgent: Sendable {
         }
     }
 
+    /// Phase 3, sixth slice: the explicit feedback surface. Records EXPLICIT user feedback (a
+    /// correction or confirmation) about a task this agent already ran — the only entry point
+    /// through which real user feedback can reach Phase 2D/2E capability learning. Never inferred
+    /// from silence, timing, message length, or any other signal: calling this method IS the
+    /// explicit signal, exactly matching `QCoreRuntime.recordUserFeedback`'s own contract, which
+    /// this only forwards to. Refused (not invented) for a task with no observed outcome, and for
+    /// any task once capability memory itself is unavailable — see `QObservationRecordResult`.
+    ///
+    /// This is a plain Swift API, deliberately NOT exposed over `QIPCChannel`: the IPC message
+    /// protocol is a fixed, closed set (`QIPCMessageType`) frozen in an earlier phase, and adding a
+    /// new case to it is out of scope for this slice.
+    @discardableResult
+    public func recordFeedback(taskId: String, feedback: QExplicitUserFeedback) async throws -> [QObservationRecordResult] {
+        let bootstrap = QRuntimeBootstrap.shared
+        if customCore == nil && bootstrap.getCoreRuntime() == nil {
+            await bootstrap.bootstrap()
+        }
+        guard let core = customCore ?? bootstrap.getCoreRuntime() else {
+            throw QAgentError.runtimeNotBootstrapped("Q Runtime failed to initialize core orchestrator.")
+        }
+        return core.recordUserFeedback(taskId: taskId, feedback: feedback)
+    }
+
     /// Resumes an interrupted or incomplete task from durable storage after crash or restart.
     public func resume(
         taskId: String,
