@@ -244,6 +244,28 @@ public final class QAgent: Sendable {
         return core.verifiedResponse(forTask: taskId)
     }
 
+    /// Phase 3, eleventh slice: the task-state surface. Forwards VERBATIM to
+    /// `QCoreRuntime.getTask(taskId:)` — the last dormant `QCoreRuntime` read accessor with no
+    /// `QAgent`-layer counterpart. Returns the task's CURRENT, live, in-memory state exactly as
+    /// `QCoreRuntime` holds it (e.g. `.awaitingApproval` before a call to `approve`, or
+    /// `.completed`/`.failed` afterward) — never a new state model, never reconstructed or
+    /// inferred. `nil` for an unknown task ID, never fabricated. This is purely a READ of state
+    /// `QCoreRuntime` already computed elsewhere: no I/O, no model call, no network, no filesystem
+    /// access, no AX/CGEvent, and no change to any task state, permission, egress, or resource
+    /// authority — it exposes nothing beyond what `run`/`resume`/`approve` already hand the SAME
+    /// caller via `QAgentResult` when they first ran. Deliberately a plain Swift method, not a new
+    /// `QIPCMessageType` case, matching the eighth slice's own precedent.
+    public func taskState(forTask taskId: String) async throws -> QTask? {
+        let bootstrap = QRuntimeBootstrap.shared
+        if customCore == nil && bootstrap.getCoreRuntime() == nil {
+            await bootstrap.bootstrap()
+        }
+        guard let core = customCore ?? bootstrap.getCoreRuntime() else {
+            throw QAgentError.runtimeNotBootstrapped("Q Runtime failed to initialize core orchestrator.")
+        }
+        return core.getTask(taskId: taskId)
+    }
+
     /// Resumes an interrupted or incomplete task from durable storage after crash or restart.
     public func resume(
         taskId: String,

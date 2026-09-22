@@ -2,7 +2,7 @@
 //  QAgentResponseSurfaceTests.swift
 //  leanring-buddyTests
 //
-//  Q × Pace Decision Engine — Phase 3, eighth through tenth slices: the QAgent response-path
+//  Q × Pace Decision Engine — Phase 3, eighth through eleventh slices: the QAgent response-path
 //  surface. `QAgent.verifiedResponse(forTask:)` is the first entry point through which any caller
 //  outside a test can retrieve a task's assembled `QVerifiedResponse` (Phase 3, first slice) —
 //  before slice eight, `QCoreRuntime.verifiedResponse(forTask:)` had zero callers outside tests.
@@ -10,12 +10,16 @@
 //  reachable by constructing `QCoreRuntime` directly. Slice nine closed the asymmetry slice eight
 //  left: `QAgent.approve`/`QCoreRuntime.resolveApproval` gained the identical `selectedFiles:`
 //  parameter, so an approval-grant resume can supply local evidence exactly like a crash-recovery
-//  resume already could. Slice ten closes the last one: `QAgent.run` — the original, most-used
-//  public entry point (Phase 1F, predating Phase 3 entirely) — gains the same `selectedFiles:`
+//  resume already could. Slice ten closed the last one: `QAgent.run` — the original, most-used
+//  public entry point (Phase 1F, predating Phase 3 entirely) — gained the same `selectedFiles:`
 //  parameter, completing symmetry with all three `QCoreRuntime` entry points that accept it
-//  (`submitIntent`/`resumeTask`/`resolveApproval`). These tests prove every surface forwards
-//  faithfully (never invents, never alters), adds no new pipeline run/model call/authority, and is
-//  refused (not fabricated) when nothing was assembled.
+//  (`submitIntent`/`resumeTask`/`resolveApproval`). Slice eleven closes the last dormant
+//  `QCoreRuntime` read accessor: `QAgent.taskState(forTask:)` forwards to `QCoreRuntime.getTask
+//  (taskId:)`, exposing a task's CURRENT, live, in-memory state (never a new state model) —
+//  previously reachable only by constructing `QCoreRuntime` directly. These tests prove every
+//  surface forwards faithfully (never invents, never alters), adds no new pipeline run/model
+//  call/authority, and is refused (not fabricated) when nothing was assembled or the task is
+//  unknown.
 //
 
 import Testing
@@ -87,6 +91,80 @@ struct QAgentResponseSurfaceTests {
         // separate one of its own.
         let agent = QAgent()
         _ = try? await agent.verifiedResponse(forTask: "unknown-task-id")
+        // No crash, no thrown QAgentError once bootstrap has run at least once in this process.
+    }
+
+    // MARK: - Phase 3, eleventh slice: taskState(forTask:) forwards faithfully
+
+    @Test("A task awaiting approval reports .awaitingApproval through QAgent.taskState, identical to the direct QCoreRuntime call")
+    func taskStateReflectsAwaitingApprovalParity() async throws {
+        let store = try QDurableTaskStore(inMemory: true)
+        let model = RecordingDecisionAwareModelProvider()
+        model.structuredPlansToReturn = [
+            """
+            {
+              "taskPrompt": "Write marker to clipboard",
+              "steps": [
+                { "actionName": "system.clipboard.write", "toolFamily": "system", "description": "Write a marker", "parameters": {"text": "q-agent-taskstate-marker"} }
+              ]
+            }
+            """
+        ]
+        let core = QCoreRuntime(modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store, endpointName: "ars-\(UUID().uuidString)")
+        let agent = QAgent(coreRuntime: core)
+        let submitted = try await core.submitIntent(prompt: "Write marker to clipboard")
+        guard case .awaitingApproval(let submittedApproval) = submitted.state else {
+            Issue.record("expected .awaitingApproval, got \(submitted.state)")
+            return
+        }
+
+        let viaAgent = try await agent.taskState(forTask: submitted.taskId)
+        let viaCoreDirectly = core.getTask(taskId: submitted.taskId)
+        guard case .awaitingApproval(let agentApproval) = viaAgent?.state,
+              case .awaitingApproval(let directApproval) = viaCoreDirectly?.state else {
+            Issue.record("expected both to report .awaitingApproval, got \(String(describing: viaAgent?.state)) / \(String(describing: viaCoreDirectly?.state))")
+            return
+        }
+        #expect(viaAgent?.taskId == submitted.taskId)
+        #expect(agentApproval.id == submittedApproval.id)
+        #expect(agentApproval.id == directApproval.id)
+    }
+
+    @Test("A completed task reports .completed through QAgent.taskState, identical to the direct QCoreRuntime call")
+    func taskStateReflectsCompletedParity() async throws {
+        let (agent, core) = makeAgentAndCore(configured: false)
+        let submitted = try await core.submitIntent(prompt: "What is the capital of France?")
+        guard case .completed(let submittedSummary) = submitted.state else {
+            Issue.record("expected .completed, got \(submitted.state)")
+            return
+        }
+
+        let viaAgent = try await agent.taskState(forTask: submitted.taskId)
+        let viaCoreDirectly = core.getTask(taskId: submitted.taskId)
+        guard case .completed(let agentSummary) = viaAgent?.state,
+              case .completed(let directSummary) = viaCoreDirectly?.state else {
+            Issue.record("expected both to report .completed, got \(String(describing: viaAgent?.state)) / \(String(describing: viaCoreDirectly?.state))")
+            return
+        }
+        #expect(viaAgent?.taskId == submitted.taskId)
+        #expect(agentSummary == submittedSummary)
+        #expect(agentSummary == directSummary)
+    }
+
+    @Test("An unknown task ID returns nil from QAgent.taskState, never an error and never invented content")
+    func taskStateForUnknownTaskIsNil() async throws {
+        let (agent, _) = makeAgentAndCore(configured: false)
+        #expect(try await agent.taskState(forTask: "task-that-never-ran") == nil)
+    }
+
+    @Test("Without an explicit core runtime, taskState resolves the shared bootstrap coordinator's runtime, throwing only if bootstrap genuinely never produced one")
+    func taskStateResolvesBootstrapWhenNoCustomCoreProvided() async throws {
+        // Mirrors verifiedResponseResolvesBootstrapWhenNoCustomCoreProvided: QAgent() with no
+        // arguments uses QRuntimeBootstrap.shared, already exercised elsewhere in this suite — this
+        // only proves taskState follows the SAME resolution path as run()/resume()/verifiedResponse(),
+        // never a separate one of its own.
+        let agent = QAgent()
+        _ = try? await agent.taskState(forTask: "unknown-task-id")
         // No crash, no thrown QAgentError once bootstrap has run at least once in this process.
     }
 
@@ -310,12 +388,16 @@ struct QAgentResponseSurfaceTests {
             encoding: .utf8
         )
         #expect(source.contains("func verifiedResponse(forTask"))
+        #expect(source.contains("func taskState(forTask"))
+        #expect(source.contains("return core.getTask(taskId: taskId)"))
         #expect(source.contains("func run("))
         #expect(source.contains("func approve("))
         let selectedFilesCount = source.components(separatedBy: "selectedFiles: [QSelectedFileHandle] = []").count - 1
         #expect(selectedFilesCount == 3, "expected exactly three default-empty selectedFiles parameters (run, resume, and approve), found \(selectedFilesCount)")
         #expect(!source.contains("QIPCMessageType.verifiedResponse"))
         #expect(!source.contains("registerHandler(for: .verifiedResponse"))
+        #expect(!source.contains("QIPCMessageType.taskState"))
+        #expect(!source.contains("registerHandler(for: .taskState"))
         let codeLines = source.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
         for symbol in ["QPermissionGate", "QResourceGuard", "QEgressBroker", "QApprovalCoordinator"] {
             #expect(!codeLines.contains { $0.contains(symbol) }, "QAgent.swift references authority type \(symbol)")
