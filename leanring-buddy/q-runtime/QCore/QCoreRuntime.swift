@@ -938,8 +938,14 @@ public final class QCoreRuntime: @unchecked Sendable {
 
     public func resumeTask(
         taskId: String,
-        observer: (any QPlanExecutionObserver)? = nil
+        observer: (any QPlanExecutionObserver)? = nil,
+        /// Phase 3, seventh slice: mirrors `submitIntent`'s own `selectedFiles` parameter, so a
+        /// caller resuming a task can also supply local evidence for THIS resume attempt. Bounded
+        /// the same way; only consulted at all when local evidence collection is explicitly enabled
+        /// (default off).
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QTask {
+        let boundedSelectedFiles = Array(selectedFiles.prefix(QLocalEvidenceLimits.maxSelectedFilesPerRequest))
         let recoveryManager = QTaskRecoveryManager(store: durableStore ?? QDurableTaskStore.shared)
         let recoveryDecision = try await recoveryManager.evaluateTaskRecovery(taskId: taskId)
 
@@ -990,14 +996,16 @@ public final class QCoreRuntime: @unchecked Sendable {
             return try await executeResumedPlan(
                 taskState: resolution.updatedTask,
                 planSnapshot: resolution.updatedPlan,
-                observer: observer
+                observer: observer,
+                selectedFiles: boundedSelectedFiles
             )
 
         case .recoverable(let taskState, let planSnapshot):
             return try await executeResumedPlan(
                 taskState: taskState,
                 planSnapshot: planSnapshot,
-                observer: observer
+                observer: observer,
+                selectedFiles: boundedSelectedFiles
             )
         }
     }
@@ -1112,7 +1120,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         taskState: QDurableTaskState,
         planSnapshot: QDurablePlanSnapshot,
         livePlan: QPlan? = nil,
-        observer: (any QPlanExecutionObserver)? = nil
+        observer: (any QPlanExecutionObserver)? = nil,
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QTask {
         var task = taskState.toTask()
         task.state = .running
@@ -1240,6 +1249,38 @@ public final class QCoreRuntime: @unchecked Sendable {
             goal: taskState.originalIntent,
             plan: executedPlan,
             context: task.context
+        )
+
+        // Phase 3, seventh slice: resume-path parity. A resumed task's goal evaluation now feeds
+        // the SAME Evidence -> Verification -> Verified Response -> Candidate Attribution chain
+        // `submitIntent` already runs on its own first goal evaluation, so a task is no longer
+        // silently invisible to everything Phase 2C-3 built merely because it crashed and was
+        // resumed (or halted on approval and continued in the same process). This runs for BOTH
+        // outcomes below (satisfied or not), exactly mirroring where `submitIntent` places its own
+        // call — before branching on `isSatisfied`. The decision plan is recomputed fresh: it is
+        // pure and deterministic from `task.intent`/taint alone, so it is identical to the one
+        // computed when the task was first submitted. There are no FRESH Phase 2B candidate
+        // attempts to report on a resume (none are re-run here), so `candidateAttempts` is empty —
+        // exactly as honest as it would be to claim otherwise; task-level 2B-attempt learning
+        // (`QOutcomeLearningService.learn`) has nothing new to learn from a resume and is
+        // deliberately not re-invoked here.
+        let resumedDecisionPlan = QDeterministicDecisionEngine().decide(for: task)
+        var resumedStructuredAnswer: QEvidenceModelResult?
+        var resumedStructuredAnswerState: QStructuredAnswerState = .notConfigured
+        if let model = modelProvider {
+            (resumedStructuredAnswer, resumedStructuredAnswerState) = await requestStructuredAnswer(
+                task: task, decisionPlan: resumedDecisionPlan, model: model
+            )
+        }
+        _ = await recordEvidenceEvaluation(
+            task: task,
+            sessionId: task.sessionId,
+            decisionPlan: resumedDecisionPlan,
+            goalEvaluation: goalEval,
+            candidateAttempts: [],
+            structuredAnswer: resumedStructuredAnswer,
+            structuredAnswerState: resumedStructuredAnswerState,
+            selectedFiles: selectedFiles
         )
 
         if goalEval.isSatisfied {
