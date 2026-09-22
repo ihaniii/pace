@@ -129,6 +129,18 @@ public final class QRuntimeBootstrap: @unchecked Sendable {
             activeComponents.append("QModelCapabilityMemory (Advisory, Bounded)")
         }
 
+        // 9c. Verified Response Path (Phase 3, slices 1-4) — wired with every sub-feature at its
+        // DEFAULT (off): no structured answer call, no local evidence collection, no verified-memory
+        // write-back. With everything off, `QCoreRuntime` reuses the evidence pool it already builds
+        // for Phase 2C/2E (no extra pipeline run, no extra model call) and only assembles a
+        // deterministic `QVerifiedResponse` from it plus records one bounded, content-free
+        // `task.response.assembled` lifecycle event — informational only; it does not change the
+        // user-visible summary, task outcome, permissions, egress, or resources. Individually
+        // enabling the structured-answer/local-evidence/write-back sub-features remains a separate,
+        // deliberate decision for a later phase.
+        let verifiedResponse = QVerifiedResponseConfiguration()
+        activeComponents.append("QVerifiedResponsePath (Assembly Only, Advisory)")
+
         // 10. Assemble Core Runtime
         if let store = self.memoryStore {
             let core = QCoreRuntime(
@@ -136,6 +148,7 @@ public final class QRuntimeBootstrap: @unchecked Sendable {
                 memoryProvider: store,
                 executionProvider: exec,
                 capabilityMemory: capabilityMemory,
+                verifiedResponse: verifiedResponse,
                 endpointName: "q-core-main"
             )
             self.coreRuntime = core

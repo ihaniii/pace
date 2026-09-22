@@ -33,6 +33,15 @@ struct QRuntimeBootstrapTests {
         #expect(memory != nil)
     }
 
+    @Test("Bootstrap wires the Phase 3 Verified Response path, with every sub-feature at its default (off)")
+    func testBootstrapWiresVerifiedResponsePath() async {
+        let coordinator = QRuntimeBootstrap.shared
+        let report = await coordinator.bootstrap(databasePath: ":memory:", localOnlyModels: true)
+
+        #expect(report.activeComponents.contains("QVerifiedResponsePath (Assembly Only, Advisory)"))
+        #expect(report.activeComponents.contains("QModelCapabilityMemory (Advisory, Bounded)"))
+    }
+
     @Test("Bootstrap records audit event on startup")
     func testBootstrapAuditLogging() async {
         let coordinator = QRuntimeBootstrap.shared
