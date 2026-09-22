@@ -28,6 +28,14 @@ public final class QCoreRuntime: @unchecked Sendable {
     /// assembled response never influences task state, permissions, egress, resources, approvals,
     /// replanning, or completion.
     private var verifiedResponseConfiguration: QVerifiedResponseConfiguration?
+    /// Phase 3, twelfth slice: optional independent model judge. `nil` (the default, and
+    /// `QRuntimeBootstrap`'s own unchanged wiring) means the evidence pipeline is built with its
+    /// existing, unmodified default verification service — byte-identical to every slice before
+    /// this one. When supplied, it is added ONLY as an ADDITIONAL verification backend alongside
+    /// the existing `QExecutionEvidenceVerificationBackend()` — never in place of it. Its opinion
+    /// can never promote a claim to verified/contradicted (see `QModelIndependentJudge.swift`'s
+    /// header for why this is structurally, not conventionally, guaranteed) and is never persisted.
+    private var independentJudge: (any QIndependentModelJudge)?
     /// The most recent rendered verified responses (in memory only, never persisted), bounded.
     private var verifiedResponsesByTask: [String: QRenderedResponse] = [:]
     private var verifiedResponseTaskOrder: [String] = []
@@ -70,6 +78,9 @@ public final class QCoreRuntime: @unchecked Sendable {
         durableStore: (any QDurableTaskStoreProtocol)? = nil,
         capabilityMemory: QModelCapabilityMemory? = nil,
         verifiedResponse: QVerifiedResponseConfiguration? = nil,
+        /// Phase 3, twelfth slice: optional independent model judge, default nil (off). See the
+        /// `independentJudge` property's own doc comment.
+        independentJudge: (any QIndependentModelJudge)? = nil,
         endpointName: String = "q-core-\(UUID().uuidString.prefix(8))"
     ) {
         self.modelProvider = modelProvider
@@ -78,6 +89,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         self.durableStore = durableStore ?? QDurableTaskStore.shared
         self.capabilityMemory = capabilityMemory
         self.verifiedResponseConfiguration = verifiedResponse
+        self.independentJudge = independentJudge
         self.ipcChannel = QIPCChannel(endpointName: endpointName)
         setupIPCHandlers()
     }
@@ -88,7 +100,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         executionProvider: QExecutionProvider? = nil,
         durableStore: (any QDurableTaskStoreProtocol)? = nil,
         capabilityMemory: QModelCapabilityMemory? = nil,
-        verifiedResponse: QVerifiedResponseConfiguration? = nil
+        verifiedResponse: QVerifiedResponseConfiguration? = nil,
+        independentJudge: (any QIndependentModelJudge)? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -98,6 +111,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         if let durableStore { self.durableStore = durableStore }
         if let capabilityMemory { self.capabilityMemory = capabilityMemory }
         if let verifiedResponse { self.verifiedResponseConfiguration = verifiedResponse }
+        if let independentJudge { self.independentJudge = independentJudge }
     }
 
     private func setupIPCHandlers() {
@@ -1322,6 +1336,24 @@ public final class QCoreRuntime: @unchecked Sendable {
 
     // MARK: - Evidence Evaluation (Phase 2C, observe-only)
 
+    /// Phase 3, twelfth slice: builds the evidence pipeline used by BOTH call sites below. With no
+    /// judge configured (the default), this returns `QEvidencePipeline()` — every field at its own
+    /// unmodified default, byte-identical to every slice before this one. With a judge configured,
+    /// the ONLY change is one additional backend appended to the verification service alongside the
+    /// existing, unmodified `QExecutionEvidenceVerificationBackend()` — never in place of it, and
+    /// every other pipeline stage (extraction, critic, synthesis, timeouts) is untouched.
+    private func makeEvidencePipeline() -> QEvidencePipeline {
+        lock.lock()
+        let judge = independentJudge
+        lock.unlock()
+        guard let judge else { return QEvidencePipeline() }
+        return QEvidencePipeline(
+            verificationService: QIndependentVerificationService(
+                backends: [QExecutionEvidenceVerificationBackend(), QIndependentModelVerificationBackend(judge: judge)]
+            )
+        )
+    }
+
     /// Runs the Phase 2C evidence pipeline over what this iteration already established and records
     /// ONLY its audit-safe outcome metadata as a lifecycle event. Strictly observational: the
     /// pipeline's result is never consulted to decide anything — task state, permissions, egress,
@@ -1349,7 +1381,7 @@ public final class QCoreRuntime: @unchecked Sendable {
             )
         }
 
-        let pipelineResult = await QEvidencePipeline().run(
+        let pipelineResult = await makeEvidencePipeline().run(
             QEvidencePipelineInput(
                 taskId: task.taskId,
                 decisionPlan: decisionPlan,
@@ -1418,7 +1450,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         // never change what capability memory learns.
         var pipelineResult = primaryResult
         if structuredAnswer != nil || localEvidenceCollector != nil {
-            pipelineResult = await QEvidencePipeline().run(
+            pipelineResult = await makeEvidencePipeline().run(
                 QEvidencePipelineInput(
                     taskId: task.taskId, decisionPlan: decisionPlan,
                     modelResults: structuredAnswer.map { [$0] } ?? [], observations: observations,
