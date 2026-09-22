@@ -132,11 +132,17 @@ public final class QCoreRuntime: @unchecked Sendable {
     public func submitIntent(
         prompt: String,
         sessionId: String = UUID().uuidString,
-        observer: (any QPlanExecutionObserver)? = nil
+        observer: (any QPlanExecutionObserver)? = nil,
+        /// Phase 3 third slice: files the CALLER has already explicitly selected (e.g. via a native
+        /// Open panel presented outside this runtime). Bounded here immediately; only consulted at
+        /// all when `verifiedResponseConfiguration?.localEvidence.isEnabled` is true. Never a
+        /// directory, never resolved by this runtime, never scanned automatically.
+        selectedFiles: [QSelectedFileHandle] = []
     ) async throws -> QTask {
         // 1. Create task and initialize trusted context
         var task = QTask(sessionId: sessionId, intent: prompt)
         task.context.append(content: prompt, provenance: .trustedUser(channel: "direct"), sourceId: "user_prompt")
+        let boundedSelectedFiles = Array(selectedFiles.prefix(QLocalEvidenceLimits.maxSelectedFilesPerRequest))
 
         var budget = QAgentBudget()
 
@@ -661,7 +667,8 @@ public final class QCoreRuntime: @unchecked Sendable {
                 goalEvaluation: goalEvaluation,
                 candidateAttempts: orchestrationAttempts,
                 structuredAnswer: structuredAnswerResult,
-                structuredAnswerState: structuredAnswerState
+                structuredAnswerState: structuredAnswerState,
+                selectedFiles: boundedSelectedFiles
             )
 
             if !outcomeLearningRecorded, let activeCapabilityMemory, !orchestrationAttempts.isEmpty {
@@ -1280,7 +1287,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         goalEvaluation: QGoalEvaluation,
         candidateAttempts: [QModelAttempt],
         structuredAnswer: QEvidenceModelResult?,
-        structuredAnswerState: QStructuredAnswerState
+        structuredAnswerState: QStructuredAnswerState,
+        selectedFiles: [QSelectedFileHandle]
     ) async -> QEvidenceOutcomeMetadata {
         var observations = [
             QEvidenceObservation(sourceId: "goal-evaluator", subject: "goal.state", value: goalEvaluation.state.rawValue)
@@ -1309,7 +1317,7 @@ public final class QCoreRuntime: @unchecked Sendable {
         )
         await recordVerifiedResponse(
             from: pipelineResult, task: task, sessionId: sessionId, decisionPlan: decisionPlan, observations: observations,
-            structuredAnswer: structuredAnswer, structuredAnswerState: structuredAnswerState
+            structuredAnswer: structuredAnswer, structuredAnswerState: structuredAnswerState, selectedFiles: selectedFiles
         )
         return pipelineResult.metadata
     }
@@ -1329,7 +1337,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         decisionPlan: QDecisionPlan,
         observations: [QEvidenceObservation],
         structuredAnswer: QEvidenceModelResult?,
-        structuredAnswerState: QStructuredAnswerState
+        structuredAnswerState: QStructuredAnswerState,
+        selectedFiles: [QSelectedFileHandle]
     ) async {
         lock.lock()
         let configuration = verifiedResponseConfiguration
@@ -1337,13 +1346,33 @@ public final class QCoreRuntime: @unchecked Sendable {
         lock.unlock()
         guard let configuration else { return }
 
-        // The claims-only answer (if any) is evaluated in its OWN pipeline run. The primary run above
-        // — whose metadata feeds outcome learning — is deliberately left untouched, so unverified
-        // model claims can never change what capability memory learns.
+        // Phase 3 third slice: bounded LOCAL evidence collection, only when explicitly enabled — a
+        // memory collector (if the memory provider supports provenance-preserving retrieval) and/or a
+        // collector over CALLER-supplied selected files. `task.intent` is used only as a transient
+        // memory query — never persisted, never placed in any evidence draft.
+        var collectors: [any QEvidenceCollector] = []
+        if configuration.localEvidence.isEnabled {
+            if let provenanceAwareMemory = memory as? QProvenanceAwareMemoryProvider {
+                collectors.append(QMemoryEvidenceCollector(store: provenanceAwareMemory, queryText: task.intent))
+            }
+            if !selectedFiles.isEmpty {
+                collectors.append(QFileEvidenceCollector(handles: selectedFiles))
+            }
+        }
+        let localEvidenceCollector: (any QEvidenceCollector)? = collectors.isEmpty ? nil : QCompositeEvidenceCollector(collectors)
+
+        // The claims-only answer (if any) and/or collected local evidence are evaluated in their OWN
+        // pipeline run. The primary run above — whose metadata feeds outcome learning — is
+        // deliberately left untouched, so unverified model claims or retrieved local evidence can
+        // never change what capability memory learns.
         var pipelineResult = primaryResult
-        if let structuredAnswer {
+        if structuredAnswer != nil || localEvidenceCollector != nil {
             pipelineResult = await QEvidencePipeline().run(
-                QEvidencePipelineInput(taskId: task.taskId, decisionPlan: decisionPlan, modelResults: [structuredAnswer], observations: observations)
+                QEvidencePipelineInput(
+                    taskId: task.taskId, decisionPlan: decisionPlan,
+                    modelResults: structuredAnswer.map { [$0] } ?? [], observations: observations,
+                    collector: localEvidenceCollector
+                )
             )
         }
 
@@ -1352,6 +1381,8 @@ public final class QCoreRuntime: @unchecked Sendable {
         var payload = response.auditPayload
         payload["structuredAnswer"] = structuredAnswerState.rawValue
         payload["answerClaimCount"] = "\(pipelineResult.pool.claims.filter { $0.originKind == .modelGenerated }.count)"
+        payload["localEvidenceEnabled"] = "\(configuration.localEvidence.isEnabled)"
+        payload["collectedEvidenceCount"] = "\(pipelineResult.pool.items.filter { $0.source.kind == .retrievedExternal }.count)"
 
         var writeBackReport = QVerifiedWriteBackReport(isEnabled: false)
         if configuration.writeBack.isEnabled, let store = memory as? QVerifiedPropositionStoring {

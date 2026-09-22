@@ -31,13 +31,18 @@ public struct QVerifiedResponseConfiguration: Sendable, Equatable {
     /// Second slice: whether to ask the model for a claims-only answer (default OFF; see
     /// `QStructuredAnswer.swift`). Source-compatible: existing initializer calls are unchanged.
     public let structuredAnswer: QStructuredAnswerConfiguration
+    /// Third slice: whether to feed bounded LOCAL evidence (memory + explicitly-selected files) into
+    /// the same structured-answer pipeline run (default OFF; see `QLocalEvidenceContracts.swift`).
+    public let localEvidence: QLocalEvidenceCollectionConfiguration
 
     public init(
         writeBack: QVerifiedMemoryWriteBackConfiguration = .disabled,
-        structuredAnswer: QStructuredAnswerConfiguration = .disabled
+        structuredAnswer: QStructuredAnswerConfiguration = .disabled,
+        localEvidence: QLocalEvidenceCollectionConfiguration = .disabled
     ) {
         self.writeBack = writeBack
         self.structuredAnswer = structuredAnswer
+        self.localEvidence = localEvidence
     }
 }
 
