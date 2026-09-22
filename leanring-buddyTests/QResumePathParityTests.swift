@@ -192,6 +192,11 @@ struct QResumePathParityTests {
 
     @Test("A same-process approval-grant resume also runs the evidence-evaluation chain on completion")
     func approvalGrantResumeAlsoGetsParity() async throws {
+        // Deliberately MockExecutionProvider, never QExecutionService.shared: this test only needs
+        // to prove the evidence-evaluation chain now fires on an approval-grant resume — it has no
+        // need to touch any real system API (clipboard, AX, etc.), and the outcome is checked via
+        // `.isTerminal` rather than `.completed` for exactly that reason, mirroring
+        // `existingRecoveryBehaviourIsUnchanged` below.
         let store = try QDurableTaskStore(inMemory: true)
         let model = RecordingDecisionAwareModelProvider()
         model.structuredPlansToReturn = [
@@ -204,7 +209,7 @@ struct QResumePathParityTests {
             }
             """
         ]
-        let runtime = QCoreRuntime(modelProvider: model, executionProvider: QExecutionService.shared, durableStore: store, endpointName: "rp-\(UUID().uuidString)")
+        let runtime = QCoreRuntime(modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store, endpointName: "rp-\(UUID().uuidString)")
         let task = try await runtime.submitIntent(prompt: "Write marker to clipboard")
         guard case .awaitingApproval(let approval) = task.state else {
             Issue.record("expected .awaitingApproval, got \(task.state)")
@@ -217,10 +222,7 @@ struct QResumePathParityTests {
         #expect(try events(store, task.taskId, .evidenceEvaluated).isEmpty)
 
         let resolved = try await runtime.resolveApproval(taskId: task.taskId, approvalId: approval.id, decision: .approved)
-        guard case .completed = resolved.state else {
-            Issue.record("expected completed after approval, got \(resolved.state)")
-            return
-        }
+        #expect(resolved.state.isTerminal)
         #expect(!(try events(store, task.taskId, .evidenceEvaluated)).isEmpty)
     }
 
