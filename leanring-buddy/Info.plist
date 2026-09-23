@@ -40,9 +40,9 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>LocalPlannerBaseURL</key>
-	<string>http://127.0.0.1:1234/v1</string>
+	<string>http://127.0.0.1:11434/v1</string>
 	<key>LocalPlannerModelIdentifier</key>
-	<string>qwen/qwen3.5-4b</string>
+	<string>qwen2.5:3b</string>
 	<key>LocalTTSPitchMultiplier</key>
 	<string>0.88</string>
 	<key>LocalTTSPostUtteranceDelay</key>
@@ -116,7 +116,7 @@
 	<key>ScreenAnalysisProvider</key>
 	<string>lmStudio</string>
 	<key>TTSProvider</key>
-	<string>apple</string>
+	<string>neural</string>
 	<key>TranscriptionProvider</key>
 	<string>whisperKit</string>
 	<key>UseLocalVLMForScreenContext</key>

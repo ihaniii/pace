@@ -113,9 +113,9 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
     private let lock = NSRecursiveLock()
     private var registeredBackends: [QModelBackendType: QLocalModelBackend] = [:]
     private var priorityOrder: [QModelBackendType] = [
+        .ollama,
         .appleFoundation,
         .mlx,
-        .ollama,
         .llamaCpp
     ]
     public var localOnly: Bool = true
@@ -150,7 +150,7 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
         // 3. Ollama Localhost
         let ollamaCap = QModelCapabilities(
             backend: .ollama,
-            modelIdentifier: "llama3.2:3b",
+            modelIdentifier: "qwen2.5:3b",
             contextWindowTokens: 4096,
             supportsVision: false,
             isLocalOnDevice: true

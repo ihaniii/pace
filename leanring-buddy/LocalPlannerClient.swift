@@ -77,19 +77,8 @@ final class LocalPlannerClient: BuddyPlannerClient {
     static func makeFromInfoPlist(
         requestsStructuredActionOutput: Bool = false
     ) -> LocalPlannerClient {
-        let configuredBaseURL =
-            AppBundleConfiguration
-            .stringValue(forKey: "LocalPlannerBaseURL")
-            ?? "http://127.0.0.1:1234/v1"
-        let configuredModelIdentifier =
-            AppBundleConfiguration
-            .stringValue(forKey: "LocalPlannerModelIdentifier")
-            ?? "qwen3-4b-instruct"
-
-        let resolvedBaseURL = PaceLocalEndpointGuard.resolvedLocalOpenAICompatibleBaseURL(
-            configuredURLString: configuredBaseURL,
-            settingName: "LocalPlannerBaseURL"
-        )
+        let resolvedBaseURL = PaceLocalPlannerBackendSettings.effectiveBaseURL()
+        let configuredModelIdentifier = PaceLocalPlannerBackendSettings.effectiveModelIdentifier()
 
         let effectiveModelIdentifier =
             PacePlannerModelResolver.resolvedIdentifier
@@ -181,9 +170,10 @@ final class LocalPlannerClient: BuddyPlannerClient {
         // LM Studio's OpenAI-compatible endpoint currently ignores the
         // non-thinking controls for Qwen 3.5. Its native API exposes the
         // explicit `reasoning: off` contract, so use that faster path for
-        // ordinary spoken answers. Structured action turns stay on Chat
-        // Completions because they need `response_format: json_schema`.
-        if !requestsStructuredActionOutput {
+        // ordinary spoken answers when connecting to LM Studio (port 1234).
+        // For Ollama (port 11434) and standard OpenAI-compatible local engines,
+        // bypass /api/v1/chat and stream directly to /v1/chat/completions.
+        if !requestsStructuredActionOutput && PaceLocalPlannerBackendSettings.isLMStudioBackend(url: baseURL) {
             do {
                 return try await generateLMStudioNativeStreamingResponse(
                     systemPrompt: systemPrompt,

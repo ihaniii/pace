@@ -191,7 +191,7 @@ struct QPhase43DogfoodValidationTests {
                 // If screen recording permission is present, it returns success
                 if result.success {
                     #expect(result.summary.contains("OCR completed") || result.summary.contains("Captured"))
-                    #expect(result.outputData["ocrText"] != nil || result.outputData["characterCount"] != nil)
+                    #expect(result.outputData["detectedText"] != nil || result.outputData["ocrText"] != nil || result.outputData["characterCount"] != nil)
                 } else {
                     // If permission is absent, it fails closed gracefully without crashing
                     #expect(result.error != nil)

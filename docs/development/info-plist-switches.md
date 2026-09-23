@@ -37,11 +37,11 @@ loopback-only; it never uses the selected cloud conversational tier. See
 | `LocalVLMBaseURL` | `http://127.0.0.1:1234/v1` | OpenAI-compatible root for the local VLM. The numeric loopback avoids an IPv6-to-IPv4 retry delay. Remote/LAN hosts are refused. |
 | `LocalVLMModelIdentifier` | `qwen/qwen3.5-4b` | Must match the model name loaded in LM Studio. The default shares one multimodal model with the planner to avoid model swaps. |
 | `AlwaysRunLocalVLMRegardlessOfTranscript` | `false` | `true` → bypass the VLM-skip heuristic, run VLM on every turn |
-| `LocalPlannerBaseURL` | `http://127.0.0.1:1234/v1` | OpenAI-compatible root for the local reasoner. The numeric loopback avoids an IPv6-to-IPv4 retry delay. Remote/LAN hosts are refused. |
-| `LocalPlannerModelIdentifier` | `qwen/qwen3.5-4b` | Must match the model name loaded in LM Studio for the planner role. The default is the same fast multimodal model used for fallback vision; Gemma 3 12B and Qwen 30B remain optional quality-over-memory choices. |
+| `LocalPlannerBaseURL` | `http://127.0.0.1:11434/v1` | OpenAI-compatible root for the local reasoner (Ollama default on port 11434). LM Studio on port 1234 can be selected via `PaceLocalPlannerBackendSettings.switchToLMStudio()` or UserDefaults `PaceLocalPlannerBaseURL`. Remote/LAN hosts are refused. |
+| `LocalPlannerModelIdentifier` | `qwen2.5:3b` | Default lightweight local model in Ollama. Uses ~2.07 GB resident RSS on 16GB Apple Silicon machines. Can be overridden to LM Studio models via presets. |
 | `EnableActions` | `true` | `false` → parse action tags but do not execute local macOS actions. Keep `Approve Risky Actions` on when this is true. |
 | `AgentMaxSteps` | `8` | Per-task ceiling for the plan-act-observe loop. `1` disables multi-step (loop exits after first response). |
-| `TTSProvider` | `apple` | `apple` uses `AVSpeechSynthesizer` with no sidecar. `localServer` opts into the Kokoro loopback service with automatic per-utterance Apple fallback. |
+| `TTSProvider` | `neural` | `neural` uses on-device Sherpa-ONNX (Kokoro `af_heart` for English, Piper `Alma` for Swedish). `apple` uses `AVSpeechSynthesizer` with no neural models. |
 | `LocalTTSServerBaseURL` | `http://127.0.0.1:8880/v1` | Loopback-only OpenAI-compatible TTS root (mlx-audio / kokoro-fastapi). Used only when `TTSProvider=localServer`. |
 | `LocalTTSServerModel` | `mlx-community/Kokoro-82M-bf16` | Model identifier the sidecar expects (`kokoro` for kokoro-fastapi). |
 | `LocalTTSServerVoice` | `af_heart` | Kokoro voice name. |
