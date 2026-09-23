@@ -14,6 +14,7 @@
 		BB00CC072F6500070039DA55 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = BB00CC042F6500040039DA55 /* MLXEmbedders */; };
 		BB00CC092F6500090039DA55 /* MLXVLM in Frameworks */ = {isa = PBXBuildFile; productRef = BB00CC082F6500080039DA55 /* MLXVLM */; };
 		BB00CC0B2F65000B0039DA55 /* TTSKit in Frameworks */ = {isa = PBXBuildFile; productRef = BB00CC0A2F65000A0039DA55 /* TTSKit */; };
+		DD00EE032F6500030039DA55 /* sherpa-onnx in Frameworks */ = {isa = PBXBuildFile; productRef = DD00EE022F6500020039DA55 /* sherpa-onnx */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -103,6 +104,7 @@
 				BB00CC072F6500070039DA55 /* MLXEmbedders in Frameworks */,
 				BB00CC092F6500090039DA55 /* MLXVLM in Frameworks */,
 				BB00CC0B2F65000B0039DA55 /* TTSKit in Frameworks */,
+				DD00EE032F6500030039DA55 /* sherpa-onnx in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -181,6 +183,7 @@
 				BB00CC042F6500040039DA55 /* MLXEmbedders */,
 				BB00CC082F6500080039DA55 /* MLXVLM */,
 				BB00CC0A2F65000A0039DA55 /* TTSKit */,
+				DD00EE022F6500020039DA55 /* sherpa-onnx */,
 			);
 			productName = "leanring-buddy";
 			productReference = 28F22CBF2F56440300A0FC59 /* Pace.app */;
@@ -204,6 +207,7 @@
 			);
 			name = "leanring-buddyTests";
 			packageProductDependencies = (
+				DD00EE042F6500040039DA55 /* sherpa-onnx */,
 			);
 			productName = "leanring-buddyTests";
 			productReference = 28F22CCC2F56440300A0FC59 /* leanring-buddyTests.xctest */;
@@ -294,6 +298,7 @@
 				AA00BB012F6500010039DA55 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				AA00BB072F6500070039DA55 /* XCRemoteSwiftPackageReference "WhisperKit" */,
 				BB00CC012F6500010039DA55 /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
+				DD00EE012F6500010039DA55 /* XCRemoteSwiftPackageReference "sherpa-onnx" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 28F22CC02F56440300A0FC59 /* Products */;
@@ -811,6 +816,14 @@
 				minimumVersion = 2.29.1;
 			};
 		};
+		DD00EE012F6500010039DA55 /* XCRemoteSwiftPackageReference "sherpa-onnx" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/k2-fsa/sherpa-onnx.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.13.8;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -848,6 +861,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA00BB072F6500070039DA55 /* XCRemoteSwiftPackageReference "WhisperKit" */;
 			productName = TTSKit;
+		};
+		DD00EE022F6500020039DA55 /* sherpa-onnx */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DD00EE012F6500010039DA55 /* XCRemoteSwiftPackageReference "sherpa-onnx" */;
+			productName = "sherpa-onnx";
+		};
+		DD00EE042F6500040039DA55 /* sherpa-onnx */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = DD00EE012F6500010039DA55 /* XCRemoteSwiftPackageReference "sherpa-onnx" */;
+			productName = "sherpa-onnx";
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

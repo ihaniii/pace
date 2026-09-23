@@ -43,7 +43,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DERIVED_DATA_PATH="/tmp/pace-test-derived-data"
+DERIVED_DATA_PATH="$HOME/.pace-test-derived-data"
 PROJECT_PATH="$PROJECT_DIR/leanring-buddy.xcodeproj"
 # Scheme name kept as `leanring-buddy` (matches the Xcode default
 # scheme alongside the legacy folder name). The PRODUCT_NAME is `Pace`,

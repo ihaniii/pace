@@ -1,5 +1,5 @@
 {
-  "originHash" : "0dd03d89678327852dd367ff35b8e83edc87866c5f9117caa84710cf251d66e9",
+  "originHash" : "f8fa1fe869b680f815eeb0145402cfa2e387798f0bdba12a14b096f06b1a2110",
   "pins" : [
     {
       "identity" : "gzipswift",
@@ -26,6 +26,24 @@
       "state" : {
         "revision" : "9bff95ca5f0b9e8c021acc4d71a2bbe4a7441631",
         "version" : "2.29.1"
+      }
+    },
+    {
+      "identity" : "onnxruntime-libs",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/csukuangfj/onnxruntime-libs",
+      "state" : {
+        "revision" : "8ebc5ebf92190903c274a7621ba4c96a732335ec",
+        "version" : "1.28.2"
+      }
+    },
+    {
+      "identity" : "sherpa-onnx",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/k2-fsa/sherpa-onnx.git",
+      "state" : {
+        "revision" : "11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf",
+        "version" : "1.13.8"
       }
     },
     {

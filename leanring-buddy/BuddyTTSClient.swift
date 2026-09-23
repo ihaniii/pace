@@ -56,6 +56,12 @@ protocol BuddyTTSClient: AnyObject {
 enum BuddyTTSClientFactory {
     @MainActor
     static func makeDefault() -> any BuddyTTSClient {
+        // Opt-in Local Neural TTS (Sherpa-ONNX: Kokoro EN + Piper SV + Apple AR fallback)
+        if PaceNeuralTTSSettings.isNeuralTTSEnabled {
+            print("🔊 TTS: using opt-in local neural TTS (Sherpa-ONNX)")
+            return PaceNeuralTTSClient()
+        }
+
         // Bundled Qwen3 TTS trumps the configured Kokoro-sidecar
         // path when the user has opted in AND TTSKit is linked. This
         // drops the Python sidecar dependency from the setup story.
