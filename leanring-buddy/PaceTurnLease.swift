@@ -9,6 +9,16 @@ import Foundation
 /// lease before it is allowed to install response work or update turn state.
 struct PaceTurnLease: Equatable, Sendable {
     fileprivate let generation: UInt64
+    let turnId: String
+
+    init(generation: UInt64, turnId: String = UUID().uuidString) {
+        self.generation = generation
+        self.turnId = turnId
+    }
+
+    static func == (lhs: PaceTurnLease, rhs: PaceTurnLease) -> Bool {
+        lhs.generation == rhs.generation && lhs.turnId == rhs.turnId
+    }
 }
 
 /// Pure generation gate for rejecting results from cancelled or superseded

@@ -1068,13 +1068,85 @@ extension CompanionManager {
     func sendTranscriptToPlannerWithScreenshot(transcript: String) {
         cancelActiveTurnTasks()
         let turnLease = turnLeaseRegistry.beginTurn()
+        // Phase 4.1: Evaluate immutable engine mode once at turn creation
+        let engineMode = PaceUserPreferencesStore.executionEngineMode()
         currentTurnDispatchTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.sendTranscriptToPlannerWithScreenshotAsync(
+            await self.dispatchTurnWithEngineRouter(
                 transcript: transcript,
-                turnLease: turnLease
+                turnLease: turnLease,
+                engineMode: engineMode
             )
         }
+    }
+
+    // MARK: - Phase 4.1 Turn Engine Router Dispatch
+
+    func buildTurnContext(transcript: String, turnLease: PaceTurnLease) -> QAgentTurnContext {
+        let historySnippets = conversationHistory.map { entry in
+            QConversationTurnSnippet(
+                userTranscript: entry.userTranscript,
+                assistantResponse: entry.assistantResponse
+            )
+        }
+
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let appBundleId = frontmost?.bundleIdentifier
+        let appName = frontmost?.localizedName
+        let hasScreenshotAvailable = !NSScreen.screens.isEmpty
+
+        return QAgentTurnContext(
+            turnId: turnLease.turnId,
+            transcript: transcript,
+            conversationHistory: historySnippets,
+            activeApplicationBundleId: appBundleId,
+            activeApplicationName: appName,
+            hasScreenshot: hasScreenshotAvailable,
+            selectionText: nil
+        )
+    }
+
+    func dispatchTurnWithEngineRouter(
+        transcript: String,
+        turnLease: PaceTurnLease,
+        engineMode: QExecutionEngineMode
+    ) async {
+        guard isActiveTurn(turnLease) else { return }
+
+        let turnContext = buildTurnContext(transcript: transcript, turnLease: turnLease)
+        let request = QTurnExecutionRequest(
+            turnId: turnLease.turnId,
+            transcript: transcript,
+            engineMode: engineMode,
+            context: turnContext,
+            createdAt: Date()
+        )
+
+        _ = await turnExecutionRouter.routeTurn(
+            request: request,
+            legacyEngine: { @MainActor in
+                await self.sendTranscriptToPlannerWithScreenshotAsync(
+                    transcript: transcript,
+                    turnLease: turnLease
+                )
+                return .success(summary: "Legacy turn completed")
+            },
+            qCoreEngine: { @MainActor in
+                let qResult = await self.executeQAgentTurn(
+                    transcript: transcript,
+                    context: turnContext,
+                    turnLease: turnLease
+                )
+                switch qResult.status {
+                case .completed:
+                    return .success(summary: qResult.summary)
+                case .failed(let reason):
+                    return .failure(reason: reason)
+                case .awaitingApproval(let tool, let risk):
+                    return .awaitingApproval(actionDescription: "\(tool) (\(risk))")
+                }
+            }
+        )
     }
 
     /// Stops the current turn without closing the conversation surface. A

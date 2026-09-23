@@ -90,9 +90,12 @@ public final class QAgent: Sendable {
         /// `resolveApproval`) without a `QAgent`-layer counterpart. Bounded identically one layer
         /// down; only consulted at all when local evidence collection is explicitly enabled
         /// (default off).
-        selectedFiles: [QSelectedFileHandle] = []
+        selectedFiles: [QSelectedFileHandle] = [],
+        /// Phase 4.1: turn context bridge from CompanionManager.
+        turnContext: QAgentTurnContext? = nil
     ) async throws -> QAgentResult {
         let start = Date()
+        let effectiveSessionId = turnContext?.turnId ?? sessionId
 
         observer?.agentDidTransition(state: .starting, message: "Bootstrapping Q runtime")
 
@@ -115,7 +118,7 @@ public final class QAgent: Sendable {
             observer?.agentDidTransition(state: .error, message: errorMsg)
             return QAgentResult(
                 taskId: UUID().uuidString,
-                sessionId: sessionId,
+                sessionId: effectiveSessionId,
                 intent: task,
                 status: .failed(reason: errorMsg),
                 summary: errorMsg,
@@ -130,13 +133,13 @@ public final class QAgent: Sendable {
         let executedTask: QTask
         do {
             let planObserver = observer as? (any QPlanExecutionObserver)
-            executedTask = try await core.submitIntent(prompt: task, sessionId: sessionId, observer: planObserver, selectedFiles: selectedFiles)
+            executedTask = try await core.submitIntent(prompt: task, sessionId: effectiveSessionId, observer: planObserver, selectedFiles: selectedFiles)
         } catch {
             let duration = Date().timeIntervalSince(start)
             observer?.agentDidTransition(state: .error, message: error.localizedDescription)
             return QAgentResult(
                 taskId: UUID().uuidString,
-                sessionId: sessionId,
+                sessionId: effectiveSessionId,
                 intent: task,
                 status: .failed(reason: error.localizedDescription),
                 summary: "Execution failed: \(error.localizedDescription)",

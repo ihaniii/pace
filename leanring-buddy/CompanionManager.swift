@@ -53,6 +53,8 @@ final class CompanionManager: ObservableObject {
     @Published var qRuntimeState: QAgentUIState = .starting
     @Published var qRuntimeBlocker: String? = nil
     @Published var activeQPlanSnapshot: QRuntimeUISnapshot? = nil
+    /// Phase 4.1: Turn execution router for selecting between legacy engine and Q-Core.
+    let turnExecutionRouter = QTurnExecutionRouter()
 
     var lastPartialTranscriptFromActiveDictation: String?
     @Published var currentAudioPowerLevel: CGFloat = 0

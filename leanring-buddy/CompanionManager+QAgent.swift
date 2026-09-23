@@ -233,12 +233,31 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
 
     /// Primary execution method for local agent turns via QAgent.
     @discardableResult
-    public func executeQAgentTurn(transcript: String) async -> QAgentResult {
+    public func executeQAgentTurn(
+        transcript: String,
+        context: QAgentTurnContext? = nil,
+        turnLease: PaceTurnLease? = nil
+    ) async -> QAgentResult {
+        if let turnLease, !isActiveTurn(turnLease) {
+            return QAgentResult(
+                taskId: turnLease.turnId,
+                sessionId: "cancelled_session",
+                intent: transcript,
+                status: .failed(reason: "Turn cancelled before execution"),
+                summary: "Turn cancelled"
+            )
+        }
+
         qRuntimeState = .thinking
         currentTurnHUDState = PaceTurnHUDState(status: .understanding, title: "Q THINKING", detail: "Reasoning locally…", options: [])
 
         do {
-            let result = try await QAgent.shared.run(task: transcript, observer: self)
+            let result = try await QAgent.shared.run(
+                task: transcript,
+                sessionId: context?.turnId ?? UUID().uuidString,
+                observer: self,
+                turnContext: context
+            )
 
             // Post turn to chat session transcript
             chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
@@ -256,7 +275,7 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
             chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: "Q Error: \(error.localizedDescription)")
             voiceState = .idle
             return QAgentResult(
-                taskId: UUID().uuidString,
+                taskId: context?.turnId ?? UUID().uuidString,
                 sessionId: "error_session",
                 intent: transcript,
                 status: .failed(reason: error.localizedDescription),

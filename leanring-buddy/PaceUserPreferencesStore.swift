@@ -144,6 +144,10 @@ enum PaceUserPreferenceKey: String {
     /// creation in `MenuBarPanelManager.createPanel()`. Flips ON by
     /// default in phase 2 after real-world use.
     case useChatPanelAsPrimarySurface
+    /// Phase 4.1: Q-Core Production Integration Foundation.
+    /// Controls whether user turns execute via legacy engine or Q-Core.
+    /// Default is legacyAuthoritative.
+    case executionEngineMode = "pace.executionEngineMode"
 }
 
 enum PaceUserPreferencesStore {
@@ -292,6 +296,25 @@ enum PaceUserPreferencesStore {
     /// Persist the user-tunable proactivity profile.
     static func setProactivityProfile(_ profile: PaceProactivityProfile) {
         UserDefaults.standard.set(profile.rawValue, forKey: PaceUserPreferenceKey.proactivityProfile.rawValue)
+    }
+
+    // MARK: - Phase 4.1 Execution Engine Mode
+
+    /// Returns the active execution engine mode. Checked first in process environment
+    /// `PACE_EXECUTION_ENGINE_MODE` for automated test injection, then in `UserDefaults`,
+    /// defaulting strictly to `.legacyAuthoritative`.
+    static func executionEngineMode() -> QExecutionEngineMode {
+        if let env = ProcessInfo.processInfo.environment["PACE_EXECUTION_ENGINE_MODE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let mode = QExecutionEngineMode(rawValue: env) {
+            return mode
+        }
+        let stored = string(.executionEngineMode, default: QExecutionEngineMode.legacyAuthoritative.rawValue)
+        return QExecutionEngineMode(rawValue: stored) ?? .legacyAuthoritative
+    }
+
+    /// Sets the persistent execution engine mode.
+    static func setExecutionEngineMode(_ mode: QExecutionEngineMode) {
+        setString(mode.rawValue, for: .executionEngineMode)
     }
 }
 
