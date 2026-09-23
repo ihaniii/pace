@@ -155,6 +155,13 @@ public final class QCoreRuntime: @unchecked Sendable {
         /// Phase 4.2: optional turn context bridge from CompanionManager / QAgent.
         turnContext: QAgentTurnContext? = nil
     ) async throws -> QTask {
+        // Phase 4.4: Early cancellation check before creating or submitting task
+        if Task.isCancelled {
+            var task = QTask(sessionId: sessionId, intent: prompt)
+            task.state = .failed(reason: "Task cancelled before execution")
+            return task
+        }
+
         // 1. Create task and initialize trusted context
         var task = QTask(sessionId: sessionId, intent: prompt)
         task.context.append(content: prompt, provenance: .trustedUser(channel: "direct"), sourceId: "user_prompt")
@@ -197,6 +204,19 @@ public final class QCoreRuntime: @unchecked Sendable {
                         content: assistantText,
                         provenance: .untrustedTool(toolName: "assistant_history"),
                         sourceId: "conversation_history_assistant"
+                    )
+                }
+            }
+
+            // Phase 4.4: Ingest bounded active selection context (untrusted external application content)
+            if let rawSelection = context.selectionText {
+                let trimmedSelection = rawSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedSelection.isEmpty {
+                    let boundedSelection = String(trimmedSelection.prefix(QAgentTurnContext.maxActiveSelectionCharacters))
+                    task.context.append(
+                        content: boundedSelection,
+                        provenance: .untrustedTool(toolName: "active_selection"),
+                        sourceId: "active_selection"
                     )
                 }
             }
@@ -399,6 +419,20 @@ public final class QCoreRuntime: @unchecked Sendable {
         lock.lock()
         let activeCapabilityMemory = capabilityMemory
         lock.unlock()
+
+        // Phase 4.4: Cancellation check before planning
+        if Task.isCancelled {
+            task.state = .failed(reason: "Task cancelled before plan generation")
+            updateTask(task)
+            durableState.lifecycleState = .failed
+            durableState.lastKnownError = "Task cancelled before plan generation"
+            try? durableStore?.saveTask(durableState)
+            try? durableStore?.recordEvent(
+                QTaskLifecycleEvent(taskId: task.taskId, sessionId: sessionId, eventType: .taskAborted, payload: ["reason": "Task cancelled before plan generation"])
+            )
+            return task
+        }
+
         budget.recordModelCall()
         durableState.budget = budget
 
@@ -555,6 +589,19 @@ public final class QCoreRuntime: @unchecked Sendable {
         let replanController = QReplanController(maxReplans: budget.maxReplans)
 
         while true {
+            // Phase 4.4: Cancellation check before execution loop iteration
+            if Task.isCancelled {
+                task.state = .failed(reason: "Task cancelled during execution")
+                updateTask(task)
+                durableState.lifecycleState = .failed
+                durableState.lastKnownError = "Task cancelled during execution"
+                try? durableStore?.saveTask(durableState)
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(taskId: task.taskId, sessionId: sessionId, eventType: .taskAborted, payload: ["reason": "Task cancelled during execution"])
+                )
+                return task
+            }
+
             // Check budget before execution iteration
             if case .exhausted(let reason, let explanation) = budget.evaluateBudget() {
                 task.state = .failed(reason: "Execution halted: \(explanation)")
@@ -631,6 +678,36 @@ public final class QCoreRuntime: @unchecked Sendable {
             let updatedSnapshot = QDurablePlanSnapshot(from: executedPlan)
             try? durableStore?.savePlan(updatedSnapshot)
             try? durableStore?.saveTask(durableState)
+
+            // Phase 4.4: Handle Plan Cancellation
+            if case .cancelled(let reason) = executedPlan.state {
+                task.state = .failed(reason: reason)
+                updateTask(task)
+                durableState.lifecycleState = .failed
+                durableState.lastKnownError = reason
+                try? durableStore?.saveTask(durableState)
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(
+                        taskId: task.taskId,
+                        sessionId: sessionId,
+                        eventType: .taskAborted,
+                        payload: ["reason": reason]
+                    )
+                )
+                QAuditLogger.shared.record(
+                    QAuditRecord(
+                        sessionId: sessionId,
+                        taskId: task.taskId,
+                        tool: "agent.cancelled",
+                        riskLevel: .level0ReadOnly,
+                        rawArguments: "taskId=\(task.taskId)",
+                        authorizationResult: "halt",
+                        provenance: "trusted:system",
+                        executionSummary: "Task execution halted due to user cancellation: \(reason)"
+                    )
+                )
+                return task
+            }
 
             // Handle Permission Approval Halts
             if case .waitingForPermission(let idx, let reason) = executedPlan.state {
@@ -870,6 +947,19 @@ public final class QCoreRuntime: @unchecked Sendable {
                 evaluation: goalEvaluation,
                 replanReason: goalEvaluation.explanation
             )
+
+            // Phase 4.4: Cancellation check before replan evaluation
+            if Task.isCancelled {
+                task.state = .failed(reason: "Task cancelled before replan")
+                updateTask(task)
+                durableState.lifecycleState = .failed
+                durableState.lastKnownError = "Task cancelled before replan"
+                try? durableStore?.saveTask(durableState)
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(taskId: task.taskId, sessionId: sessionId, eventType: .taskAborted, payload: ["reason": "Task cancelled before replan"])
+                )
+                return task
+            }
 
             switch replanDecision {
             case .allow(let replanReq):
@@ -1121,6 +1211,21 @@ public final class QCoreRuntime: @unchecked Sendable {
             return task
         }
 
+        // Phase 4.4: Cancellation check during approval resolution
+        if Task.isCancelled {
+            consumeLivePlanAwaitingApproval(planId: durableState.currentPlanId)
+            let reasonText = "Task cancelled during approval resolution"
+            durableState.lifecycleState = .failed
+            durableState.lastKnownError = reasonText
+            try? durableStore.saveTask(durableState)
+            try? durableStore.recordEvent(
+                QTaskLifecycleEvent(taskId: taskId, sessionId: durableState.sessionId, eventType: .taskAborted, payload: ["reason": reasonText])
+            )
+            var task = durableState.toTask()
+            task.state = .failed(reason: reasonText)
+            return task
+        }
+
         let resolution = QApprovalCoordinator.shared.resolve(approvalId: approvalId, decision: decision)
 
         switch resolution {
@@ -1245,11 +1350,40 @@ public final class QCoreRuntime: @unchecked Sendable {
         if pendingSteps.isEmpty {
             executedPlan = plan
         } else {
+            // Phase 4.4: Cancellation check before resumed plan execution
+            if Task.isCancelled {
+                var task = taskState.toTask()
+                task.state = .failed(reason: "Task cancelled before resumed plan execution")
+                var updatedDurable = taskState
+                updatedDurable.lifecycleState = .failed
+                updatedDurable.lastKnownError = "Task cancelled before resumed plan execution"
+                try? durableStore?.saveTask(updatedDurable)
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(taskId: task.taskId, sessionId: task.sessionId, eventType: .taskAborted, payload: ["reason": "Task cancelled before resumed plan execution"])
+                )
+                return task
+            }
+
             executedPlan = try await executor.execute(
                 plan: plan,
                 context: task.context,
                 observer: observer
             )
+
+            // Phase 4.4: Handle cancelled resumed plan
+            if case .cancelled(let reason) = executedPlan.state {
+                var task = taskState.toTask()
+                task.state = .failed(reason: reason)
+                var updatedDurable = taskState
+                updatedDurable.lifecycleState = .failed
+                updatedDurable.lastKnownError = reason
+                try? durableStore?.saveTask(updatedDurable)
+                try? durableStore?.recordEvent(
+                    QTaskLifecycleEvent(taskId: task.taskId, sessionId: task.sessionId, eventType: .taskAborted, payload: ["reason": reason])
+                )
+                return task
+            }
+
             // Any step that reached a real terminal outcome during THIS execute() call consumes
             // budget, exactly like submitIntent's loop. Steps still pending/waiting-for-permission
             // are intentionally not counted here — they have not been attempted yet.

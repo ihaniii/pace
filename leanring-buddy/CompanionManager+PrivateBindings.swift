@@ -479,11 +479,11 @@ extension CompanionManager {
             pttPressedAt = Date()
             // Start a per-turn latency budget tracker.
             PaceLatencyBudget.shared.startTurn(trigger: .pushToTalk)
-            // Fire the screen-context pre-warm in parallel with dictation.
-            // VLM + OCR run during the user's natural speech time (~2-5s)
-            // and the result is awaited by the agent loop's first step —
-            // perceived VLM latency drops to ~0 in the common case.
-            screenContextService.prewarmScreenContext(reason: .pushToTalkPress)
+            // Phase 4.4: Suppress legacy screen-context pre-warm in qCoreAuthoritative mode.
+            // Q-Core uses on-demand perception (screen.ocr) rather than eager full-screen capture.
+            if shouldPrewarmScreenContextForCurrentEngineMode() {
+                screenContextService.prewarmScreenContext(reason: .pushToTalkPress)
+            }
             // Warm the Kokoro TTS sidecar in the same PTT-press dead-time
             // window. The single-space prewarm synthesis runs while the user
             // is still speaking, so the first real sentence after the planner

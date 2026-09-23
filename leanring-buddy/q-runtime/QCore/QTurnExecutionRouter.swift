@@ -36,6 +36,10 @@ public struct QConversationTurnSnippet: Sendable, Codable, Equatable {
 }
 
 public struct QAgentTurnContext: Sendable, Equatable {
+    /// Phase 4.4: Maximum characters of active selection context ingested into planning.
+    /// Bounded to fit cleanly within local model context windows without truncation risk.
+    public static let maxActiveSelectionCharacters: Int = 2_000
+
     public let turnId: String
     public let transcript: String
     public let conversationHistory: [QConversationTurnSnippet]

@@ -1081,6 +1081,30 @@ extension CompanionManager {
         }
     }
 
+    // MARK: - Phase 4.4 Engine Prewarm & Context Helpers
+
+    func shouldPrewarmScreenContextForCurrentEngineMode() -> Bool {
+        PaceUserPreferencesStore.executionEngineMode() == .legacyAuthoritative
+    }
+
+    func readActiveSelectionTextSafely() -> String? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedValue) == .success,
+              let focusedValue,
+              CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let focusedElement = focusedValue as! AXUIElement
+        var selectedValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(focusedElement, kAXSelectedTextAttribute as CFString, &selectedValue) == .success,
+           let selectedStr = selectedValue as? String {
+            let trimmed = selectedStr.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return nil
+    }
+
     // MARK: - Phase 4.1 Turn Engine Router Dispatch
 
     func buildTurnContext(transcript: String, turnLease: PaceTurnLease) -> QAgentTurnContext {
@@ -1095,6 +1119,7 @@ extension CompanionManager {
         let appBundleId = frontmost?.bundleIdentifier
         let appName = frontmost?.localizedName
         let hasScreenshotAvailable = !NSScreen.screens.isEmpty
+        let selection = readActiveSelectionTextSafely()
 
         return QAgentTurnContext(
             turnId: turnLease.turnId,
@@ -1103,7 +1128,7 @@ extension CompanionManager {
             activeApplicationBundleId: appBundleId,
             activeApplicationName: appName,
             hasScreenshot: hasScreenshotAvailable,
-            selectionText: nil
+            selectionText: selection
         )
     }
 

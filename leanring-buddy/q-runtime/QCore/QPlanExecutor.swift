@@ -59,6 +59,26 @@ public final class QPlanExecutor: Sendable {
 
         // 2. Iterate through steps sequentially
         for i in 0..<plan.steps.count {
+            // Phase 4.4: Cooperative cancellation check before step begins
+            if Task.isCancelled {
+                skipRemainingSteps(in: &plan, startingAt: i, reason: "Turn cancelled by user")
+                plan.state = .cancelled(reason: "Turn cancelled by user")
+                observer?.planDidUpdate(plan: plan)
+                QAuditLogger.shared.record(
+                    QAuditRecord(
+                        sessionId: plan.sessionId,
+                        taskId: plan.taskId,
+                        tool: "plan.cancelled",
+                        riskLevel: .level0ReadOnly,
+                        rawArguments: "stepIndex=\(i)",
+                        authorizationResult: "halt",
+                        provenance: context.isTainted ? "untrusted" : "trusted:system",
+                        executionSummary: "Plan execution halted at step \(i) due to user cancellation."
+                    )
+                )
+                return plan
+            }
+
             var step = plan.steps[i]
 
             // Invariant: steps must match index
@@ -246,6 +266,29 @@ public final class QPlanExecutor: Sendable {
             observer?.planDidUpdate(plan: plan)
 
             // D. Dispatch Physical Execution
+            // Phase 4.4: Cooperative cancellation check immediately before dispatching physical action
+            if Task.isCancelled {
+                step.state = .skipped(reason: "Turn cancelled by user")
+                plan.steps[i] = step
+                skipRemainingSteps(in: &plan, startingAt: i + 1, reason: "Turn cancelled by user")
+                plan.state = .cancelled(reason: "Turn cancelled by user")
+                observer?.stepDidTransition(step: step, planId: plan.id)
+                observer?.planDidUpdate(plan: plan)
+                QAuditLogger.shared.record(
+                    QAuditRecord(
+                        sessionId: plan.sessionId,
+                        taskId: plan.taskId,
+                        tool: "plan.cancelled",
+                        riskLevel: .level0ReadOnly,
+                        rawArguments: "stepIndex=\(i)",
+                        authorizationResult: "halt",
+                        provenance: context.isTainted ? "untrusted" : "trusted:system",
+                        executionSummary: "Plan execution halted immediately before action dispatch at step \(i) due to user cancellation."
+                    )
+                )
+                return plan
+            }
+
             let actionReq = step.action.toActionRequest(stepId: step.id)
             let actionResult: QActionResult
             do {
