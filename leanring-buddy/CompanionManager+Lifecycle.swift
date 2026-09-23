@@ -118,7 +118,16 @@ extension CompanionManager {
 
         cancelActiveTurnTasks()
         ttsClient.stopPlayback()
-        streamingSentenceTTSPipeline.resetForNewTurn()
+        let detectedTurnLocale = PaceSpeechVoiceResolver.detectLanguage(for: transcript).flatMap { raw -> String? in
+            let base = raw.replacingOccurrences(of: "_", with: "-").lowercased().split(separator: "-").first.map(String.init) ?? raw
+            switch base {
+            case "en": return "en-US"
+            case "sv": return "sv-SE"
+            case "ar": return "ar"
+            default: return raw
+            }
+        } ?? "en-US"
+        streamingSentenceTTSPipeline.resetForNewTurn(locale: detectedTurnLocale)
         // New turn began — hide the reply-replay button so it doesn't
         // linger past the next push-to-talk press.
         clearLastSpokenReplyState()

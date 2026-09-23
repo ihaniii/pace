@@ -112,6 +112,7 @@ extension CompanionManager {
         currentResponseTask = Task { [weak self] in
             guard let self else { return }
             voiceState = .responding
+            streamingSentenceTTSPipeline.setActiveTurnLocale("en-US")
             await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: spokenText)
             while ttsClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 80_000_000)
@@ -1168,6 +1169,16 @@ extension CompanionManager {
     ) async {
         guard isActiveTurn(turnLease) else { return }
         ttsClient.stopPlayback()
+        let detectedTurnLocale = PaceSpeechVoiceResolver.detectLanguage(for: transcript).flatMap { raw -> String? in
+            let base = raw.replacingOccurrences(of: "_", with: "-").lowercased().split(separator: "-").first.map(String.init) ?? raw
+            switch base {
+            case "en": return "en-US"
+            case "sv": return "sv-SE"
+            case "ar": return "ar"
+            default: return raw
+            }
+        } ?? "en-US"
+        streamingSentenceTTSPipeline.setActiveTurnLocale(detectedTurnLocale)
         // HIGH-2 remediation: clear any retrieval/prompt-injection taint
         // carried over from a prior turn before this new one starts — see
         // `PaceActionExecutor.isCurrentTurnContextTainted`'s doc comment.

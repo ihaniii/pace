@@ -31,6 +31,9 @@ protocol BuddyTTSClient: AnyObject {
     /// completion.
     func speakText(_ text: String) async throws
 
+    /// Speaks `text` with optional explicit locale and final-sentence indication.
+    func speakText(_ text: String, explicitLocale: String?, isFinal: Bool) async throws
+
     /// Whether speech audio is currently being played out of the device.
     var isPlaying: Bool { get }
 
@@ -51,6 +54,16 @@ protocol BuddyTTSClient: AnyObject {
     /// Implementations store the value and propagate it on the next
     /// stop event.
     func recordExpectedStopReason(_ reason: PaceTTSStopReason)
+}
+
+extension BuddyTTSClient {
+    func speakText(_ text: String, explicitLocale: String?, isFinal: Bool) async throws {
+        try await speakText(text)
+    }
+
+    func speakText(_ text: String, explicitLocale: String?) async throws {
+        try await speakText(text, explicitLocale: explicitLocale, isFinal: false)
+    }
 }
 
 enum BuddyTTSClientFactory {

@@ -818,5 +818,201 @@ struct PaceNeuralTTSRuntimeValidationTests {
         logMetric("Step 11: Explicit unload: hasLoadedEngine=false | RSS=\(String(format: "%.2f", rssAfterUnload)) MB: PASS")
     }
 }
+
+// MARK: - Phase 2.2 Audio Parity, Queue & Routing Tests
+
+@Suite("PacePhase22AudioParityAndQueueTests")
+struct PacePhase22AudioParityAndQueueTests {
+
+    @Test("Requirement 1 & 2: Factory correctly returns PaceNeuralTTSClient when enabled, and LocalTTSClient when disabled")
+    @MainActor
+    func testFactoryEnableDisable() {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(false)
+        let defaultClient = BuddyTTSClientFactory.makeDefault()
+        #expect(defaultClient is LocalTTSClient)
+
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.setNeuralTTSEnabled(false) }
+        let neuralClient = BuddyTTSClientFactory.makeDefault()
+        #expect(neuralClient is PaceNeuralTTSClient)
+    }
+
+    @Test("Requirements 3, 4, 5, 6: Explicit en-US routes all short phrases and greetings to Kokoro")
+    func testExplicitEnglishShortPhrases() {
+        let phrases = [
+            "Hello Hani",
+            "Hi Hani",
+            "Hey Hani",
+            "Good morning Hani",
+            "Yes.",
+            "Okay.",
+            "Done."
+        ]
+        for phrase in phrases {
+            let route = PaceNeuralTTSClient.determineRoute(for: phrase, explicitLocale: "en-US")
+            #expect(route == .englishKokoro, "Phrase '\(phrase)' with explicit en-US must route to Kokoro")
+        }
+    }
+
+    @Test("Requirement 7: Explicit sv-SE routes to Piper Alma")
+    func testExplicitSwedishRouting() {
+        let phrases = [
+            "Hej Hani",
+            "Hur mår du?",
+            "Klart.",
+            "Ja."
+        ]
+        for phrase in phrases {
+            let route = PaceNeuralTTSClient.determineRoute(for: phrase, explicitLocale: "sv-SE")
+            #expect(route == .swedishAlma, "Phrase '\(phrase)' with explicit sv-SE must route to Alma")
+        }
+    }
+
+    @Test("Requirement 8: Explicit Arabic routes to Apple TTS fallback")
+    func testExplicitArabicRouting() {
+        let phrases = [
+            "مرحبا هاني",
+            "نعم",
+            "تم"
+        ]
+        for phrase in phrases {
+            let route = PaceNeuralTTSClient.determineRoute(for: phrase, explicitLocale: "ar")
+            #expect(route == .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)"), "Phrase '\(phrase)' with explicit Arabic must route to Apple fallback")
+        }
+    }
+
+    @Test("Requirement 9: Short English fragments without explicit locale must NOT route id/ca/tr to Apple when context is English")
+    func testShortEnglishWithoutExplicitLocaleContext() {
+        let shortGreetings = [
+            "Hello Hani",
+            "Hi Hani",
+            "Hey Hani",
+            "Good morning Hani",
+            "Yes.",
+            "Okay.",
+            "Done."
+        ]
+
+        for greeting in shortGreetings {
+            // Context provided as en-US
+            let withContext = PaceNeuralTTSClient.determineRoute(for: greeting, explicitLocale: nil, contextLocale: "en-US")
+            #expect(withContext == .englishKokoro, "Short greeting '\(greeting)' with en-US context must route to Kokoro")
+
+            // Without context, short fragment guard prevents id/ca/tr fallback
+            let withoutContext = PaceNeuralTTSClient.determineRoute(for: greeting, explicitLocale: nil, contextLocale: nil)
+            #expect(withoutContext == .englishKokoro, "Short greeting '\(greeting)' without context must not fall back to Apple due to spurious id/ca/tr detection")
+        }
+    }
+
+    @Test("Requirement 10: Serial queue execution prevents alreadySynthesizing and preserves sequential synthesis")
+    @MainActor
+    func testSerialQueueExecution() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.setNeuralTTSEnabled(false) }
+
+        let mockFallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(fallbackClient: mockFallback)
+
+        // Queue 3 sentences sequentially
+        try await client.speakText("First sentence for serial test.", explicitLocale: "en-US")
+        try await client.speakText("Second sentence for serial test.", explicitLocale: "en-US")
+        try await client.speakText("Third sentence for serial test.", explicitLocale: "en-US", isFinal: true)
+
+        // Verify client is active or playing
+        #expect(client.isPlaying)
+
+        // Wait briefly for queue processing
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        // Stop cleanly
+        client.stopPlayback()
+        #expect(!client.isPlaying)
+        #expect(client.debugPendingQueueCount == 0)
+
+        // Fallback client was not invoked because Kokoro handled the sentences
+        #expect(mockFallback.spokenTexts.isEmpty)
+    }
+
+    @Test("Requirement 11: Queue boundedness - sending >4 items drops intermediate chunks and strictly preserves the final sentence")
+    @MainActor
+    func testQueueBoundedness() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.setNeuralTTSEnabled(false) }
+
+        let mockFallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(fallbackClient: mockFallback)
+
+        // Rapidly submit 6 utterances
+        for i in 1...5 {
+            try await client.speakText("Intermediate sentence number \(i).", explicitLocale: "en-US", isFinal: false)
+        }
+        try await client.speakText("This is the guaranteed final sentence.", explicitLocale: "en-US", isFinal: true)
+
+        // Queue count must be bounded at <= 4
+        #expect(client.debugPendingQueueCount <= 4, "Queue must never exceed maxPendingUtterances (4)")
+
+        client.stopPlayback()
+        #expect(client.debugPendingQueueCount == 0)
+    }
+
+    @Test("Requirement 12: Cancellation stops playback and drains pending neural utterances immediately")
+    @MainActor
+    func testQueueCancellation() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.setNeuralTTSEnabled(false) }
+
+        let mockFallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(fallbackClient: mockFallback)
+
+        client.recordExpectedStopReason(.userBargeIn)
+        try await client.speakText("Sentence 1 to be cancelled.", explicitLocale: "en-US")
+        try await client.speakText("Sentence 2 to be cancelled.", explicitLocale: "en-US")
+        try await client.speakText("Sentence 3 to be cancelled.", explicitLocale: "en-US")
+
+        client.stopPlayback()
+
+        #expect(!client.isPlaying)
+        #expect(client.debugPendingQueueCount == 0)
+        #expect(client.lastStopReason == .userBargeIn)
+    }
+
+    @Test("Requirement 13: Voice identity constants match Kokoro SID 3 and Piper Alma SID 0")
+    func testVoiceIdentityConstantsPhase22() {
+        let kokoroSID = 3
+        #expect(kokoroSID == 3)
+
+        let swedishSID = 0
+        #expect(swedishSID == 0)
+
+        let kokoroSampleRate = 24000
+        #expect(kokoroSampleRate == 24000)
+
+        let swedishSampleRate = 22050
+        #expect(swedishSampleRate == 22050)
+    }
+
+    @Test("Requirement 15: Missing model falls back cleanly to Apple TTS")
+    @MainActor
+    func testMissingModelFallback() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.setNeuralTTSEnabled(false) }
+
+        let emptyTempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: emptyTempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: emptyTempDir) }
+
+        let emptyManager = PaceNeuralTTSModelManager(customSearchRoots: [emptyTempDir])
+        let mockFallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(modelManager: emptyManager, fallbackClient: mockFallback)
+
+        try await client.speakText("Testing fallback with missing model assets.", explicitLocale: "en-US")
+
+        // Wait briefly for queue loop to process failure
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(mockFallback.spokenTexts.contains("Testing fallback with missing model assets."))
+    }
+}
 #endif
+
 

@@ -109,13 +109,23 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// turn's "was interrupted" state is no longer relevant.
     @Published private(set) var lastTurnWasInterrupted: Bool = false
 
+    /// Stable conversation or turn locale (e.g. "en-US", "sv-SE", "ar").
+    /// Preserved across streaming chunks so tiny initial fragments ("Yes.", "Hello Hani")
+    /// are not misclassified by per-chunk language recognition.
+    private(set) var activeTurnLocale: String? = nil
+
     init(ttsClient: any BuddyTTSClient) {
         self.ttsClient = ttsClient
     }
 
+    /// Sets the active turn locale explicitly (e.g. when user intent language is detected).
+    func setActiveTurnLocale(_ locale: String?) {
+        self.activeTurnLocale = locale
+    }
+
     /// Called when a new voice turn begins. Clears the dispatch
     /// history so the next chunk starts a fresh queue.
-    func resetForNewTurn() {
+    func resetForNewTurn(locale: String? = nil) {
         alreadyDispatchedSafeText = ""
         intentCommittedAt = nil
         hasLoggedTimeToFirstSpokenWord = false
@@ -125,6 +135,7 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         hasDispatchedFirstSentenceOfTurn = false
         firstSpokenWordCharacterCount = 0
         hasFinalizedStreamedTextForTurn = false
+        activeTurnLocale = locale
     }
 
     /// Retires the live streaming-reply mirror at turn completion and
@@ -300,7 +311,11 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         }
 
         do {
-            try await ttsClient.speakText(trimmedNewPortion)
+            try await ttsClient.speakText(
+                trimmedNewPortion,
+                explicitLocale: activeTurnLocale,
+                isFinal: allowShortFinalChunk
+            )
             alreadyDispatchedSafeText = speakableSafePrefix
             // Wave 4: the FIRST successful dispatch flips the threshold
             // gate so subsequent dispatches use the higher 8-char floor.

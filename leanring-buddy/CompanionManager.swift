@@ -372,6 +372,15 @@ final class CompanionManager: ObservableObject {
         return BuddyTTSClientFactory.makeDefault()
     }()
 
+    /// Safely stops playback and reloads the TTS client from the factory
+    /// when the user toggles Neural TTS in settings.
+    func reloadTTSClient() {
+        ttsClient.stopPlayback()
+        let newClient = BuddyTTSClientFactory.makeDefault()
+        self.ttsClient = newClient
+        self.streamingSentenceTTSPipeline = StreamingSentenceTTSPipeline(ttsClient: newClient)
+    }
+
     // The action executor synthesises real mouse/keyboard events on the
     // user's behalf. Gated behind Info.plist EnableActions — when false,
     // every method here logs and returns without posting anything.

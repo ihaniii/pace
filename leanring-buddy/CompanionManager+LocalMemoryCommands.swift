@@ -57,6 +57,7 @@ extension CompanionManager {
         recordConversationTurn(userTranscript: transcript, assistantResponse: spokenText)
         currentResponseTask = Task {
             voiceState = .responding
+            streamingSentenceTTSPipeline.setActiveTurnLocale("en-US")
             await streamingSentenceTTSPipeline.flushFinal(finalSpokenText: spokenText)
             while ttsClient.isPlaying {
                 try? await Task.sleep(nanoseconds: 80_000_000)

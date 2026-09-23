@@ -18,8 +18,16 @@ struct PaceVoiceSettingsTab: View {
         VStack(alignment: .leading, spacing: 12) {
             paceSettingsInfoRow(title: "Transcription", value: companionManager.buddyDictationManager.transcriptionProviderDisplayName)
             paceSettingsInfoRow(title: "Transcription model", value: companionManager.isTranscriptionModelReady ? "Ready" : "Loading")
-            paceSettingsInfoRow(title: "Active voice", value: companionManager.activeTTSVoiceSummary.displayText)
-            if companionManager.activeTTSVoiceSummary.needsUpgrade {
+            Toggle("Local Neural Speech (Kokoro / Piper)", isOn: Binding(
+                get: { PaceNeuralTTSSettings.isNeuralTTSEnabled },
+                set: { newValue in
+                    PaceNeuralTTSSettings.setNeuralTTSEnabled(newValue)
+                    companionManager.reloadTTSClient()
+                }
+            ))
+            .font(.system(size: 13, weight: .medium))
+            paceSettingsInfoRow(title: "Active voice", value: PaceNeuralTTSSettings.isNeuralTTSEnabled ? "Kokoro (af_heart) / Piper (Alma)" : companionManager.activeTTSVoiceSummary.displayText)
+            if !PaceNeuralTTSSettings.isNeuralTTSEnabled && companionManager.activeTTSVoiceSummary.needsUpgrade {
                 Text(companionManager.activeTTSVoiceSummary.recommendationText)
                     .font(.system(size: 12))
                     .foregroundColor(DS.Colors.warning)
