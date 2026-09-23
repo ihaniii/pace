@@ -3,73 +3,51 @@
 //  leanring-buddy
 //
 //  Shared voice-picking logic for LocalTTSClient and the panel's voice
-//  quality preflight row.
+//  quality preflight row. Delegates to PaceSpeechVoiceResolver.
 //
 
 import AVFoundation
 import Foundation
 
-enum PaceTTSVoiceResolver {
-    static func bestAvailableVoice(preferredVoiceIdentifier: String?) -> AVSpeechSynthesisVoice? {
-        let englishVoices = AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language.hasPrefix("en") }
+public enum PaceTTSVoiceResolver {
+    /// Resolves the best installed voice, delegating to `PaceSpeechVoiceResolver` to prefer
+    /// high-quality female Apple voices with deterministic fallback.
+    public static func bestAvailableVoice(
+        locale: String? = nil,
+        preferredVoiceIdentifier: String? = nil
+    ) -> AVSpeechSynthesisVoice? {
+        PaceSpeechVoiceResolver.bestAvailableVoice(
+            locale: locale,
+            preferredVoiceIdentifier: preferredVoiceIdentifier
+        )
+    }
 
-        if let preferredVoiceIdentifier,
-           let preferredVoice = AVSpeechSynthesisVoice(identifier: preferredVoiceIdentifier),
-           preferredVoice.quality == .premium || preferredVoice.quality == .enhanced {
-            return preferredVoice
-        }
-
-        let preferredVoiceNamesInOrder = ["Ava", "Evan", "Samantha", "Zoe", "Nathan", "Joelle", "Noelle"]
-        for preferredName in preferredVoiceNamesInOrder {
-            if let namedPremiumVoice = englishVoices.first(where: {
-                $0.name == preferredName && $0.quality == .premium
-            }) {
-                return namedPremiumVoice
-            }
-        }
-        for preferredName in preferredVoiceNamesInOrder {
-            if let namedEnhancedVoice = englishVoices.first(where: {
-                $0.name == preferredName && $0.quality == .enhanced
-            }) {
-                return namedEnhancedVoice
-            }
-        }
-
-        if let premiumVoice = englishVoices.first(where: { $0.quality == .premium }) {
-            return premiumVoice
-        }
-        if let enhancedVoice = englishVoices.first(where: { $0.quality == .enhanced }) {
-            return enhancedVoice
-        }
-
-        if let preferredVoiceIdentifier,
-           let preferredVoice = AVSpeechSynthesisVoice(identifier: preferredVoiceIdentifier) {
-            return preferredVoice
-        }
-
-        return AVSpeechSynthesisVoice(language: "en-US")
+    /// Backward-compatible overload for existing callers without explicit locale.
+    public static func bestAvailableVoice(
+        preferredVoiceIdentifier: String? = nil
+    ) -> AVSpeechSynthesisVoice? {
+        bestAvailableVoice(locale: nil, preferredVoiceIdentifier: preferredVoiceIdentifier)
     }
 }
 
-struct PaceTTSVoiceSummary: Equatable {
-    let voiceName: String
-    let qualityName: String
-    let needsUpgrade: Bool
+public struct PaceTTSVoiceSummary: Equatable {
+    public let voiceName: String
+    public let qualityName: String
+    public let needsUpgrade: Bool
 
-    var displayText: String {
+    public var displayText: String {
         "\(voiceName) · \(qualityName)"
     }
 
-    var recommendationText: String {
+    public var recommendationText: String {
         needsUpgrade
             ? "Install an Enhanced or Premium Apple voice for better playback."
             : "High-quality local Apple voice active."
     }
 
-    static func current() -> PaceTTSVoiceSummary {
+    public static func current() -> PaceTTSVoiceSummary {
         let preferredVoiceIdentifier = AppBundleConfiguration.stringValue(forKey: "LocalTTSVoiceIdentifier")
-        guard let voice = PaceTTSVoiceResolver.bestAvailableVoice(
+        guard let voice = PaceSpeechVoiceResolver.bestAvailableVoice(
             preferredVoiceIdentifier: preferredVoiceIdentifier
         ) else {
             return PaceTTSVoiceSummary(

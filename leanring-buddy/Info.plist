@@ -59,8 +59,6 @@
 	<string>af_heart</string>
 	<key>LocalTTSSpeechRate</key>
 	<string>0.44</string>
-	<key>LocalTTSVoiceIdentifier</key>
-	<string>com.apple.voice.compact.en-IN.Rishi</string>
 	<key>LocalTTSVolume</key>
 	<string>0.90</string>
 	<key>LocalVLMBaseURL</key>

@@ -114,18 +114,35 @@ final class LocalTTSClient: NSObject, BuddyTTSClient {
         utterance.volume = speechProsody.volume
         utterance.preUtteranceDelay = speechProsody.preUtteranceDelay
         utterance.postUtteranceDelay = speechProsody.postUtteranceDelay
-        let pickedVoice = resolveCachedBestVoice()
+        let pickedVoice = resolveVoice(for: trimmedText) ?? resolveCachedBestVoice()
         utterance.voice = pickedVoice
         printVoiceUpgradeHintOnceIfCompact(pickedVoice: pickedVoice)
 
         speechSynthesizer.speak(utterance)
-        print("🔊 Local TTS: speaking \(trimmedText.count) chars")
+        print("🔊 Local TTS: speaking \(trimmedText.count) chars with voice \(pickedVoice?.name ?? "default")")
     }
 
-    /// Returns the best-available voice, computing it on first call and
-    /// caching the result. The `AVSpeechSynthesisVoice.speechVoices()`
-    /// scan inside `bestAvailableVoice()` is too expensive to do per
-    /// utterance with sentence-level streaming.
+    /// Cached voices by detected language code so sentence-level streaming doesn't
+    /// repeatedly scan the installed voice list per utterance.
+    private var memoizedVoicesByLanguage: [String: AVSpeechSynthesisVoice] = [:]
+
+    private func resolveVoice(for text: String) -> AVSpeechSynthesisVoice? {
+        let detected = PaceSpeechVoiceResolver.detectLanguage(for: text) ?? "en"
+        if let cached = memoizedVoicesByLanguage[detected] {
+            return cached
+        }
+        let voice = PaceSpeechVoiceResolver.bestAvailableVoice(
+            forText: text,
+            preferredVoiceIdentifier: preferredVoiceIdentifier
+        )
+        if let voice {
+            memoizedVoicesByLanguage[detected] = voice
+        }
+        return voice
+    }
+
+    /// Returns the primary default voice, computing it on first call and
+    /// caching the result.
     private func resolveCachedBestVoice() -> AVSpeechSynthesisVoice? {
         if hasResolvedBestVoice {
             return memoizedBestVoice
