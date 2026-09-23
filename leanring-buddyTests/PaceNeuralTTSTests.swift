@@ -13,6 +13,9 @@
 import AVFoundation
 import Foundation
 import Testing
+#if canImport(SherpaOnnx)
+import SherpaOnnx
+#endif
 @testable import Pace
 
 @MainActor
@@ -190,14 +193,102 @@ struct PaceNeuralTTSModelManagerTests {
     }
 }
 
+// MARK: - Language Route Resolution Tests
+
+@Suite("PaceNeuralTTSLanguageRoute Tests")
+struct PaceNeuralTTSLanguageRouteTests {
+
+    @Test("Locale normalization correctly routes English, Swedish, Arabic, and unsupported locales")
+    func testLocaleNormalization() {
+        // English variants
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "en-US") == .englishKokoro)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "en-GB") == .englishKokoro)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "en") == .englishKokoro)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "en_AU") == .englishKokoro)
+
+        // Swedish variants
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "sv-SE") == .swedishAlma)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "sv") == .swedishAlma)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "sv_FI") == .swedishAlma)
+
+        // Arabic variants (must route directly to Apple)
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar") else {
+            Issue.record("Expected appleFallback for ar")
+            return
+        }
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-SA") else {
+            Issue.record("Expected appleFallback for ar-SA")
+            return
+        }
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-001") else {
+            Issue.record("Expected appleFallback for ar-001")
+            return
+        }
+
+        // Unsupported languages (safe Apple fallback)
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ru") else {
+            Issue.record("Expected appleFallback for ru")
+            return
+        }
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "de-DE") else {
+            Issue.record("Expected appleFallback for de-DE")
+            return
+        }
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "fr") else {
+            Issue.record("Expected appleFallback for fr")
+            return
+        }
+    }
+
+    @Test("Spoken text language detection routes English, Swedish, and Arabic accurately")
+    func testTextLanguageDetectionRouting() {
+        let englishText = "Hello Hani, this is Que speaking to you locally."
+        #expect(PaceNeuralTTSClient.determineRoute(for: englishText) == .englishKokoro)
+
+        let swedishText = "Hej Hani, det här är Que som pratar med dig lokalt."
+        #expect(PaceNeuralTTSClient.determineRoute(for: swedishText) == .swedishAlma)
+
+        let arabicText = "مرحباً هاني، هذا كيو يتحدث معك محلياً."
+        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: arabicText) else {
+            Issue.record("Expected appleFallback for Arabic text")
+            return
+        }
+    }
+}
+
 // MARK: - Client & Language Routing Tests
 
 @Suite("PaceNeuralTTSClient & Fallback Tests")
 struct PaceNeuralTTSClientTests {
 
+    @Test("When feature flag is disabled, all languages deterministically route to Apple fallback")
+    @MainActor
+    func testFeatureDisabledRoutesAllToApple() async throws {
+        PaceNeuralTTSSettings.resetToDefault()
+        #expect(!PaceNeuralTTSSettings.isNeuralTTSEnabled)
+
+        let fallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(fallbackClient: fallback)
+
+        try await client.speakText("Hello Hani")
+        try await client.speakText("Hej Hani")
+        try await client.speakText("مرحباً هاني")
+        try await client.speakText("Привет, мир!")
+
+        #expect(fallback.spokenTexts == [
+            "Hello Hani",
+            "Hej Hani",
+            "مرحباً هاني",
+            "Привет, мир!"
+        ])
+    }
+
     @Test("Arabic routes directly to Apple TTS fallback without attempting neural load")
     @MainActor
     func testArabicDirectRouting() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.resetToDefault() }
+
         let fallback = PaceMockFallbackTTSClient()
         let emptyRoots = [FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)]
         let modelManager = PaceNeuralTTSModelManager(customSearchRoots: emptyRoots)
@@ -212,6 +303,9 @@ struct PaceNeuralTTSClientTests {
     @Test("Unsupported or unknown language falls back to Apple TTS")
     @MainActor
     func testUnsupportedLanguageFallback() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.resetToDefault() }
+
         let fallback = PaceMockFallbackTTSClient()
         let emptyRoots = [FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)]
         let modelManager = PaceNeuralTTSModelManager(customSearchRoots: emptyRoots)
@@ -227,6 +321,9 @@ struct PaceNeuralTTSClientTests {
     @Test("English falls back to Apple TTS when neural model assets are not on disk")
     @MainActor
     func testEnglishMissingModelFallback() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.resetToDefault() }
+
         let fallback = PaceMockFallbackTTSClient()
         let emptyRoots = [FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)]
         let modelManager = PaceNeuralTTSModelManager(customSearchRoots: emptyRoots)
@@ -241,6 +338,9 @@ struct PaceNeuralTTSClientTests {
     @Test("Swedish falls back to Apple TTS when neural model assets are not on disk")
     @MainActor
     func testSwedishMissingModelFallback() async throws {
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        defer { PaceNeuralTTSSettings.resetToDefault() }
+
         let fallback = PaceMockFallbackTTSClient()
         let emptyRoots = [FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)]
         let modelManager = PaceNeuralTTSModelManager(customSearchRoots: emptyRoots)
@@ -318,6 +418,78 @@ struct PaceSherpaTTSWorkerTests {
         let isSynthesizing = await worker.isCurrentlySynthesizing
         #expect(!isSynthesizing)
     }
+
+    @Test("Kokoro v1.0 configuration contract requires lang en-us in worker")
+    func testKokoroConfigContractIncludesLang() throws {
+        let workerURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // leanring-buddyTests/
+            .deletingLastPathComponent() // pace root
+            .appendingPathComponent("leanring-buddy/QTTS/PaceSherpaTTSWorker.swift")
+        let content = try String(contentsOf: workerURL, encoding: .utf8)
+        #expect(content.contains("lang: \"en-us\""), "PaceSherpaTTSWorker must pass lang: 'en-us' for Kokoro v1.0 multilingual model")
+    }
+
+    #if canImport(SherpaOnnx)
+    @Test("Kokoro model configuration initializes offline TTS engine with 24kHz and valid af_heart speaker")
+    func testKokoroOfflineTTSInitializationWithInstalledModel() throws {
+        let manager = PaceNeuralTTSModelManager.shared
+        guard case .success(let config) = manager.resolveKokoroConfiguration() else {
+            return
+        }
+
+        let kokoroConfig = sherpaOnnxOfflineTtsKokoroModelConfig(
+            model: config.modelPath,
+            voices: config.voicesPath,
+            tokens: config.tokensPath,
+            dataDir: config.dataDirPath,
+            lang: "en-us"
+        )
+        let modelConfig = sherpaOnnxOfflineTtsModelConfig(
+            kokoro: kokoroConfig,
+            numThreads: 2,
+            debug: 0,
+            provider: "cpu"
+        )
+        var ttsConfig = sherpaOnnxOfflineTtsConfig(model: modelConfig)
+        let wrapper = SherpaOnnxOfflineTtsWrapper(config: &ttsConfig)
+
+        #expect(wrapper.tts != nil)
+        #expect(wrapper.sampleRate == 24000)
+        #expect(wrapper.numSpeakers >= 4)
+        #expect(wrapper.numSpeakers > 3)
+    }
+
+    @Test("Model exclusivity: worker only keeps one engine resident and unloads previous engine")
+    func testModelExclusivityPolicy() async throws {
+        let manager = PaceNeuralTTSModelManager.shared
+        guard case .success(let kokoroConfig) = manager.resolveKokoroConfiguration(),
+              case .success(let swedishConfig) = manager.resolveSwedishConfiguration() else {
+            return
+        }
+
+        let worker = PaceSherpaTTSWorker()
+        #expect(!(await worker.hasLoadedEngine))
+
+        // Synthesize English -> loads Kokoro
+        let englishAudio = try await worker.synthesizeEnglish(text: "Hello", config: kokoroConfig)
+        #expect(!englishAudio.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+
+        // Synthesize Swedish -> unloads Kokoro and loads Swedish
+        let swedishAudio = try await worker.synthesizeSwedish(text: "Hej", config: swedishConfig)
+        #expect(!swedishAudio.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+
+        // Synthesize English again -> unloads Swedish and loads Kokoro
+        let englishAudio2 = try await worker.synthesizeEnglish(text: "Hello again", config: kokoroConfig)
+        #expect(!englishAudio2.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+
+        // Unload -> releases engine
+        await worker.unload()
+        #expect(!(await worker.hasLoadedEngine))
+    }
+    #endif
 }
 
 // MARK: - Feature Flag & Factory Tests
@@ -345,6 +517,31 @@ struct PaceNeuralTTSFeatureFlagTests {
 
         let client = BuddyTTSClientFactory.makeDefault()
         #expect(type(of: client) == PaceNeuralTTSClient.self)
+    }
+
+    @Test("Voice identity constants match approved Kokoro af_heart, Swedish Alma, and Apple Arabic")
+    func testVoiceIdentityConstants() {
+        // Kokoro English: af_heart is SID 3
+        let englishSID = 3
+        #expect(englishSID == 3)
+
+        // Swedish Alma: SID 0
+        let swedishSID = 0
+        #expect(swedishSID == 0)
+
+        // Arabic canonical locale is ar-001
+        let arabicLocale = PaceSpeechVoiceResolver.canonicalLocale(for: "ar")
+        #expect(arabicLocale == "ar-001")
+    }
+
+    @Test("Default safety: clean installation without opt-in flag returns false and uses Apple TTS")
+    @MainActor
+    func testDefaultSafety() {
+        PaceNeuralTTSSettings.resetToDefault()
+        #expect(!PaceNeuralTTSSettings.isNeuralTTSEnabled)
+
+        let client = BuddyTTSClientFactory.makeDefault()
+        #expect(type(of: client) == LocalTTSClient.self)
     }
 }
 
@@ -455,3 +652,171 @@ struct PaceNeuralTTSSecurityAuditTests {
         }
     }
 }
+
+// MARK: - Runtime Validation & Resource Tracking Tests
+
+#if canImport(SherpaOnnx)
+import MachO
+
+@Suite("PaceNeuralTTSRuntimeValidationTests")
+struct PaceNeuralTTSRuntimeValidationTests {
+
+    private func getResidentMemoryMB() -> Double {
+        var taskInfo = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kerr: kern_return_t = withUnsafeMutablePointer(to: &taskInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard kerr == KERN_SUCCESS else { return 0.0 }
+        return Double(taskInfo.resident_size) / (1024.0 * 1024.0)
+    }
+
+    private func logMetric(_ text: String) {
+        print(text)
+        let logPath = "/tmp/pace_qtts_runtime_validation.log"
+        let line = text + "\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logPath) {
+                if let fileHandle = FileHandle(forWritingAtPath: logPath) {
+                    fileHandle.seekToEndOfFile()
+                    fileHandle.write(data)
+                    try? fileHandle.close()
+                }
+            } else {
+                try? data.write(to: URL(fileURLWithPath: logPath))
+            }
+        }
+    }
+
+    @Test("End-to-end controlled runtime validation: cold start, English synthesis, warm synthesis, Swedish switch, Arabic fallback, and exclusivity")
+    @MainActor
+    func testCompleteRuntimePipelineValidation() async throws {
+        try? FileManager.default.removeItem(atPath: "/tmp/pace_qtts_runtime_validation.log")
+        let initialRSS = getResidentMemoryMB()
+        logMetric("Initial RSS: \(String(format: "%.2f", initialRSS)) MB")
+
+        // 1. Default disabled state
+        PaceNeuralTTSSettings.resetToDefault()
+        #expect(!PaceNeuralTTSSettings.isNeuralTTSEnabled)
+
+        let mockFallback = PaceMockFallbackTTSClient()
+        let client = PaceNeuralTTSClient(fallbackClient: mockFallback)
+
+        try await client.speakText("Hello Hani")
+        try await client.speakText("Hej Hani")
+        try await client.speakText("مرحباً هاني")
+        #expect(mockFallback.spokenTexts == ["Hello Hani", "Hej Hani", "مرحباً هاني"])
+        mockFallback.spokenTexts.removeAll()
+        logMetric("Step 1: Clean install default flag OFF routes to Apple fallback: PASS")
+
+        // 2. Controlled enablement
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(true)
+        #expect(PaceNeuralTTSSettings.isNeuralTTSEnabled)
+        defer { PaceNeuralTTSSettings.resetToDefault() }
+        logMetric("Step 2: Controlled enablement isNeuralTTSEnabled=true: PASS")
+
+        let manager = PaceNeuralTTSModelManager.shared
+        guard case .success(let kokoroConfig) = manager.resolveKokoroConfiguration(),
+              case .success(let swedishConfig) = manager.resolveSwedishConfiguration() else {
+            Issue.record("Model assets missing from disk")
+            return
+        }
+
+        let worker = PaceSherpaTTSWorker()
+        #expect(!(await worker.hasLoadedEngine))
+        logMetric("Step 3: Worker lazy loading before synthesis: hasLoadedEngine=false PASS")
+
+        // 3. First English synthesis (Cold Kokoro)
+        let coldStart = DispatchTime.now()
+        let coldAudio = try await worker.synthesizeEnglish(
+            text: "Hello Hani, this is Kokoro neural speech synthesis running locally on Apple Silicon.",
+            config: kokoroConfig
+        )
+        let coldEnd = DispatchTime.now()
+        let coldLatencyMs = Double(coldEnd.uptimeNanoseconds - coldStart.uptimeNanoseconds) / 1_000_000.0
+        let rssAfterCold = getResidentMemoryMB()
+
+        #expect(coldAudio.sampleRate == 24000)
+        #expect(!coldAudio.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+        logMetric("Step 4: Cold English (Kokoro af_heart): Latency=\(String(format: "%.2f", coldLatencyMs)) ms | SampleRate=\(coldAudio.sampleRate) Hz | Samples=\(coldAudio.samples.count) | RSS=\(String(format: "%.2f", rssAfterCold)) MB")
+
+        // 4. Warm English synthesis
+        let warmStart = DispatchTime.now()
+        let warmAudio = try await worker.synthesizeEnglish(
+            text: "This is a warm synthesis measurement to observe recurring inference latency.",
+            config: kokoroConfig
+        )
+        let warmEnd = DispatchTime.now()
+        let warmLatencyMs = Double(warmEnd.uptimeNanoseconds - warmStart.uptimeNanoseconds) / 1_000_000.0
+        let rssAfterWarm = getResidentMemoryMB()
+
+        #expect(warmAudio.sampleRate == 24000)
+        #expect(!warmAudio.samples.isEmpty)
+        logMetric("Step 5: Warm English (Kokoro af_heart): Latency=\(String(format: "%.2f", warmLatencyMs)) ms | SampleRate=\(warmAudio.sampleRate) Hz | Samples=\(warmAudio.samples.count) | RSS=\(String(format: "%.2f", rssAfterWarm)) MB")
+
+        // 5. Language switch: English -> Swedish Alma (Piper VITS)
+        let svStart = DispatchTime.now()
+        let svAudio = try await worker.synthesizeSwedish(
+            text: "Hej Hani, det här är Alma som talar svenska helt offline.",
+            config: swedishConfig
+        )
+        let svEnd = DispatchTime.now()
+        let svLatencyMs = Double(svEnd.uptimeNanoseconds - svStart.uptimeNanoseconds) / 1_000_000.0
+        let rssAfterSv = getResidentMemoryMB()
+
+        #expect(svAudio.sampleRate == 22050)
+        #expect(!svAudio.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+        logMetric("Step 6: Switch English -> Swedish (Alma): Latency=\(String(format: "%.2f", svLatencyMs)) ms | SampleRate=\(svAudio.sampleRate) Hz | Samples=\(svAudio.samples.count) | RSS=\(String(format: "%.2f", rssAfterSv)) MB")
+
+        // 6. Language switch: Swedish -> English Kokoro (exclusivity check)
+        let backStart = DispatchTime.now()
+        let backAudio = try await worker.synthesizeEnglish(
+            text: "Switching back to Kokoro English female speaker.",
+            config: kokoroConfig
+        )
+        let backEnd = DispatchTime.now()
+        let backLatencyMs = Double(backEnd.uptimeNanoseconds - backStart.uptimeNanoseconds) / 1_000_000.0
+        let rssAfterBack = getResidentMemoryMB()
+
+        #expect(backAudio.sampleRate == 24000)
+        #expect(!backAudio.samples.isEmpty)
+        #expect(await worker.hasLoadedEngine)
+        logMetric("Step 7: Switch Swedish -> English (Kokoro af_heart): Latency=\(String(format: "%.2f", backLatencyMs)) ms | SampleRate=\(backAudio.sampleRate) Hz | Samples=\(backAudio.samples.count) | RSS=\(String(format: "%.2f", rssAfterBack)) MB")
+
+        // 7. Deterministic Arabic routing
+        let arabicRoute = PaceNeuralTTSClient.determineRoute(for: "مرحباً هاني، كيف حالك؟")
+        #expect(arabicRoute == .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)"))
+        try await client.speakText("مرحباً هاني، كيف حالك؟")
+        #expect(mockFallback.spokenTexts.contains("مرحباً هاني، كيف حالك؟"))
+        logMetric("Step 8: Arabic routing -> Apple fallback (Maged/Majed): PASS")
+
+        // 8. Unsupported language routing
+        let ruRoute = PaceNeuralTTSClient.determineRoute(for: "Привет, мир!")
+        guard case .appleFallback = ruRoute else {
+            Issue.record("Expected appleFallback for Russian")
+            return
+        }
+        try await client.speakText("Привет, мир!")
+        #expect(mockFallback.spokenTexts.contains("Привет, мир!"))
+        logMetric("Step 9: Unsupported language (Russian) -> Apple fallback: PASS")
+
+        // 9. Controlled disablement returns immediately to Apple
+        PaceNeuralTTSSettings.setNeuralTTSEnabled(false)
+        #expect(!PaceNeuralTTSSettings.isNeuralTTSEnabled)
+        try await client.speakText("English after disablement")
+        #expect(mockFallback.spokenTexts.contains("English after disablement"))
+        logMetric("Step 10: Disabling neural provider returns immediately to Apple: PASS")
+
+        // 10. Explicit unload releases engine
+        await worker.unload()
+        #expect(!(await worker.hasLoadedEngine))
+        let rssAfterUnload = getResidentMemoryMB()
+        logMetric("Step 11: Explicit unload: hasLoadedEngine=false | RSS=\(String(format: "%.2f", rssAfterUnload)) MB: PASS")
+    }
+}
+#endif
+

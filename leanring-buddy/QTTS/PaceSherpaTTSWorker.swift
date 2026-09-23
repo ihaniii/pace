@@ -196,7 +196,8 @@ public actor PaceSherpaTTSWorker {
             model: config.modelPath,
             voices: config.voicesPath,
             tokens: config.tokensPath,
-            dataDir: config.dataDirPath
+            dataDir: config.dataDirPath,
+            lang: "en-us"
         )
         let modelConfig = sherpaOnnxOfflineTtsModelConfig(
             kokoro: kokoroConfig,

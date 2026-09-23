@@ -14,8 +14,16 @@ public enum PaceNeuralTTSSettings {
     public static let useLocalNeuralTTSKey = "PaceUseLocalNeuralTTS"
 
     /// Whether Neural TTS is active. Defaults to false.
+    /// Active if either developer UserDefaults flag is set, OR Info.plist TTSProvider is "neural".
     public static var isNeuralTTSEnabled: Bool {
-        UserDefaults.standard.bool(forKey: useLocalNeuralTTSKey)
+        if UserDefaults.standard.bool(forKey: useLocalNeuralTTSKey) {
+            return true
+        }
+        let configured = AppBundleConfiguration
+            .stringValue(forKey: "TTSProvider")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return configured == "neural"
     }
 
     /// Sets the opt-in flag.

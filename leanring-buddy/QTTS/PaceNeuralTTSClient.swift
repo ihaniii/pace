@@ -85,15 +85,55 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         fallbackClient.stopPlayback()
     }
 
+    // MARK: - Deterministic Language Routing
+
+    public enum PaceNeuralTTSLanguageRoute: Equatable, Sendable {
+        case englishKokoro
+        case swedishAlma
+        case appleFallback(reason: String)
+    }
+
+    /// Deterministically routes an utterance to a neural engine or Apple fallback based on
+    /// locale metadata or on-device language detection.
+    nonisolated public static func determineRoute(for text: String, explicitLocale: String? = nil) -> PaceNeuralTTSLanguageRoute {
+        let rawTarget = explicitLocale ?? PaceSpeechVoiceResolver.detectLanguage(for: text)
+        guard let raw = rawTarget?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            // Default to English Kokoro if language is undetermined
+            return .englishKokoro
+        }
+
+        let normalized = raw.replacingOccurrences(of: "_", with: "-").lowercased()
+        let baseLanguage = normalized.split(separator: "-").first.map(String.init) ?? normalized
+
+        switch baseLanguage {
+        case "en":
+            return .englishKokoro
+        case "sv":
+            return .swedishAlma
+        case "ar":
+            return .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)")
+        default:
+            return .appleFallback(reason: "Unsupported neural language '\(raw)'; falling back to Apple TTS")
+        }
+    }
+
     func speakText(_ text: String) async throws {
+        try await speakText(text, explicitLocale: nil)
+    }
+
+    func speakText(_ text: String, explicitLocale: String?) async throws {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        // Detect language via PaceSpeechVoiceResolver
-        let detectedLanguage = PaceSpeechVoiceResolver.detectLanguage(for: trimmed)?.lowercased()
+        // If neural feature flag is not enabled, deterministically route to Apple fallback
+        guard PaceNeuralTTSSettings.isNeuralTTSEnabled else {
+            try await fallbackClient.speakText(trimmed)
+            return
+        }
 
-        switch detectedLanguage {
-        case "en":
+        let route = Self.determineRoute(for: trimmed, explicitLocale: explicitLocale)
+        switch route {
+        case .englishKokoro:
             do {
                 try await speakWithKokoro(trimmed)
             } catch {
@@ -101,7 +141,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
                 try await fallbackClient.speakText(trimmed)
             }
 
-        case "sv":
+        case .swedishAlma:
             do {
                 try await speakWithSwedish(trimmed)
             } catch {
@@ -109,12 +149,8 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
                 try await fallbackClient.speakText(trimmed)
             }
 
-        case "ar":
-            // Arabic routes directly to Apple AVSpeechSynthesizer female voice
-            try await fallbackClient.speakText(trimmed)
-
-        default:
-            // Unknown or other language: safe Apple fallback
+        case .appleFallback(let reason):
+            print("🔊 Neural TTS: \(reason)")
             try await fallbackClient.speakText(trimmed)
         }
     }
