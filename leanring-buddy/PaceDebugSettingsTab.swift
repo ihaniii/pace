@@ -15,6 +15,8 @@ import SwiftUI
 struct PaceDebugSettingsTab: View {
     @ObservedObject var companionManager: CompanionManager
 
+    @State private var selectedEngineMode: QExecutionEngineMode = PaceUserPreferencesStore.executionEngineMode()
+
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -23,6 +25,31 @@ struct PaceDebugSettingsTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Execution engine (controlled dogfood)")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Selects the authoritative turn execution engine. Production default is Legacy Authoritative. Q-Core Authoritative is for internal controlled dogfood only.")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Picker("", selection: $selectedEngineMode) {
+                    Text("Legacy Authoritative (Default)").tag(QExecutionEngineMode.legacyAuthoritative)
+                    Text("Q-Core Authoritative (Dogfood)").tag(QExecutionEngineMode.qCoreAuthoritative)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: selectedEngineMode) { newMode in
+                    PaceUserPreferencesStore.setExecutionEngineMode(newMode)
+                }
+            }
+            .onAppear {
+                selectedEngineMode = PaceUserPreferencesStore.executionEngineMode()
+            }
+
+            Divider()
+                .background(DS.Colors.borderSubtle)
+
             VStack(alignment: .leading, spacing: 6) {
                 Text("Tool calls")
                     .font(.system(size: 13, weight: .semibold))

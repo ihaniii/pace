@@ -133,7 +133,13 @@ public final class QAgent: Sendable {
         let executedTask: QTask
         do {
             let planObserver = observer as? (any QPlanExecutionObserver)
-            executedTask = try await core.submitIntent(prompt: task, sessionId: effectiveSessionId, observer: planObserver, selectedFiles: selectedFiles)
+            executedTask = try await core.submitIntent(
+                prompt: task,
+                sessionId: effectiveSessionId,
+                observer: planObserver,
+                selectedFiles: selectedFiles,
+                turnContext: turnContext
+            )
         } catch {
             let duration = Date().timeIntervalSince(start)
             observer?.agentDidTransition(state: .error, message: error.localizedDescription)

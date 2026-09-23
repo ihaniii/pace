@@ -151,11 +151,57 @@ public final class QCoreRuntime: @unchecked Sendable {
         /// Open panel presented outside this runtime). Bounded here immediately; only consulted at
         /// all when `verifiedResponseConfiguration?.localEvidence.isEnabled` is true. Never a
         /// directory, never resolved by this runtime, never scanned automatically.
-        selectedFiles: [QSelectedFileHandle] = []
+        selectedFiles: [QSelectedFileHandle] = [],
+        /// Phase 4.2: optional turn context bridge from CompanionManager / QAgent.
+        turnContext: QAgentTurnContext? = nil
     ) async throws -> QTask {
         // 1. Create task and initialize trusted context
         var task = QTask(sessionId: sessionId, intent: prompt)
         task.context.append(content: prompt, provenance: .trustedUser(channel: "direct"), sourceId: "user_prompt")
+
+        // Phase 4.2: Ingest bounded turn context (frontmost app & bounded history)
+        if let context = turnContext {
+            // Frontmost application metadata (trusted system provenance)
+            if let appName = context.activeApplicationName, !appName.isEmpty {
+                let bundleId = context.activeApplicationBundleId ?? "unknown"
+                task.context.append(
+                    content: "Active Application: \(appName) (bundleId: \(bundleId))",
+                    provenance: .trustedSystem,
+                    sourceId: "frontmost_app"
+                )
+            } else if let bundleId = context.activeApplicationBundleId, !bundleId.isEmpty {
+                task.context.append(
+                    content: "Active Application bundleId: \(bundleId)",
+                    provenance: .trustedSystem,
+                    sourceId: "frontmost_app"
+                )
+            }
+
+            // Bounded conversation history (max 4 turns)
+            // Critical Trust Rule: User turns are trusted user context, but assistant
+            // responses MUST remain untrusted reference data and cannot issue instructions.
+            let boundedHistory = context.conversationHistory.suffix(4)
+            for snippet in boundedHistory {
+                let userText = snippet.userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !userText.isEmpty {
+                    task.context.append(
+                        content: userText,
+                        provenance: .trustedUser(channel: "history"),
+                        sourceId: "conversation_history_user"
+                    )
+                }
+
+                let assistantText = snippet.assistantResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !assistantText.isEmpty {
+                    task.context.append(
+                        content: assistantText,
+                        provenance: .untrustedTool(toolName: "assistant_history"),
+                        sourceId: "conversation_history_assistant"
+                    )
+                }
+            }
+        }
+
         let boundedSelectedFiles = Array(selectedFiles.prefix(QLocalEvidenceLimits.maxSelectedFilesPerRequest))
 
         var budget = QAgentBudget()
