@@ -217,7 +217,11 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 observer: self
             )
 
-            chatSession.appendCompletedTurn(userTranscript: userTranscript, assistantResponse: result.summary)
+            if case .completed = result.status, !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: userTranscript, assistantResponse: result.summary)
+            } else {
+                chatSession.appendCompletedTurn(userTranscript: userTranscript, assistantResponse: result.summary)
+            }
             if !chatSession.isChatTTSMuted {
                 try? await ttsClient.speakText(result.summary)
             }
@@ -259,8 +263,12 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 turnContext: context
             )
 
-            // Post turn to chat session transcript
-            chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
+            // Post turn to chat session transcript and thread memory
+            if case .completed = result.status, !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
+            } else {
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
+            }
 
             // Speak result via existing TTS pipeline
             if !chatSession.isChatTTSMuted {

@@ -38,6 +38,10 @@ extension CompanionManager {
         userTranscript: String,
         assistantResponse: String
     ) {
+        let trimmedTranscript = userTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedResponse = assistantResponse.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTranscript.isEmpty, !trimmedResponse.isEmpty else { return }
+
         if let activePacePadTurnIdentifier {
             _ = pacePadOutputDelegate?.deliverAssistantResponse(
                 turnIdentifier: activePacePadTurnIdentifier,
