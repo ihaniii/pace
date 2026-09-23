@@ -1055,10 +1055,17 @@ public final class QActionVerifier: Sendable {
             return .verified(evidence: "File '\(path)' is confirmed deleted from disk.")
 
         case .windowOrAppActive(let appName):
-            let runningApps = NSWorkspace.shared.runningApplications
-            let isRunning = runningApps.contains { app in
-                (app.localizedName?.caseInsensitiveCompare(appName) == .orderedSame) ||
-                (app.bundleIdentifier?.caseInsensitiveCompare(appName) == .orderedSame)
+            var isRunning = false
+            // Bounded poll (~1.5s) for the process to appear in NSWorkspace before failing,
+            // accommodating asynchronous macOS application launch latency.
+            for _ in 0..<15 {
+                let runningApps = NSWorkspace.shared.runningApplications
+                isRunning = runningApps.contains { app in
+                    (app.localizedName?.caseInsensitiveCompare(appName) == .orderedSame) ||
+                    (app.bundleIdentifier?.caseInsensitiveCompare(appName) == .orderedSame)
+                }
+                if isRunning { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
             }
             if isRunning {
                 return .verified(evidence: "Application '\(appName)' verified running in NSWorkspace.")
