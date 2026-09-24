@@ -13,6 +13,7 @@ public protocol QDurableTaskStoreProtocol: Sendable {
     func saveTask(_ state: QDurableTaskState) throws
     func getTask(taskId: String) throws -> QDurableTaskState?
     func listIncompleteTasks() throws -> [QDurableTaskState]
+    func listRecentTasks(limit: Int) throws -> [QDurableTaskState]
     func savePlan(_ plan: QDurablePlanSnapshot) throws
     func getPlan(planId: String) throws -> QDurablePlanSnapshot?
     func recordEvent(_ event: QTaskLifecycleEvent) throws
@@ -108,6 +109,7 @@ public final class QDurableTaskStore: QDurableTaskStoreProtocol, @unchecked Send
         );
 
         CREATE INDEX IF NOT EXISTS idx_tasks_lifecycle ON q_durable_tasks(lifecycle_state);
+        CREATE INDEX IF NOT EXISTS idx_tasks_updated_created ON q_durable_tasks(updated_at DESC, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_plans_task ON q_durable_plans(task_id);
         CREATE INDEX IF NOT EXISTS idx_events_task ON q_lifecycle_events(task_id, timestamp);
         """
@@ -194,6 +196,33 @@ public final class QDurableTaskStore: QDurableTaskStoreProtocol, @unchecked Send
             throw QMemoryError.queryFailed("Failed to prepare listIncompleteTasks SQL")
         }
         defer { sqlite3_finalize(stmt) }
+
+        var results: [QDurableTaskState] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let cStr = sqlite3_column_text(stmt, 0) {
+                let jsonStr = String(cString: cStr)
+                if let data = jsonStr.data(using: .utf8),
+                   let task = try? jsonDecoder.decode(QDurableTaskState.self, from: data) {
+                    results.append(task)
+                }
+            }
+        }
+        return results
+    }
+
+    public func listRecentTasks(limit: Int = 20) throws -> [QDurableTaskState] {
+        guard limit > 0 else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+
+        let sql = "SELECT state_json FROM q_durable_tasks ORDER BY updated_at DESC, created_at DESC LIMIT ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            throw QMemoryError.queryFailed("Failed to prepare listRecentTasks SQL")
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int(stmt, 1, Int32(limit))
 
         var results: [QDurableTaskState] = []
         while sqlite3_step(stmt) == SQLITE_ROW {

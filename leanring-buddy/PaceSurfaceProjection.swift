@@ -98,6 +98,7 @@ nonisolated enum PaceNowSurfaceProjection {
 nonisolated enum PaceWorkingSurfaceTaskState: Equatable, Sendable {
     case queued
     case running
+    case awaitingApproval
     case completed
     case cancelled
     case failed
@@ -134,29 +135,146 @@ nonisolated enum PaceWorkingSurfaceLimits {
 }
 
 nonisolated enum PaceWorkingSurfaceProjection {
-    static func project(backgroundAgentTasks: [PaceBackgroundAgentTask]) -> PaceWorkingSurfaceState {
-        let projectedTasks = backgroundAgentTasks
-            .sorted { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
-            .prefix(PaceWorkingSurfaceLimits.maximumProjectedTaskCount)
-            .map { task -> PaceWorkingSurfaceTask in
-                let projectedState: PaceWorkingSurfaceTaskState
-                switch task.state {
-                case .queued: projectedState = .queued
-                case .running: projectedState = .running
-                case .completed: projectedState = .completed
-                case .cancelled: projectedState = .cancelled
-                case .failed: projectedState = .failed
-                }
-                return PaceWorkingSurfaceTask(
+    static func project(
+        backgroundAgentTasks: [PaceBackgroundAgentTask] = [],
+        durableTasks: [QDurableTaskState] = []
+    ) -> PaceWorkingSurfaceState {
+        var allCandidates: [(task: PaceWorkingSurfaceTask, sessionId: String?)] = []
+
+        for task in backgroundAgentTasks {
+            let projectedState: PaceWorkingSurfaceTaskState
+            switch task.state {
+            case .queued: projectedState = .queued
+            case .running: projectedState = .running
+            case .completed: projectedState = .completed
+            case .cancelled: projectedState = .cancelled
+            case .failed: projectedState = .failed
+            }
+            allCandidates.append((
+                task: PaceWorkingSurfaceTask(
                     id: task.id,
                     displayName: task.displayName,
                     state: projectedState,
                     currentStepDescription: task.currentStepDescription,
                     startedAt: task.startedAt,
                     hasResult: task.resultSummary?.isEmpty == false
-                )
+                ),
+                sessionId: nil
+            ))
+        }
+
+        for durable in durableTasks {
+            allCandidates.append((
+                task: mapDurableTask(durable),
+                sessionId: durable.sessionId
+            ))
+        }
+
+        allCandidates.sort { a, b in
+            let timeA = a.task.startedAt ?? .distantPast
+            let timeB = b.task.startedAt ?? .distantPast
+            if timeA != timeB {
+                return timeA > timeB
             }
-        return PaceWorkingSurfaceState(tasks: Array(projectedTasks))
+            return a.task.id < b.task.id
+        }
+
+        var seenIdentifiers = Set<String>()
+        var deduplicatedTasks: [PaceWorkingSurfaceTask] = []
+
+        for candidate in allCandidates {
+            let taskId = candidate.task.id
+            if seenIdentifiers.contains(taskId) {
+                continue
+            }
+            if let sess = candidate.sessionId, !sess.isEmpty && seenIdentifiers.contains(sess) {
+                continue
+            }
+            seenIdentifiers.insert(taskId)
+            if let sess = candidate.sessionId, !sess.isEmpty {
+                seenIdentifiers.insert(sess)
+            }
+            deduplicatedTasks.append(candidate.task)
+            if deduplicatedTasks.count >= PaceWorkingSurfaceLimits.maximumProjectedTaskCount {
+                break
+            }
+        }
+
+        return PaceWorkingSurfaceState(tasks: deduplicatedTasks)
+    }
+
+    static func mapDurableTask(_ task: QDurableTaskState) -> PaceWorkingSurfaceTask {
+        let projectedState: PaceWorkingSurfaceTaskState
+        switch task.lifecycleState {
+        case .pending:
+            projectedState = .queued
+        case .running:
+            projectedState = .running
+        case .awaitingApproval:
+            projectedState = .awaitingApproval
+        case .paused:
+            projectedState = .queued
+        case .completed:
+            projectedState = .completed
+        case .failed:
+            if task.lastKnownError?.lowercased().contains("cancel") == true {
+                projectedState = .cancelled
+            } else {
+                projectedState = .failed
+            }
+        case .blocked:
+            projectedState = .failed
+        case .unknown:
+            projectedState = .failed
+        }
+
+        // Sanitized display name: truncate, take first line, and avoid leaking raw JSON or credentials
+        let rawIntent = task.originalIntent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstLine = rawIntent.components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let displayName: String
+        if firstLine.isEmpty {
+            displayName = "Q Task"
+        } else if firstLine.hasPrefix("{") {
+            displayName = "Structured Action"
+        } else {
+            displayName = String(firstLine.prefix(120))
+        }
+
+        // Safe step description: high-level summary, no internal file paths/stack traces
+        let stepDesc: String?
+        switch task.lifecycleState {
+        case .pending:
+            stepDesc = "Queued"
+        case .running:
+            stepDesc = "Step \(task.currentStepIndex + 1)"
+        case .awaitingApproval:
+            stepDesc = "Awaiting permission"
+        case .paused:
+            stepDesc = "Paused"
+        case .completed:
+            stepDesc = "Completed"
+        case .failed:
+            if task.lastKnownError?.lowercased().contains("cancel") == true {
+                stepDesc = "Cancelled"
+            } else {
+                stepDesc = "Failed"
+            }
+        case .blocked:
+            stepDesc = "Security blocked"
+        case .unknown:
+            stepDesc = "Unknown state"
+        }
+
+        let hasResult = task.lifecycleState == .completed || !task.verificationEvidenceReferences.isEmpty
+
+        return PaceWorkingSurfaceTask(
+            id: task.taskId,
+            displayName: displayName,
+            state: projectedState,
+            currentStepDescription: stepDesc,
+            startedAt: task.taskCreationTimestamp,
+            hasResult: hasResult
+        )
     }
 }
 

@@ -24,9 +24,13 @@ extension CompanionManager {
     }
 
     /// Background/scheduled work, derived on demand from the shared
-    /// `PaceBackgroundAgentRunner`.
+    /// `PaceBackgroundAgentRunner` and `QDurableTaskStore`.
     var workingSurfaceState: PaceWorkingSurfaceState {
-        PaceWorkingSurfaceProjection.project(backgroundAgentTasks: PaceBackgroundAgentRunner.shared.tasks)
+        let durableTasks = (try? QDurableTaskStore.shared.listRecentTasks(limit: PaceWorkingSurfaceLimits.maximumProjectedTaskCount)) ?? []
+        return PaceWorkingSurfaceProjection.project(
+            backgroundAgentTasks: PaceBackgroundAgentRunner.shared.tasks,
+            durableTasks: durableTasks
+        )
     }
 
     /// Durable facts, derived on demand from `episodicFactStore`.

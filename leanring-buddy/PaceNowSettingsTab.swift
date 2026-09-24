@@ -185,6 +185,7 @@ struct PaceNowSettingsTab: View {
             switch state {
             case .queued: return ("Queued", DS.Colors.textTertiary)
             case .running: return ("Running", DS.Colors.accent)
+            case .awaitingApproval: return ("Awaiting Approval", DS.Colors.warning)
             case .completed: return ("Completed", DS.Colors.success)
             case .cancelled: return ("Cancelled", DS.Colors.textTertiary)
             case .failed: return ("Failed", DS.Colors.failure)
