@@ -115,7 +115,7 @@ public struct QDurableTaskState: Codable, Sendable, Equatable {
         case .awaitingApproval(let req):
             self.lifecycleState = .awaitingApproval
             self.securityBlockReason = req.reason
-        case .completed:
+        case .completed, .directAnswer:
             self.lifecycleState = .completed
         case .failed(let reason):
             self.lifecycleState = .failed

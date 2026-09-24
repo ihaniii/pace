@@ -251,6 +251,9 @@ final class CompanionManager: ObservableObject {
         return StreamingSentenceTTSPipeline(ttsClient: ttsClient)
     }()
 
+    /// Ephemeral accumulated text stream for active Q-Core turn.
+    var qCoreStreamedAccumulatedText: String = ""
+
     /// Backing store for the in-window chat transcript. Lazy so it
     /// only builds the local history reader on first use (the main
     /// window opens on demand, not at launch). Persistence runs

@@ -24,6 +24,8 @@ public enum QAgentUIState: String, Sendable, Codable, Equatable {
 
 public enum QAgentStatus: Sendable, Codable, Equatable {
     case completed
+    case directAnswer(text: String)
+    case cancelled(reason: String)
     case failed(reason: String)
     case awaitingApproval(toolName: String, riskLevel: String)
 }
@@ -39,8 +41,12 @@ public struct QAgentResult: Sendable, Codable, Equatable {
     public let durationSeconds: Double
 
     public var isSuccess: Bool {
-        if case .completed = status { return true }
-        return false
+        switch status {
+        case .completed, .directAnswer:
+            return true
+        default:
+            return false
+        }
     }
 
     public init(
@@ -66,6 +72,11 @@ public struct QAgentResult: Sendable, Codable, Equatable {
 
 public protocol QAgentStateObserver: AnyObject, Sendable {
     func agentDidTransition(state: QAgentUIState, message: String)
+    func agentDidReceiveStreamEvent(_ event: QCoreStreamEvent)
+}
+
+public extension QAgentStateObserver {
+    func agentDidReceiveStreamEvent(_ event: QCoreStreamEvent) {}
 }
 
 public final class QAgent: Sendable {
@@ -92,10 +103,26 @@ public final class QAgent: Sendable {
         /// (default off).
         selectedFiles: [QSelectedFileHandle] = [],
         /// Phase 4.1: turn context bridge from CompanionManager.
-        turnContext: QAgentTurnContext? = nil
+        turnContext: QAgentTurnContext? = nil,
+        /// Phase 4.6: optional event stream handler for real-time model streaming.
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)? = nil
     ) async throws -> QAgentResult {
         let start = Date()
         let effectiveSessionId = turnContext?.turnId ?? sessionId
+
+        if Task.isCancelled {
+            let reason = "Task cancelled before execution"
+            observer?.agentDidTransition(state: .error, message: reason)
+            return QAgentResult(
+                taskId: UUID().uuidString,
+                sessionId: effectiveSessionId,
+                intent: task,
+                status: .cancelled(reason: reason),
+                summary: "Cancelled: \(reason)",
+                modelUsed: "none",
+                durationSeconds: 0.0
+            )
+        }
 
         observer?.agentDidTransition(state: .starting, message: "Bootstrapping Q runtime")
 
@@ -129,6 +156,11 @@ public final class QAgent: Sendable {
 
         observer?.agentDidTransition(state: .thinking, message: "Planning actions with \(modelHealth.selectedBackend?.rawValue ?? "local model")")
 
+        let combinedStreamHandler: @Sendable (QCoreStreamEvent) -> Void = { event in
+            observer?.agentDidReceiveStreamEvent(event)
+            streamHandler?(event)
+        }
+
         // 3. Submit intent to Core Runtime
         let executedTask: QTask
         do {
@@ -138,10 +170,23 @@ public final class QAgent: Sendable {
                 sessionId: effectiveSessionId,
                 observer: planObserver,
                 selectedFiles: selectedFiles,
-                turnContext: turnContext
+                turnContext: turnContext,
+                streamHandler: combinedStreamHandler
             )
         } catch {
             let duration = Date().timeIntervalSince(start)
+            if Task.isCancelled || error is CancellationError {
+                let reason = "Task cancelled during execution"
+                observer?.agentDidTransition(state: .error, message: reason)
+                return QAgentResult(
+                    taskId: UUID().uuidString,
+                    sessionId: effectiveSessionId,
+                    intent: task,
+                    status: .cancelled(reason: reason),
+                    summary: "Cancelled: \(reason)",
+                    durationSeconds: duration
+                )
+            }
             observer?.agentDidTransition(state: .error, message: error.localizedDescription)
             return QAgentResult(
                 taskId: UUID().uuidString,
@@ -171,7 +216,33 @@ public final class QAgent: Sendable {
                 durationSeconds: duration
             )
 
+        case .directAnswer(let text):
+            observer?.agentDidTransition(state: .completed, message: text)
+            return QAgentResult(
+                taskId: executedTask.taskId,
+                sessionId: executedTask.sessionId,
+                intent: task,
+                status: .directAnswer(text: text),
+                summary: text,
+                provenanceTag: executedTask.context.isTainted ? "untrusted" : "untrusted:model_output",
+                modelUsed: modelUsed,
+                durationSeconds: duration
+            )
+
         case .failed(let reason):
+            if Task.isCancelled || reason.lowercased().contains("cancel") {
+                observer?.agentDidTransition(state: .error, message: reason)
+                return QAgentResult(
+                    taskId: executedTask.taskId,
+                    sessionId: executedTask.sessionId,
+                    intent: task,
+                    status: .cancelled(reason: reason),
+                    summary: "Cancelled: \(reason)",
+                    provenanceTag: executedTask.context.isTainted ? "untrusted" : "trusted:user",
+                    modelUsed: modelUsed,
+                    durationSeconds: duration
+                )
+            }
             observer?.agentDidTransition(state: .blocked, message: reason)
             return QAgentResult(
                 taskId: executedTask.taskId,
@@ -315,6 +386,17 @@ public final class QAgent: Sendable {
                 provenanceTag: resumedTask.context.isTainted ? "untrusted" : "trusted:user",
                 durationSeconds: duration
             )
+        case .directAnswer(let text):
+            observer?.agentDidTransition(state: .completed, message: text)
+            return QAgentResult(
+                taskId: resumedTask.taskId,
+                sessionId: resumedTask.sessionId,
+                intent: resumedTask.intent,
+                status: .directAnswer(text: text),
+                summary: text,
+                provenanceTag: resumedTask.context.isTainted ? "untrusted" : "untrusted:model_output",
+                durationSeconds: duration
+            )
         case .failed(let reason):
             observer?.agentDidTransition(state: .blocked, message: reason)
             return QAgentResult(
@@ -389,6 +471,17 @@ public final class QAgent: Sendable {
                 status: .completed,
                 summary: summary,
                 provenanceTag: resolvedTask.context.isTainted ? "untrusted" : "trusted:user",
+                durationSeconds: duration
+            )
+        case .directAnswer(let text):
+            observer?.agentDidTransition(state: .completed, message: text)
+            return QAgentResult(
+                taskId: resolvedTask.taskId,
+                sessionId: resolvedTask.sessionId,
+                intent: resolvedTask.intent,
+                status: .directAnswer(text: text),
+                summary: text,
+                provenanceTag: resolvedTask.context.isTainted ? "untrusted" : "untrusted:model_output",
                 durationSeconds: duration
             )
         case .failed(let reason):

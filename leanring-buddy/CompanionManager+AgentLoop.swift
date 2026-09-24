@@ -1166,6 +1166,10 @@ extension CompanionManager {
                 switch qResult.status {
                 case .completed:
                     return .success(summary: qResult.summary)
+                case .directAnswer(let text):
+                    return .directAnswer(text: text)
+                case .cancelled(let reason):
+                    return .cancelled(reason: reason)
                 case .failed(let reason):
                     return .failure(reason: reason)
                 case .awaitingApproval(let tool, let risk):

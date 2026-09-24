@@ -36,16 +36,34 @@ public struct QModelActionSchema: Codable, Sendable, Equatable {
     }
 }
 
+public enum QModelResponseMode: String, Codable, Sendable, Equatable {
+    case action = "action"
+    case directAnswer = "directAnswer"
+    case clarification = "clarification"
+}
+
+public enum QParsedPlanResult: Sendable, Equatable {
+    case plan(QPlan)
+    case directAnswer(QDirectAnswerResult)
+    case clarification(String)
+}
+
 public struct QModelPlanSchema: Codable, Sendable, Equatable {
+    public let responseMode: QModelResponseMode?
+    public let directAnswer: String?
     public let taskPrompt: String?
     public let summary: String?
-    public let steps: [QModelActionSchema]
+    public let steps: [QModelActionSchema]?
 
     public init(
+        responseMode: QModelResponseMode? = .action,
+        directAnswer: String? = nil,
         taskPrompt: String? = nil,
         summary: String? = nil,
-        steps: [QModelActionSchema]
+        steps: [QModelActionSchema]? = nil
     ) {
+        self.responseMode = responseMode
+        self.directAnswer = directAnswer
         self.taskPrompt = taskPrompt
         self.summary = summary
         self.steps = steps
@@ -62,6 +80,8 @@ public enum QModelPlanParseError: Error, Equatable, Sendable {
     case unauthorizedRiskLevel(toolName: String, risk: String)
     case stepLimitExceeded(count: Int, maxAllowed: Int)
     case missingRequiredField(String)
+    case unexpectedDirectAnswer
+    case unexpectedClarification
 }
 
 // MARK: - Schema Validator & Parser
@@ -1607,6 +1627,139 @@ public struct QModelPlanParser: Sendable {
         "ui.list_linked_elements": ("ui", .level0ReadOnly)
     ]
 
+    /// Progressive streaming helper that extracts unescaped direct answer text
+    /// from in-flight model tokens while suppressing <think> blocks and action steps.
+    public static func extractStreamingDirectAnswer(from text: String) -> String {
+        var cleaned = text
+        // Suppress <think> block
+        if let thinkStart = cleaned.range(of: "<think>") {
+            if let thinkEnd = cleaned.range(of: "</think>") {
+                cleaned.removeSubrange(thinkStart.lowerBound..<thinkEnd.upperBound)
+            } else {
+                return "" // Still thinking
+            }
+        }
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // If not structured JSON, it is plain conversational prose
+        guard trimmed.contains("{") else {
+            return trimmed
+        }
+
+        // Locate "directAnswer" in JSON
+        guard let keyRange = trimmed.range(of: "\"directAnswer\"") else {
+            return ""
+        }
+
+        let afterKey = trimmed[keyRange.upperBound...]
+        guard let colonIndex = afterKey.firstIndex(of: ":") else {
+            return ""
+        }
+        let afterColon = afterKey[afterKey.index(after: colonIndex)...]
+        guard let quoteIndex = afterColon.firstIndex(of: "\"") else {
+            return ""
+        }
+
+        let contentStart = afterColon.index(after: quoteIndex)
+        var result = ""
+        var isEscaped = false
+        var idx = contentStart
+
+        while idx < afterColon.endIndex {
+            let char = afterColon[idx]
+            if isEscaped {
+                switch char {
+                case "n": result.append("\n")
+                case "r": result.append("\r")
+                case "t": result.append("\t")
+                case "\"": result.append("\"")
+                case "\\": result.append("\\")
+                default:
+                    result.append("\\")
+                    result.append(char)
+                }
+                isEscaped = false
+            } else if char == "\\" {
+                isEscaped = true
+            } else if char == "\"" {
+                // Closing quote found
+                break
+            } else {
+                result.append(char)
+            }
+            idx = afterColon.index(after: idx)
+        }
+
+        return result
+    }
+
+    /// Parses raw model text into a validated QParsedPlanResult.
+    public static func parseResult(
+        rawText: String,
+        taskId: String,
+        taskPrompt: String,
+        sessionId: String = "default"
+    ) throws -> QParsedPlanResult {
+        var cleanedText = rawText
+        if let thinkStart = cleanedText.range(of: "<think>") {
+            if let thinkEnd = cleanedText.range(of: "</think>") {
+                cleanedText.removeSubrange(thinkStart.lowerBound..<thinkEnd.upperBound)
+            } else {
+                cleanedText.removeSubrange(thinkStart.lowerBound...)
+            }
+        }
+        cleanedText = cleanedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedText.isEmpty else {
+            throw QModelPlanParseError.emptyOutput
+        }
+
+        if cleanedText.contains("{") {
+            let cleanedJSON = extractJSON(from: cleanedText)
+            guard !cleanedJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw QModelPlanParseError.emptyOutput
+            }
+
+            guard let data = cleanedJSON.data(using: .utf8) else {
+                throw QModelPlanParseError.malformedJSON("Failed to encode cleaned string to UTF-8")
+            }
+
+            let schema: QModelPlanSchema
+            do {
+                schema = try JSONDecoder().decode(QModelPlanSchema.self, from: data)
+            } catch {
+                throw QModelPlanParseError.malformedJSON("JSON decoding error: \(error.localizedDescription)")
+            }
+
+            if schema.responseMode == .directAnswer || (schema.directAnswer != nil && (schema.steps == nil || schema.steps?.isEmpty == true)) {
+                let ans = schema.directAnswer ?? schema.summary ?? ""
+                return .directAnswer(QDirectAnswerResult(text: ans, provenance: "untrusted:model_output"))
+            }
+
+            if schema.responseMode == .clarification {
+                return .clarification(schema.summary ?? "Clarification requested")
+            }
+
+            guard let steps = schema.steps, !steps.isEmpty else {
+                throw QModelPlanParseError.emptySteps
+            }
+
+            guard steps.count <= maxAllowedSteps else {
+                throw QModelPlanParseError.stepLimitExceeded(count: steps.count, maxAllowed: maxAllowedSteps)
+            }
+
+            let validatedSteps = try validateSteps(steps)
+            let plan = QPlan(
+                taskId: taskId,
+                sessionId: sessionId,
+                taskPrompt: taskPrompt,
+                steps: validatedSteps
+            )
+            return .plan(plan)
+        } else {
+            return .directAnswer(QDirectAnswerResult(text: cleanedText, provenance: "untrusted:model_output"))
+        }
+    }
+
     /// Parses raw model text into a validated QPlan data model.
     public static func parse(
         rawText: String,
@@ -1614,33 +1767,21 @@ public struct QModelPlanParser: Sendable {
         taskPrompt: String,
         sessionId: String = "default"
     ) throws -> QPlan {
-        let cleanedJSON = extractJSON(from: rawText)
-        guard !cleanedJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw QModelPlanParseError.emptyOutput
+        let result = try parseResult(rawText: rawText, taskId: taskId, taskPrompt: taskPrompt, sessionId: sessionId)
+        switch result {
+        case .plan(let plan):
+            return plan
+        case .directAnswer:
+            throw QModelPlanParseError.unexpectedDirectAnswer
+        case .clarification:
+            throw QModelPlanParseError.unexpectedClarification
         }
+    }
 
-        guard let data = cleanedJSON.data(using: .utf8) else {
-            throw QModelPlanParseError.malformedJSON("Failed to encode cleaned string to UTF-8")
-        }
-
-        let schema: QModelPlanSchema
-        do {
-            schema = try JSONDecoder().decode(QModelPlanSchema.self, from: data)
-        } catch {
-            throw QModelPlanParseError.malformedJSON("JSON decoding error: \(error.localizedDescription)")
-        }
-
-        guard !schema.steps.isEmpty else {
-            throw QModelPlanParseError.emptySteps
-        }
-
-        guard schema.steps.count <= maxAllowedSteps else {
-            throw QModelPlanParseError.stepLimitExceeded(count: schema.steps.count, maxAllowed: maxAllowedSteps)
-        }
-
+    private static func validateSteps(_ steps: [QModelActionSchema]) throws -> [QPlanStep] {
         var validatedSteps: [QPlanStep] = []
 
-        for (index, actionSchema) in schema.steps.enumerated() {
+        for (index, actionSchema) in steps.enumerated() {
             guard !actionSchema.actionName.isEmpty else {
                 throw QModelPlanParseError.missingRequiredField("step[\(index)].actionName")
             }
@@ -1649,14 +1790,6 @@ public struct QModelPlanParser: Sendable {
                 throw QModelPlanParseError.unknownCapability(toolName: actionSchema.actionName)
             }
 
-            // Risk classification is strictly authoritative from the registered capability
-            // allowlist — model-declared risk text is untrusted data and is NEVER used to set
-            // or downgrade the enforced risk level. A declared value is optional (the common
-            // case: trust the registry outright), but if the model DOES declare one, it must
-            // exactly match this tool's registered risk level; any mismatch — an unrecognized
-            // string, an attempt to claim Level 4, or simply the wrong level for this tool
-            // (e.g. claiming Level 0 for a Level 3 tool to try to dodge the approval gate) —
-            // is rejected outright rather than silently coerced to the registered value.
             if let declaredRisk = actionSchema.riskLevel {
                 guard let parsedDeclaredRisk = QCapabilityLevel.parse(declaredRisk) else {
                     throw QModelPlanParseError.unauthorizedRiskLevel(toolName: actionSchema.actionName, risk: declaredRisk)
@@ -1667,13 +1800,45 @@ public struct QModelPlanParser: Sendable {
             }
             let riskLevel = regCap.defaultRisk
 
+            var args = actionSchema.parameters ?? [:]
+            if actionSchema.actionName == "ui.open_app" {
+                if args["appName"] == nil {
+                    if let name = args["name"] ?? args["target"] ?? args["application"] ?? actionSchema.targetResources?.first {
+                        args["appName"] = name
+                    }
+                }
+                if let appName = args["appName"], appName.hasSuffix(".app") {
+                    args["appName"] = String(appName.dropLast(4))
+                }
+            }
+
+            var targetResources = actionSchema.targetResources ?? []
+            if actionSchema.actionName == "fs.write_sandbox" || actionSchema.actionName == "fs.read" {
+                if let p = args["path"], !p.hasPrefix("/") && !p.hasPrefix("~") {
+                    let sanitized = p.replacingOccurrences(of: " ", with: "-")
+                    let filename = (sanitized.isEmpty || sanitized == "sandbox-file") ? "test-sandbox-data.txt" : sanitized
+                    let resolved = (QResourceGuard.filesystemCapabilitySandboxRoot as NSString).appendingPathComponent(filename)
+                    args["path"] = resolved
+                    targetResources = [resolved]
+                } else if args["path"] == nil {
+                    let resolved = (QResourceGuard.filesystemCapabilitySandboxRoot as NSString).appendingPathComponent("test-sandbox-data.txt")
+                    args["path"] = resolved
+                    targetResources = [resolved]
+                } else if let p = args["path"] {
+                    targetResources = [p]
+                }
+                if actionSchema.actionName == "fs.write_sandbox" && args["content"] == nil {
+                    args["content"] = args["data"] ?? args["text"] ?? args["payload"] ?? "Q Verified Data"
+                }
+            }
+
             let plannedAction = QPlannedAction(
                 actionName: actionSchema.actionName,
                 toolFamily: regCap.toolFamily,
                 riskLevel: riskLevel,
                 literalAction: actionSchema.description,
-                targetResources: actionSchema.targetResources ?? [],
-                arguments: actionSchema.parameters ?? [:]
+                targetResources: targetResources,
+                arguments: args
             )
 
             let step = QPlanStep(
@@ -1684,12 +1849,7 @@ public struct QModelPlanParser: Sendable {
             validatedSteps.append(step)
         }
 
-        return QPlan(
-            taskId: taskId,
-            sessionId: sessionId,
-            taskPrompt: taskPrompt,
-            steps: validatedSteps
-        )
+        return validatedSteps
     }
 
     /// Strips markdown code block wrappers (e.g. ```json ... ```) and extracts raw JSON object

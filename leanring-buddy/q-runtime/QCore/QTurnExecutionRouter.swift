@@ -95,6 +95,7 @@ public struct QTurnExecutionRequest: Sendable {
 
 public enum QTurnExecutionResult: Sendable, Codable, Equatable {
     case success(summary: String)
+    case directAnswer(text: String)
     case failure(reason: String)
     case blocked(reason: String)
     case awaitingApproval(actionDescription: String)
@@ -103,6 +104,7 @@ public enum QTurnExecutionResult: Sendable, Codable, Equatable {
     public var summary: String {
         switch self {
         case .success(let s): return s
+        case .directAnswer(let text): return text
         case .failure(let r): return "Failed: \(r)"
         case .blocked(let r): return "Blocked: \(r)"
         case .awaitingApproval(let d): return "Awaiting approval: \(d)"
@@ -111,8 +113,12 @@ public enum QTurnExecutionResult: Sendable, Codable, Equatable {
     }
 
     public var isSuccess: Bool {
-        if case .success = self { return true }
-        return false
+        switch self {
+        case .success, .directAnswer:
+            return true
+        default:
+            return false
+        }
     }
 }
 

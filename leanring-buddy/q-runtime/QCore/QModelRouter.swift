@@ -97,17 +97,31 @@ public struct QModelInferenceResponse: Sendable, Equatable {
     }
 }
 
-// MARK: - Backend Provider Protocol
-
 public protocol QLocalModelBackend: Sendable {
     var capabilities: QModelCapabilities { get }
     func isAvailable() async -> Bool
     func complete(request: QModelInferenceRequest) async throws -> QModelInferenceResponse
+    func streamInference(
+        request: QModelInferenceRequest,
+        onEvent: @Sendable @escaping (QCoreStreamEvent) -> Void
+    ) async throws -> QModelInferenceResponse
+}
+
+public extension QLocalModelBackend {
+    func streamInference(
+        request: QModelInferenceRequest,
+        onEvent: @Sendable @escaping (QCoreStreamEvent) -> Void
+    ) async throws -> QModelInferenceResponse {
+        let resp = try await complete(request: request)
+        onEvent(.textDelta(resp.text))
+        onEvent(.completed)
+        return resp
+    }
 }
 
 // MARK: - Local Model Router
 
-public final class QModelRouter: QStructuredModelProvider, QDecisionContextAwareModelProvider, QModelCandidateAwareProvider, @unchecked Sendable {
+public final class QModelRouter: QConversationalModelProvider, QDecisionContextAwareModelProvider, QModelCandidateAwareProvider, @unchecked Sendable {
     public static let shared = QModelRouter()
 
     private let lock = NSRecursiveLock()
@@ -297,7 +311,65 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
         return response
     }
 
-    // MARK: - Structured Multi-Step Plan Generation (Phase 2B)
+    public func routeStreamingInference(
+        request: QModelInferenceRequest,
+        preferredBackend: QModelBackendType? = nil,
+        needsVision: Bool = false,
+        onEvent: @Sendable @escaping (QCoreStreamEvent) -> Void
+    ) async throws -> QModelInferenceResponse {
+        if Task.isCancelled {
+            onEvent(.cancelled)
+            throw CancellationError()
+        }
+
+        let targetBackend: QLocalModelBackend
+        if let preferred = preferredBackend {
+            if let explicit = getBackend(type: preferred), await explicit.isAvailable() {
+                targetBackend = explicit
+            } else {
+                let err = QModelRouterError.noBackendAvailable("Preferred backend '\(preferred.rawValue)' is not available")
+                onEvent(.failed(reason: err.localizedDescription))
+                throw err
+            }
+        } else if let selected = await selectBestBackend(needsVision: needsVision) {
+            targetBackend = selected
+        } else {
+            let err = QModelRouterError.noBackendAvailable("No local inference backend available")
+            onEvent(.failed(reason: err.localizedDescription))
+            throw err
+        }
+
+        if !targetBackend.capabilities.isLocalOnDevice {
+            guard QEgressBroker.shared.getMode() == .open else {
+                let err = QModelRouterError.egressBlocked(
+                    "Cloud model routing blocked by QEgressBroker: no concrete destination to authorize under a non-OPEN policy."
+                )
+                onEvent(.failed(reason: err.localizedDescription))
+                throw err
+            }
+        }
+
+        let start = Date()
+        let response = try await targetBackend.streamInference(request: request, onEvent: onEvent)
+        let duration = Date().timeIntervalSince(start)
+
+        QAuditLogger.shared.record(
+            QAuditRecord(
+                sessionId: "model-session",
+                taskId: "inference-stream",
+                tool: "model.\(targetBackend.capabilities.backend.rawValue)",
+                riskLevel: .level0ReadOnly,
+                rawArguments: request.prompt.prefix(120).description,
+                authorizationResult: "allow",
+                provenance: "trusted:system",
+                executionSummary: "Streamed \(response.completionTokens) tokens in \(String(format: "%.2f", duration))s"
+            )
+        )
+
+        return response
+    }
+
+    // MARK: - Structured Multi-Step Plan Generation (Phase 2B & Phase 4.6)
 
     public func generateStructuredPlan(
         for task: QTask,
@@ -308,19 +380,15 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
             for: task,
             memoryContext: memoryContext,
             failureContext: failureContext,
-            decisionPlan: nil
+            decisionPlan: nil,
+            preferredBackend: nil
         )
     }
 
     /// Phase 2A.4 (`QDecisionContextAwareModelProvider`): identical to
     /// `generateStructuredPlan(for:memoryContext:failureContext:)` above, with one additional,
     /// optional, ADVISORY parameter — the `QDecisionPlan` `QCoreRuntime` already computed for
-    /// `task`, if any. `decisionPlan` never changes backend/provider selection (`routeInference`
-    /// below is untouched), never changes the required JSON schema, and never changes how the
-    /// returned `QPlan` is validated or authorized downstream — it only ever adds a few bounded,
-    /// non-sensitive descriptive lines to the user-facing prompt text, exactly like
-    /// `memoryContext`/`failureContext` already do. `decisionPlan: nil` (the default 3-arg
-    /// overload above) produces byte-identical prompts to before this phase.
+    /// `task`, if any.
     public func generateStructuredPlan(
         for task: QTask,
         memoryContext: String? = nil,
@@ -336,41 +404,34 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
         )
     }
 
-    /// Phase 2B (`QModelCandidateAwareProvider`): identical to the 4-arg `decisionPlan`-aware
-    /// overload above, with one additional, optional parameter — a specific backend to target, so
-    /// a bounded orchestration layer above this router (`QModelOrchestrator`) can attempt a
-    /// SPECIFIC registered candidate rather than always letting `routeInference`'s own
-    /// `priorityOrder` auto-selection run. Never changes what selection means when
-    /// `preferredBackend == nil` (byte-identical to the 4-arg overload's own behavior); never
-    /// bypasses `routeInference`'s own availability/egress checks for the preferred backend — see
-    /// that function's existing `preferredBackend` handling, unchanged by this phase. The
-    /// orchestrator, not this method, is responsible for only ever passing a backend it already
-    /// confirmed is local/available via `candidateBackends()` — this method makes no such
-    /// assumption itself and still fails closed exactly like `routeInference` always has.
-    public func generateStructuredPlan(
+    public func generateTurnPlan(
         for task: QTask,
         memoryContext: String? = nil,
         failureContext: String? = nil,
-        decisionPlan: QDecisionPlan?,
-        preferredBackend: QModelBackendType?
-    ) async throws -> QPlan {
+        decisionPlan: QDecisionPlan? = nil,
+        preferredBackend: QModelBackendType? = nil,
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)? = nil
+    ) async throws -> QParsedPlanResult {
         let systemPrompt = """
-        You are the Q autonomous task planner for macOS.
+        You are the Q autonomous task planner and assistant for macOS.
         Output ONLY valid JSON matching this schema:
         {
+          "responseMode": "directAnswer" | "action" | "clarification",
+          "directAnswer": "string or null",
           "taskPrompt": "user intent",
-          "summary": "short plan summary",
+          "summary": "short summary",
           "steps": [
             {
-              "actionName": "system.running_apps" | "system.clipboard.read" | "ui.open_app" | "fs.read" | "fs.write_sandbox" | "screen.ocr" | "test.noop" | "accessibility.read",
-              "toolFamily": "system" | "perception" | "app" | "fs" | "test" | "accessibility",
+              "actionName": "ui.open_app" | "system.running_apps" | "system.clipboard.read" | "fs.read" | "fs.write_sandbox" | "screen.ocr" | "test.noop" | "accessibility.read",
+              "toolFamily": "app" | "system" | "fs" | "perception" | "test" | "accessibility",
               "riskLevel": "level0ReadOnly" | "level1SafeLocalAction" | "level2UserApproval",
               "description": "step description",
-              "targetResources": ["resource_path_or_name"],
-              "parameters": {"key": "val"}
+              "targetResources": ["resource"],
+              "parameters": {"appName": "Notes"}
             }
           ]
         }
+        For informational, conversational, or memory questions, set responseMode to directAnswer and provide directAnswer. For tasks requiring actions, set responseMode to action and provide steps.
         Do not output markdown text or explanation outside the JSON.
         """
 
@@ -388,20 +449,103 @@ public final class QModelRouter: QStructuredModelProvider, QDecisionContextAware
             maxTokens: 1024
         )
 
-        let res = try await routeInference(request: infReq, preferredBackend: preferredBackend)
+        var accumulatedRaw = ""
+        var previousDirectAnswer = ""
 
-        // Try parsing JSON model response
+        let streamingCallback: @Sendable (QCoreStreamEvent) -> Void = { event in
+            switch event {
+            case .textDelta(let delta):
+                accumulatedRaw.append(delta)
+                let currentDirectAnswer = QModelPlanParser.extractStreamingDirectAnswer(from: accumulatedRaw)
+                if currentDirectAnswer.count > previousDirectAnswer.count && currentDirectAnswer.hasPrefix(previousDirectAnswer) {
+                    let newSlice = String(currentDirectAnswer.dropFirst(previousDirectAnswer.count))
+                    previousDirectAnswer = currentDirectAnswer
+                    streamHandler?(.textDelta(newSlice))
+                }
+            case .completed:
+                streamHandler?(.completed)
+            case .failed(let reason):
+                streamHandler?(.failed(reason: reason))
+            case .cancelled:
+                streamHandler?(.cancelled)
+            }
+        }
+
+        let res = try await routeStreamingInference(
+            request: infReq,
+            preferredBackend: preferredBackend,
+            onEvent: streamingCallback
+        )
+
         do {
-            let plan = try QModelPlanParser.parse(
+            return try QModelPlanParser.parseResult(
                 rawText: res.text,
                 taskId: task.taskId,
                 taskPrompt: task.intent,
                 sessionId: task.sessionId
             )
-            return plan
+        } catch let parseError as QModelPlanParseError {
+            switch parseError {
+            case .malformedJSON:
+                // FAIL CLOSED: Malformed structured output MUST NOT silently become test.noop
+                throw parseError
+            case .emptyOutput:
+                throw parseError
+            case .emptySteps, .unknownCapability, .unauthorizedRiskLevel, .stepLimitExceeded, .missingRequiredField:
+                let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text)
+                return .plan(fallbackPlan)
+            case .unexpectedDirectAnswer, .unexpectedClarification:
+                throw parseError
+            }
         } catch {
-            // If model returned plain text or mock format, use deterministic structured generator
-            return generateDeterministicPlan(for: task, rawModelOutput: res.text)
+            throw error
+        }
+    }
+
+    public func generateTurnPlan(
+        for task: QTask,
+        memoryContext: String?,
+        failureContext: String?,
+        decisionPlan: QDecisionPlan?,
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)?
+    ) async throws -> QParsedPlanResult {
+        try await generateTurnPlan(
+            for: task,
+            memoryContext: memoryContext,
+            failureContext: failureContext,
+            decisionPlan: decisionPlan,
+            preferredBackend: nil,
+            streamHandler: streamHandler
+        )
+    }
+
+    /// Phase 2B (`QModelCandidateAwareProvider`): identical to the 4-arg `decisionPlan`-aware
+    /// overload above, with one additional, optional parameter — a specific backend to target, so
+    /// a bounded orchestration layer above this router (`QModelOrchestrator`) can attempt a
+    /// SPECIFIC registered candidate rather than always letting `routeInference`'s own
+    /// `priorityOrder` auto-selection run.
+    public func generateStructuredPlan(
+        for task: QTask,
+        memoryContext: String? = nil,
+        failureContext: String? = nil,
+        decisionPlan: QDecisionPlan?,
+        preferredBackend: QModelBackendType?
+    ) async throws -> QPlan {
+        let result = try await generateTurnPlan(
+            for: task,
+            memoryContext: memoryContext,
+            failureContext: failureContext,
+            decisionPlan: decisionPlan,
+            preferredBackend: preferredBackend,
+            streamHandler: nil
+        )
+        switch result {
+        case .plan(let plan):
+            return plan
+        case .directAnswer:
+            throw QModelPlanParseError.unexpectedDirectAnswer
+        case .clarification:
+            throw QModelPlanParseError.unexpectedClarification
         }
     }
 
@@ -943,6 +1087,81 @@ public struct QLocalhostHTTPBackend: QLocalModelBackend {
         }
 
         throw QModelRouterError.noBackendAvailable("Malformed completion payload from localhost engine.")
+    }
+
+    public func streamInference(
+        request: QModelInferenceRequest,
+        onEvent: @Sendable @escaping (QCoreStreamEvent) -> Void
+    ) async throws -> QModelInferenceResponse {
+        let endpoint = baseURL.appendingPathComponent("v1/chat/completions")
+        try QEgressBroker.shared.authorize(url: endpoint)
+
+        if Task.isCancelled {
+            onEvent(.cancelled)
+            throw CancellationError()
+        }
+
+        var urlReq = URLRequest(url: endpoint)
+        urlReq.httpMethod = "POST"
+        urlReq.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlReq.timeoutInterval = request.timeoutSeconds
+
+        let body: [String: Any] = [
+            "model": capabilities.modelIdentifier,
+            "messages": [
+                ["role": "system", "content": request.systemPrompt ?? "You are a helpful macOS AI assistant."],
+                ["role": "user", "content": request.prompt]
+            ],
+            "temperature": request.temperature,
+            "max_tokens": request.maxTokens,
+            "stream": true
+        ]
+        urlReq.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        let start = Date()
+        let (byteStream, response) = try await URLSession.shared.bytes(for: urlReq, delegate: QEgressRedirectGuard())
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            onEvent(.failed(reason: "HTTP error from localhost engine"))
+            throw QModelRouterError.noBackendAvailable("Localhost engine returned error HTTP response.")
+        }
+
+        var accumulatedText = ""
+        for try await line in byteStream.lines {
+            if Task.isCancelled {
+                onEvent(.cancelled)
+                throw CancellationError()
+            }
+            guard line.hasPrefix("data: ") else { continue }
+            let jsonString = String(line.dropFirst(6)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if jsonString == "[DONE]" { break }
+            guard let jsonData = jsonString.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let choices = payload["choices"] as? [[String: Any]],
+                  let firstChoice = choices.first,
+                  let delta = firstChoice["delta"] as? [String: Any],
+                  let textChunk = delta["content"] as? String,
+                  !textChunk.isEmpty else {
+                continue
+            }
+            accumulatedText.append(textChunk)
+            onEvent(.textDelta(textChunk))
+        }
+
+        if Task.isCancelled {
+            onEvent(.cancelled)
+            throw CancellationError()
+        }
+
+        onEvent(.completed)
+        let duration = Date().timeIntervalSince(start)
+        return QModelInferenceResponse(
+            text: accumulatedText,
+            finishReason: "stop",
+            promptTokens: 10,
+            completionTokens: accumulatedText.split(separator: " ").count,
+            providerUsed: capabilities.backend,
+            durationSeconds: duration
+        )
     }
 }
 

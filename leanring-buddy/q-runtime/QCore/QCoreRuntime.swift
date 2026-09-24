@@ -153,7 +153,9 @@ public final class QCoreRuntime: @unchecked Sendable {
         /// directory, never resolved by this runtime, never scanned automatically.
         selectedFiles: [QSelectedFileHandle] = [],
         /// Phase 4.2: optional turn context bridge from CompanionManager / QAgent.
-        turnContext: QAgentTurnContext? = nil
+        turnContext: QAgentTurnContext? = nil,
+        /// Phase 4.6: optional event stream handler for real-time model streaming.
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)? = nil
     ) async throws -> QTask {
         // Phase 4.4: Early cancellation check before creating or submitting task
         if Task.isCancelled {
@@ -437,7 +439,63 @@ public final class QCoreRuntime: @unchecked Sendable {
         durableState.budget = budget
 
         do {
-            if let candidateAwareModel = model as? QModelCandidateAwareProvider {
+            if let conversationalModel = model as? QConversationalModelProvider {
+                let turnResult = try await conversationalModel.generateTurnPlan(
+                    for: task,
+                    memoryContext: memoryContext,
+                    failureContext: nil,
+                    decisionPlan: decisionPlan,
+                    streamHandler: streamHandler
+                )
+                switch turnResult {
+                case .directAnswer(let directAnswer):
+                    if Task.isCancelled {
+                        task.state = .failed(reason: "Task cancelled before completion")
+                        updateTask(task)
+                        durableState.lifecycleState = .failed
+                        durableState.lastKnownError = "Task cancelled before completion"
+                        try? durableStore?.saveTask(durableState)
+                        return task
+                    }
+                    task.state = .directAnswer(text: directAnswer.text)
+                    updateTask(task)
+                    durableState.lifecycleState = .completed
+                    try? durableStore?.saveTask(durableState)
+                    try? durableStore?.recordEvent(
+                        QTaskLifecycleEvent(
+                            taskId: task.taskId,
+                            sessionId: sessionId,
+                            eventType: .taskCompleted,
+                            payload: ["directAnswer": directAnswer.text]
+                        )
+                    )
+                    try? await memoryProvider?.recordTaskCompletion(task, result: directAnswer.text)
+                    QAuditLogger.shared.record(
+                        QAuditRecord(
+                            sessionId: sessionId,
+                            taskId: task.taskId,
+                            tool: "core.direct_answer",
+                            riskLevel: .level0ReadOnly,
+                            rawArguments: prompt,
+                            authorizationResult: "allow",
+                            provenance: directAnswer.provenance,
+                            executionSummary: "Provided direct conversational answer (\(QAuditRecord.safeDescriptor(omittedContent: directAnswer.text, label: "direct answer")))"
+                        )
+                    )
+                    return task
+
+                case .clarification(let question):
+                    task.state = .failed(reason: question)
+                    updateTask(task)
+                    durableState.lifecycleState = .failed
+                    durableState.lastKnownError = question
+                    try? durableStore?.saveTask(durableState)
+                    return task
+
+                case .plan(let plan):
+                    currentPlan = plan
+                }
+            } else if let candidateAwareModel = model as? QModelCandidateAwareProvider {
                 // Phase 2B: bounded multi-model orchestration. QDeterministicModelOrchestrator
                 // sits strictly above QModelRouter — see its own file header — and every attempt
                 // it makes still goes through the unmodified QModelRouter.generateStructuredPlan

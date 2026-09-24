@@ -8,18 +8,34 @@
 
 import Foundation
 
-// MARK: - Task State & Model
+public enum QCoreStreamEvent: Sendable, Equatable {
+    case textDelta(String)
+    case completed
+    case failed(reason: String)
+    case cancelled
+}
+
+public struct QDirectAnswerResult: Sendable, Codable, Equatable {
+    public let text: String
+    public let provenance: String
+
+    public init(text: String, provenance: String = "untrusted:model_output") {
+        self.text = text
+        self.provenance = provenance
+    }
+}
 
 public enum QTaskState: Equatable, Sendable {
     case pending
     case running
     case awaitingApproval(QApprovalRequest)
     case completed(summary: String)
+    case directAnswer(text: String)
     case failed(reason: String)
 
     public var isTerminal: Bool {
         switch self {
-        case .completed, .failed:
+        case .completed, .directAnswer, .failed:
             return true
         case .pending, .running, .awaitingApproval:
             return false
@@ -27,8 +43,12 @@ public enum QTaskState: Equatable, Sendable {
     }
 
     public var isCompleted: Bool {
-        if case .completed = self { return true }
-        return false
+        switch self {
+        case .completed, .directAnswer:
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -121,6 +141,16 @@ public protocol QModelProvider: Sendable {
 public protocol QStructuredModelProvider: QModelProvider {
     func generateStructuredPlan(for task: QTask, memoryContext: String?, failureContext: String?) async throws -> QPlan
     func generateGroundedSummary(for task: QTask, verifiedEvidence: [String], isSuccess: Bool) async throws -> String
+}
+
+public protocol QConversationalModelProvider: QStructuredModelProvider {
+    func generateTurnPlan(
+        for task: QTask,
+        memoryContext: String?,
+        failureContext: String?,
+        decisionPlan: QDecisionPlan?,
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)?
+    ) async throws -> QParsedPlanResult
 }
 
 public protocol QToolProvider: Sendable {

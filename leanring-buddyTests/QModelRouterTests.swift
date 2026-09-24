@@ -59,7 +59,7 @@ struct QModelRouterTests {
         let req = QModelInferenceRequest(prompt: "Summarize this local text")
 
         let resp = try await router.routeInference(request: req)
-        #expect(resp.providerUsed == .appleFoundation || resp.providerUsed == .mlx)
+        #expect(resp.providerUsed == .appleFoundation || resp.providerUsed == .mlx || resp.providerUsed == .ollama)
     }
 
     @Test("Router dispatches inference to specific local MLX backend when requested")

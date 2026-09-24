@@ -53,6 +53,22 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         }
     }
 
+    public func agentDidReceiveStreamEvent(_ event: QCoreStreamEvent) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch event {
+            case .textDelta(let delta):
+                self.qCoreStreamedAccumulatedText.append(delta)
+                await self.streamingSentenceTTSPipeline.acceptStreamedText(self.qCoreStreamedAccumulatedText)
+            case .completed:
+                await self.streamingSentenceTTSPipeline.flushFinal(finalSpokenText: self.qCoreStreamedAccumulatedText)
+            case .cancelled, .failed:
+                self.streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+                self.ttsClient.stopPlayback()
+            }
+        }
+    }
+
     // MARK: - QPlanExecutionObserver
 
     public func planDidUpdate(plan: QPlan) {
@@ -242,12 +258,28 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         context: QAgentTurnContext? = nil,
         turnLease: PaceTurnLease? = nil
     ) async -> QAgentResult {
-        if let turnLease, !isActiveTurn(turnLease) {
+        let detectedTurnLocale = PaceSpeechVoiceResolver.detectLanguage(for: transcript).flatMap { raw -> String? in
+            let base = raw.replacingOccurrences(of: "_", with: "-").lowercased().split(separator: "-").first.map(String.init) ?? raw
+            switch base {
+            case "en": return "en-US"
+            case "sv": return "sv-SE"
+            case "ar": return "ar"
+            default: return raw
+            }
+        } ?? "en-US"
+
+        qCoreStreamedAccumulatedText = ""
+        streamingSentenceTTSPipeline.resetForNewTurn(locale: detectedTurnLocale)
+        streamingSentenceTTSPipeline.markIntentCommitted()
+        streamingSentenceTTSPipeline.setMutedForCurrentTurn(chatSession.isChatTTSMuted)
+
+        if (turnLease != nil && !isActiveTurn(turnLease!)) || Task.isCancelled {
+            streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
             return QAgentResult(
-                taskId: turnLease.turnId,
+                taskId: turnLease?.turnId ?? UUID().uuidString,
                 sessionId: "cancelled_session",
                 intent: transcript,
-                status: .failed(reason: "Turn cancelled before execution"),
+                status: .cancelled(reason: "Turn cancelled before execution"),
                 summary: "Turn cancelled"
             )
         }
@@ -263,21 +295,47 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 turnContext: context
             )
 
-            // Post turn to chat session transcript and thread memory
-            if case .completed = result.status, !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
-            } else {
-                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
-            }
+            switch result.status {
+            case .directAnswer(let text):
+                streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    recordConversationTurn(userTranscript: transcript, assistantResponse: text)
+                } else {
+                    chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: text)
+                }
+                if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
+                    try? await ttsClient.speakText(text, explicitLocale: detectedTurnLocale)
+                }
 
-            // Speak result via existing TTS pipeline
-            if !chatSession.isChatTTSMuted {
-                try? await ttsClient.speakText(result.summary)
+            case .completed:
+                streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
+                if !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
+                } else {
+                    chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
+                }
+                if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
+                    try? await ttsClient.speakText(result.summary, explicitLocale: detectedTurnLocale)
+                }
+
+            case .cancelled(let reason):
+                streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+                ttsClient.stopPlayback()
+
+            case .failed(let reason):
+                streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+                ttsClient.stopPlayback()
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: "Q Failed: \(reason)")
+
+            case .awaitingApproval:
+                break
             }
 
             voiceState = .idle
             return result
         } catch {
+            streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+            ttsClient.stopPlayback()
             qRuntimeState = .error
             currentTurnHUDState = PaceTurnHUDState.failed(error.localizedDescription)
             chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: "Q Error: \(error.localizedDescription)")

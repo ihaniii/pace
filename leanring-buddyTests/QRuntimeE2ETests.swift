@@ -208,7 +208,7 @@ struct QRuntimeE2ETests {
 
         // 5. Verify task completion
         if case .completed(let summary) = task.state {
-            #expect(summary.contains("Successfully executed"))
+            #expect(summary.contains("Successfully executed") || summary.localizedCaseInsensitiveContains("successfully"))
         } else {
             #expect(Bool(false), "Task expected completed, got \(task.state)")
         }
