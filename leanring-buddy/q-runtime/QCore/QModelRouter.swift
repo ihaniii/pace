@@ -478,7 +478,8 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
         )
 
         let taskDecision = decisionPlan ?? QDeterministicDecisionEngine().decide(for: task)
-        let isConversational = taskDecision.isConversational
+        let hasExecutionIntent = QDeterministicDecisionEngine.containsExecutionIndicators(intent: task.intent)
+        let isConversational = !hasExecutionIntent && taskDecision.isConversational
 
         do {
             let parsed = try QModelPlanParser.parseResult(
@@ -504,7 +505,20 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
                     )
                 }
             } else {
-                return parsed
+                switch parsed {
+                case .plan:
+                    return parsed
+                case .directAnswer:
+                    // Model says directAnswer for an execution-authorized task: model responseMode cannot grant authority
+                    if let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text) {
+                        return .plan(fallbackPlan)
+                    } else {
+                        throw QModelPlanParseError.unexpectedDirectAnswer
+                    }
+                case .clarification:
+                    // Model clarification for an execution task
+                    return parsed
+                }
             }
         } catch let parseError as QModelPlanParseError {
             if isConversational {
@@ -521,7 +535,10 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             } else {
                 switch parseError {
                 case .malformedJSON:
-                    // FAIL CLOSED: Malformed structured output MUST NOT silently become test.noop
+                    if let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text) {
+                        return .plan(fallbackPlan)
+                    }
+                    // FAIL CLOSED: Malformed structured output without matching safe template MUST NOT silently succeed
                     throw parseError
                 case .emptyOutput:
                     throw parseError
@@ -532,7 +549,12 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
                         // Fail closed: malformed action request without matching safe plan fails closed
                         throw parseError
                     }
-                case .unexpectedDirectAnswer, .unexpectedClarification:
+                case .unexpectedDirectAnswer:
+                    if let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text) {
+                        return .plan(fallbackPlan)
+                    }
+                    throw parseError
+                case .unexpectedClarification:
                     throw parseError
                 }
             }
@@ -999,7 +1021,7 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
     // MARK: - Conversational Direct Answer Recovery (Phase 4.7C)
 
     /// Safely extracts conversational answer text from raw model output or JSON summary if present.
-    private static func extractConversationalAnswer(from rawText: String) -> String? {
+    public static func extractConversationalAnswer(from rawText: String) -> String? {
         let cleaned = QModelPlanParser.extractJSON(from: rawText)
         guard let data = cleaned.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -1014,6 +1036,45 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             let trimmed = directAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty && trimmed != "null" { return trimmed }
         }
+        if let answer = json["answer"] as? String {
+            let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" { return trimmed }
+        }
+        if let response = json["response"] as? String {
+            let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" { return trimmed }
+        }
+        if let content = json["content"] as? String {
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" { return trimmed }
+        }
+
+        // Support reasoning models emitting {"reasoning": "...", "examples": [...]}
+        var parts: [String] = []
+        if let reasoning = json["reasoning"] as? String {
+            let trimmed = reasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" {
+                parts.append(trimmed)
+            }
+        }
+        if let examples = json["examples"] as? [String], !examples.isEmpty {
+            let formattedExamples = examples.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+            parts.append(formattedExamples)
+        } else if let examples = json["examples"] as? [[String: Any]], !examples.isEmpty {
+            let formattedExamples = examples.enumerated().compactMap { idx, dict -> String? in
+                if let ex = dict["example"] as? String ?? dict["description"] as? String ?? dict["text"] as? String {
+                    return "\(idx + 1). \(ex)"
+                }
+                return nil
+            }.joined(separator: "\n")
+            if !formattedExamples.isEmpty {
+                parts.append(formattedExamples)
+            }
+        }
+        if !parts.isEmpty {
+            return parts.joined(separator: "\n\n")
+        }
+
         if let summary = json["summary"] as? String {
             let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty && trimmed != "null" { return trimmed }

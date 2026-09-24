@@ -225,14 +225,12 @@ public struct QDecisionPlan: Codable, Sendable, Equatable {
 
 public extension QDecisionPlan {
     /// Indicates whether this decision plan represents a conversational or informational query
-    /// (e.g. simple Q&A, conversational memory, creative writing, or non-decomposed reasoning)
+    /// (e.g. simple Q&A, conversational memory, creative writing, or non-execution reasoning)
     /// rather than an action or execution task that alters system state.
     var isConversational: Bool {
         switch taskType {
-        case .simpleQA:
+        case .simpleQA, .reasoning, .creative:
             return true
-        case .reasoning, .creative:
-            return decompositionDecision == .notRequired
         case .coding, .research, .planning, .execution, .criticalHighRisk:
             return false
         }

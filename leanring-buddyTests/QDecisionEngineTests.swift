@@ -401,4 +401,17 @@ struct QDecisionEngineTests {
         let plan = engine.decide(for: task(intent: "What is the capital of France?"))
         #expect(plan.taskType == .simpleQA)
     }
+
+    // MARK: - Phase 4.7D: Reasoning Conversational Routing
+
+    @Test("4.7D: Reasoning conversational with recommended decomposition is conversational")
+    func reasoningConversationalWithDecompositionRecommendedIsConversational() {
+        let plan = QDeterministicDecisionEngine().decide(
+            for: task(intent: "Explain in several short paragraphs why local AI can be useful on a Mac, and give me three practical examples.")
+        )
+        #expect(plan.taskType == .reasoning)
+        #expect(plan.complexity == .moderate)
+        #expect(plan.decompositionDecision == .recommended(maximumSubtasks: 3))
+        #expect(plan.isConversational == true)
+    }
 }

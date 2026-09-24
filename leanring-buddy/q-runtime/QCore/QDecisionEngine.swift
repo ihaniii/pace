@@ -170,61 +170,92 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
     /// external, or high-blast-radius actions — see `QCapabilityModel.swift`) rather than
     /// inventing a new, separate risk taxonomy. Checked FIRST: any match here overrides every
     /// other category, per the "fail conservatively toward... no privileged authority" principle.
-    fileprivate static let criticalHighRiskIndicators: [String] = [
+    /// Mirrors `QCapabilityLevel.level3HighRisk`'s own already-documented scope (destructive,
+    /// external, or high-blast-radius actions — see `QCapabilityModel.swift`) rather than
+    /// inventing a new, separate risk taxonomy. Checked FIRST: any match here overrides every
+    /// other category, per the "fail conservatively toward... no privileged authority" principle.
+    public static let criticalHighRiskIndicators: [String] = [
         "delete", "remove permanently", "erase", "wipe", "format the disk", "uninstall",
         "force quit", "shut down", "restart the computer", "factory reset",
         "send money", "make a payment", "transfer funds", "wire transfer", "buy ", "purchase",
-        "send an email", "send a message to", "post publicly", "publish", "share my",
+        "send an email", "send a message to", "send this message", "send message", "post publicly", "publish", "share my",
         "delete account", "close my account", "cancel my subscription",
-        "sudo ", "rm -rf", "git push --force", "drop table", "deploy to production"
+        "sudo ", "rm -rf", "git push --force", "drop table", "deploy to production",
+        // Arabic critical indicators
+        "احذف", "امسح", "فرمت", "أرسل الرسالة", "ارسل الرسالة", "ابعث الرسالة"
     ]
 
     /// State-changing but not inherently high-risk actions — the `ui.*`/`app.*`/`fs.write_sandbox`
     /// shape of capability already registered elsewhere in this codebase (Level 1–2), not a new
     /// action taxonomy.
-    fileprivate static let executionIndicators: [String] = [
+    public static let executionIndicators: [String] = [
         "open ", "close ", "click ", "type ", "set the", "select ", "toggle ", "enable ",
         "disable ", "run ", "execute ", "launch ", "start ", "stop ", "move ", "copy ",
-        "rename ", "save ", "create a file", "write to the file", "quit "
+        "rename ", "save ", "create a file", "write to the file", "write to ", "write data", "quit ",
+        // Folder and directory operations
+        "create a folder", "create folder", "create a directory", "create directory", "make a folder", "make a directory", "new folder",
+        // File reading operations requiring computer file access
+        "read this file", "read the file", "read file", "read from ",
+        // Volume / system media operations
+        "change the volume", "set the volume", "adjust the volume", "turn up the volume", "turn down the volume", "mute", "unmute",
+        // Arabic execution indicators
+        "افتح", "اغلق", "سكر", "شغل", "انقر", "اضغط", "اكتب", "غير الصوت", "عدل الصوت", "انشئ مجلد", "اعمل مجلد"
     ]
 
-    fileprivate static let codingIndicators: [String] = [
+    public static let codingIndicators: [String] = [
         "write a function", "write code", "write a script", "write a program",
         "write a class", "write a method", "implement ", "debug ", "fix the bug",
         "refactor", "compile", "write a unit test", "write tests for", "write a component"
     ]
 
-    fileprivate static let planningIndicators: [String] = [
+    public static let planningIndicators: [String] = [
         "create a plan", "make a plan", "project plan", "roadmap", "schedule ",
         "outline a plan", "organize my", "itinerary", "plan a", "plan the", "plan for"
     ]
 
-    fileprivate static let researchIndicators: [String] = [
+    public static let researchIndicators: [String] = [
         "research ", "find information about", "look up", "search for", "gather sources",
-        "investigate", "find out about", "compile a list of sources", "find articles about"
+        "investigate", "find out about", "compile a list of sources", "find articles about",
+        "search the web", "search google"
     ]
 
-    fileprivate static let creativeIndicators: [String] = [
+    public static let creativeIndicators: [String] = [
         "write a story", "write a poem", "brainstorm", "creative writing", "compose a song",
         "write lyrics", "generate ideas for", "design a logo", "come up with names",
-        "write a song", "invent a"
+        "write a song", "invent a", "write a short", "write an explanation", "write an essay"
     ]
 
-    fileprivate static let simpleQAIndicators: [String] = [
+    public static let simpleQAIndicators: [String] = [
         "what is ", "what's ", "who is ", "who's ", "when is ", "when did ", "where is ",
         "define ", "how many ", "how much ", "what does ", "what time ", "which ", "tell me ",
         "what programming language", "what did i ", "do you remember",
+        "give me examples", "give me three examples", "examples of ",
         // Arabic conversational question indicators
-        "ما هو", "ما هي", "شو ", "مين ", "وين ", "كم ", "متى ", "ايش ", "كيف ", "تذكر ", "احكيلي", "أخبرني", "هل "
+        "ما هو", "ما هي", "شو ", "مين ", "وين ", "كم ", "متى ", "ايش ", "كيف ", "تذكر ", "احكيلي", "أخبرني", "هل ", "اعطيني امثلة", "أعطني أمثلة"
     ]
 
-    fileprivate static let reasoningIndicators: [String] = [
-        "why ", "explain why", "analyze", "analyse", "compare ", "evaluate the",
+    public static let reasoningIndicators: [String] = [
+        "why ", "explain why", "explain in ", "explain how ", "explain the difference", "explain this", "explain ",
+        "analyze", "analyse", "compare ", "evaluate the",
         "what are the implications", "reason about", "think through", "pros and cons",
-        "trade-offs", "tradeoffs",
+        "trade-offs", "tradeoffs", "how does ",
         // Arabic reasoning indicators
         "ليش", "لماذا", "فسر", "اشرح"
     ]
+
+    /// Evaluates whether an intent string contains deterministic computer-side execution or mutation indicators.
+    /// Used as defense-in-depth to ensure non-conversational execution routing even if taskType is advisory reasoning.
+    public static func containsExecutionIndicators(intent: String) -> Bool {
+        let lowercased = intent.lowercased()
+        func matches(_ indicators: [String]) -> Bool {
+            indicators.contains { lowercased.contains($0) }
+        }
+        return matches(criticalHighRiskIndicators) ||
+               matches(executionIndicators) ||
+               matches(codingIndicators) ||
+               matches(planningIndicators) ||
+               matches(researchIndicators)
+    }
 
     // MARK: - Complexity
 
