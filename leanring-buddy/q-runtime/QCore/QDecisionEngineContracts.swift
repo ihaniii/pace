@@ -220,3 +220,21 @@ public struct QDecisionPlan: Codable, Sendable, Equatable {
         self.uncertainty = uncertainty
     }
 }
+
+// MARK: - Conversational Classification Helper
+
+public extension QDecisionPlan {
+    /// Indicates whether this decision plan represents a conversational or informational query
+    /// (e.g. simple Q&A, conversational memory, creative writing, or non-decomposed reasoning)
+    /// rather than an action or execution task that alters system state.
+    var isConversational: Bool {
+        switch taskType {
+        case .simpleQA:
+            return true
+        case .reasoning, .creative:
+            return decompositionDecision == .notRequired
+        case .coding, .research, .planning, .execution, .criticalHighRisk:
+            return false
+        }
+    }
+}

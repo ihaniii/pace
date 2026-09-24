@@ -212,13 +212,18 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
 
     fileprivate static let simpleQAIndicators: [String] = [
         "what is ", "what's ", "who is ", "who's ", "when is ", "when did ", "where is ",
-        "define ", "how many ", "how much ", "what does ", "what time "
+        "define ", "how many ", "how much ", "what does ", "what time ", "which ", "tell me ",
+        "what programming language", "what did i ", "do you remember",
+        // Arabic conversational question indicators
+        "ما هو", "ما هي", "شو ", "مين ", "وين ", "كم ", "متى ", "ايش ", "كيف ", "تذكر ", "احكيلي", "أخبرني", "هل "
     ]
 
     fileprivate static let reasoningIndicators: [String] = [
         "why ", "explain why", "analyze", "analyse", "compare ", "evaluate the",
         "what are the implications", "reason about", "think through", "pros and cons",
-        "trade-offs", "tradeoffs"
+        "trade-offs", "tradeoffs",
+        // Arabic reasoning indicators
+        "ليش", "لماذا", "فسر", "اشرح"
     ]
 
     // MARK: - Complexity

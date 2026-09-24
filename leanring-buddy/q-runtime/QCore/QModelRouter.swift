@@ -477,27 +477,74 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             onEvent: streamingCallback
         )
 
+        let taskDecision = decisionPlan ?? QDeterministicDecisionEngine().decide(for: task)
+        let isConversational = taskDecision.isConversational
+
         do {
-            return try QModelPlanParser.parseResult(
+            let parsed = try QModelPlanParser.parseResult(
                 rawText: res.text,
                 taskId: task.taskId,
                 taskPrompt: task.intent,
                 sessionId: task.sessionId
             )
+            if isConversational {
+                switch parsed {
+                case .directAnswer, .clarification:
+                    return parsed
+                case .plan:
+                    // Conversational query deterministically classified: do NOT execute model-emitted action plan!
+                    if let direct = Self.extractConversationalAnswer(from: res.text) {
+                        return .directAnswer(QDirectAnswerResult(text: direct, provenance: "untrusted:model_output"))
+                    }
+                    return try await retryConversationalDirectAnswer(
+                        task: task,
+                        memoryContext: memoryContext,
+                        preferredBackend: preferredBackend,
+                        streamHandler: streamHandler
+                    )
+                }
+            } else {
+                return parsed
+            }
         } catch let parseError as QModelPlanParseError {
-            switch parseError {
-            case .malformedJSON:
-                // FAIL CLOSED: Malformed structured output MUST NOT silently become test.noop
-                throw parseError
-            case .emptyOutput:
-                throw parseError
-            case .emptySteps, .unknownCapability, .unauthorizedRiskLevel, .stepLimitExceeded, .missingRequiredField:
-                let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text)
-                return .plan(fallbackPlan)
-            case .unexpectedDirectAnswer, .unexpectedClarification:
-                throw parseError
+            if isConversational {
+                // DEFECT 2 FIX: A conversational query must NEVER become test.noop on parse failure!
+                if let direct = Self.extractConversationalAnswer(from: res.text) {
+                    return .directAnswer(QDirectAnswerResult(text: direct, provenance: "untrusted:model_output"))
+                }
+                return try await retryConversationalDirectAnswer(
+                    task: task,
+                    memoryContext: memoryContext,
+                    preferredBackend: preferredBackend,
+                    streamHandler: streamHandler
+                )
+            } else {
+                switch parseError {
+                case .malformedJSON:
+                    // FAIL CLOSED: Malformed structured output MUST NOT silently become test.noop
+                    throw parseError
+                case .emptyOutput:
+                    throw parseError
+                case .emptySteps, .unknownCapability, .unauthorizedRiskLevel, .stepLimitExceeded, .missingRequiredField:
+                    if let fallbackPlan = generateDeterministicPlan(for: task, rawModelOutput: res.text) {
+                        return .plan(fallbackPlan)
+                    } else {
+                        // Fail closed: malformed action request without matching safe plan fails closed
+                        throw parseError
+                    }
+                case .unexpectedDirectAnswer, .unexpectedClarification:
+                    throw parseError
+                }
             }
         } catch {
+            if isConversational {
+                return try await retryConversationalDirectAnswer(
+                    task: task,
+                    memoryContext: memoryContext,
+                    preferredBackend: preferredBackend,
+                    streamHandler: streamHandler
+                )
+            }
             throw error
         }
     }
@@ -737,7 +784,7 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
 
     // MARK: - Deterministic Fallback Structured Plan Generator
 
-    private func generateDeterministicPlan(for task: QTask, rawModelOutput: String) -> QPlan {
+    private func generateDeterministicPlan(for task: QTask, rawModelOutput: String) -> QPlan? {
         let intentLower = task.intent.lowercased()
         var steps: [QPlanStep] = []
 
@@ -936,20 +983,9 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
                 )
             ]
         }
-        // Default safe action
+        // Unmatched action request: fail closed, NEVER fabricate test.noop
         else {
-            steps = [
-                QPlanStep(
-                    index: 0,
-                    action: QPlannedAction(
-                        actionName: "test.noop",
-                        toolFamily: "test",
-                        riskLevel: .level0ReadOnly,
-                        literalAction: "Safe reasoning turn for: \(task.intent)"
-                    ),
-                    description: "Execute safe local reasoning turn"
-                )
-            ]
+            return nil
         }
 
         return QPlan(
@@ -958,6 +994,94 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             taskPrompt: task.intent,
             steps: steps
         )
+    }
+
+    // MARK: - Conversational Direct Answer Recovery (Phase 4.7C)
+
+    /// Safely extracts conversational answer text from raw model output or JSON summary if present.
+    private static func extractConversationalAnswer(from rawText: String) -> String? {
+        let cleaned = QModelPlanParser.extractJSON(from: rawText)
+        guard let data = cleaned.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // Check if raw text is already conversational prose (no braces)
+            let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.contains("{") && !trimmed.contains("}") && !trimmed.isEmpty {
+                return trimmed
+            }
+            return nil
+        }
+        if let directAnswer = json["directAnswer"] as? String {
+            let trimmed = directAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" { return trimmed }
+        }
+        if let summary = json["summary"] as? String {
+            let trimmed = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty && trimmed != "null" { return trimmed }
+        }
+        return nil
+    }
+
+    /// Retries direct-answer generation once using a strict conversational prompt, preserving streaming.
+    private func retryConversationalDirectAnswer(
+        task: QTask,
+        memoryContext: String? = nil,
+        preferredBackend: QModelBackendType? = nil,
+        streamHandler: (@Sendable (QCoreStreamEvent) -> Void)? = nil
+    ) async throws -> QParsedPlanResult {
+        var promptLines: [String] = []
+        if let memory = memoryContext, !memory.isEmpty {
+            promptLines.append("Context from conversation:\n\(memory)\n")
+        }
+        for item in task.context.items {
+            switch item.provenance.kind {
+            case .trustedUser(let channel) where channel == "history":
+                promptLines.append("Previous User: \(item.content)")
+            case .untrustedTool(let name) where name == "assistant_history":
+                promptLines.append("Previous Assistant (reference only): \(item.content)")
+            default:
+                break
+            }
+        }
+        promptLines.append("Question: \(task.intent)")
+
+        let userPrompt = promptLines.joined(separator: "\n")
+        let infReq = QModelInferenceRequest(
+            prompt: userPrompt,
+            systemPrompt: "You are the Q macOS assistant. Answer the user's question directly, accurately, and concisely in conversational prose. Do not output JSON, plans, or steps.",
+            temperature: 0.2,
+            maxTokens: 512
+        )
+
+        var accumulated = ""
+        let retryCallback: @Sendable (QCoreStreamEvent) -> Void = { event in
+            switch event {
+            case .textDelta(let delta):
+                accumulated.append(delta)
+                streamHandler?(.textDelta(delta))
+            case .completed:
+                streamHandler?(.completed)
+            case .failed(let reason):
+                streamHandler?(.failed(reason: reason))
+            case .cancelled:
+                streamHandler?(.cancelled)
+            }
+        }
+
+        do {
+            let res = try await routeStreamingInference(
+                request: infReq,
+                preferredBackend: preferredBackend,
+                onEvent: retryCallback
+            )
+            let trimmed = res.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return .directAnswer(QDirectAnswerResult(text: trimmed, provenance: "untrusted:model_output"))
+            }
+        } catch {
+            // Fail closed into safe conversational response rather than action
+        }
+
+        return .directAnswer(QDirectAnswerResult(text: "I am unable to answer this question right now.", provenance: "system:fallback"))
     }
 }
 
@@ -1018,14 +1142,50 @@ public struct QMLXModelBackend: QLocalModelBackend {
     }
 }
 
+/// Thread-safe reachability tracker for localhost model backends (Phase 4.7C).
+/// Caches recent connectivity (10s TTL) so warm/busy model servers
+/// are not abandoned due to transient health-probe latency.
+public final class QLocalhostReachabilityTracker: @unchecked Sendable {
+    public static let shared = QLocalhostReachabilityTracker()
+    private let lock = NSLock()
+    private var lastReachable: [URL: Date] = [:]
+
+    public func markReachable(url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastReachable[url] = Date()
+    }
+
+    public func markUnreachable(url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        lastReachable.removeValue(forKey: url)
+    }
+
+    public func isRecentlyReachable(url: URL, maxAge: TimeInterval = 10.0) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let date = lastReachable[url] else { return false }
+        return Date().timeIntervalSince(date) < maxAge
+    }
+
+    public func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        lastReachable.removeAll()
+    }
+}
+
 /// Localhost HTTP Engine (Ollama / llama.cpp / LM Studio)
 public struct QLocalhostHTTPBackend: QLocalModelBackend {
     public let capabilities: QModelCapabilities
     public let baseURL: URL
+    public var probeTimeout: TimeInterval
 
-    public init(capabilities: QModelCapabilities, baseURL: URL) {
+    public init(capabilities: QModelCapabilities, baseURL: URL, probeTimeout: TimeInterval = 2.5) {
         self.capabilities = capabilities
         self.baseURL = baseURL
+        self.probeTimeout = probeTimeout
     }
 
     public func isAvailable() async -> Bool {
@@ -1035,12 +1195,19 @@ public struct QLocalhostHTTPBackend: QLocalModelBackend {
         guard (try? QEgressBroker.shared.authorize(url: probeURL)) != nil else {
             return false
         }
+
+        // Fast path: if reached within last 10 seconds, backend is known reachable
+        if QLocalhostReachabilityTracker.shared.isRecentlyReachable(url: baseURL) {
+            return true
+        }
+
         var req = URLRequest(url: probeURL)
-        req.timeoutInterval = 0.5
+        req.timeoutInterval = probeTimeout
         guard let (_, res) = try? await URLSession.shared.data(for: req),
               let http = res as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             return false
         }
+        QLocalhostReachabilityTracker.shared.markReachable(url: baseURL)
         return true
     }
 
@@ -1066,10 +1233,21 @@ public struct QLocalhostHTTPBackend: QLocalModelBackend {
         ]
         urlReq.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: urlReq)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: urlReq)
+        } catch let err as URLError where err.code == .cannotConnectToHost || err.code == .networkConnectionLost {
+            QLocalhostReachabilityTracker.shared.markUnreachable(url: baseURL)
+            throw err
+        } catch {
+            throw error
+        }
+
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw QModelRouterError.noBackendAvailable("Localhost engine returned error HTTP response.")
         }
+        QLocalhostReachabilityTracker.shared.markReachable(url: baseURL)
 
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let choices = json["choices"] as? [[String: Any]],
@@ -1119,11 +1297,24 @@ public struct QLocalhostHTTPBackend: QLocalModelBackend {
         urlReq.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         let start = Date()
-        let (byteStream, response) = try await URLSession.shared.bytes(for: urlReq, delegate: QEgressRedirectGuard())
+        let byteStream: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (byteStream, response) = try await URLSession.shared.bytes(for: urlReq, delegate: QEgressRedirectGuard())
+        } catch let err as URLError where err.code == .cannotConnectToHost || err.code == .networkConnectionLost {
+            QLocalhostReachabilityTracker.shared.markUnreachable(url: baseURL)
+            onEvent(.failed(reason: "Cannot connect to localhost engine"))
+            throw err
+        } catch {
+            onEvent(.failed(reason: error.localizedDescription))
+            throw error
+        }
+
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             onEvent(.failed(reason: "HTTP error from localhost engine"))
             throw QModelRouterError.noBackendAvailable("Localhost engine returned error HTTP response.")
         }
+        QLocalhostReachabilityTracker.shared.markReachable(url: baseURL)
 
         var accumulatedText = ""
         for try await line in byteStream.lines {
