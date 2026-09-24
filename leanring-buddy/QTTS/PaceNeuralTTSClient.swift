@@ -20,6 +20,7 @@ import Foundation
 final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
     private let modelManager: PaceNeuralTTSModelManager
     private let worker: PaceSherpaTTSWorker
+    private let sofeliaWorker: PaceArabicSofeliaONNXWorker
     private let fallbackClient: any BuddyTTSClient
 
     private var audioPlayer: AVAudioPlayer?
@@ -53,10 +54,12 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
     init(
         modelManager: PaceNeuralTTSModelManager = .shared,
         worker: PaceSherpaTTSWorker = .shared,
+        sofeliaWorker: PaceArabicSofeliaONNXWorker = .shared,
         fallbackClient: (any BuddyTTSClient)? = nil
     ) {
         self.modelManager = modelManager
         self.worker = worker
+        self.sofeliaWorker = sofeliaWorker
         self.fallbackClient = fallbackClient ?? LocalTTSClient()
         super.init()
     }
@@ -110,6 +113,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         // Cancel active worker synthesis
         Task {
             await worker.cancelActiveSynthesis()
+            await sofeliaWorker.cancelActiveSynthesis()
         }
 
         // Stop current audio player
@@ -132,6 +136,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
     public enum PaceNeuralTTSLanguageRoute: Equatable, Sendable {
         case englishKokoro
         case swedishAlma
+        case arabicSofelia
         case appleFallback(reason: String)
     }
 
@@ -156,7 +161,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         // Arabic Unicode range \u{0600}...\u{06FF}
         let hasArabic = text.unicodeScalars.contains { $0.value >= 0x0600 && $0.value <= 0x06FF }
         if hasArabic {
-            return .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)")
+            return .arabicSofelia
         }
 
         // Swedish distinct characters (å, ä, ö)
@@ -181,7 +186,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         case "sv":
             return .swedishAlma
         case "ar":
-            return .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)")
+            return .arabicSofelia
         default:
             // Short fragment guard (< 40 characters) ONLY for Latin text:
             // Apple NLLanguageRecognizer is notoriously noisy on short Latin phrases with proper nouns
@@ -204,7 +209,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         case "sv":
             return .swedishAlma
         case "ar":
-            return .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)")
+            return .arabicSofelia
         default:
             return .appleFallback(reason: "Unsupported neural language '\(locale)'; falling back to Apple TTS")
         }
@@ -242,6 +247,9 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
 
         case .swedishAlma:
             print("[TTS] provider=neural locale=sv-SE engine=piper-alma sid=0")
+
+        case .arabicSofelia:
+            print("[TTS] provider=neural locale=ar engine=sofelia-palestinian")
         }
 
         let utteranceId = UUID()
@@ -336,7 +344,8 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
                 }
 
                 // If concurrency contention (alreadySynthesizing) occurred, retry through the serialized queue
-                if let sherpaErr = error as? PaceSherpaTTSError, case .alreadySynthesizing = sherpaErr {
+                let isContention = (error as? PaceSherpaTTSError) == .alreadySynthesizing || (error as? PaceSofeliaTTSError) == .alreadySynthesizing
+                if isContention {
                     print("⚠️ [TTS] worker concurrency race detected; retrying in serialized queue...")
                     try? await Task.sleep(nanoseconds: 80_000_000)
                     do {
@@ -368,6 +377,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
 
         switch utterance.route {
         case .englishKokoro:
+            await sofeliaWorker.unload()
             let configResult = modelManager.resolveKokoroConfiguration()
             guard case .success(let config) = configResult else {
                 if case .failure(let err) = configResult { throw err }
@@ -377,12 +387,23 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
             wavData = PaceWAVEncoder.encodeWAV(samples: synthesized.samples, sampleRate: synthesized.sampleRate)
 
         case .swedishAlma:
+            await sofeliaWorker.unload()
             let configResult = modelManager.resolveSwedishConfiguration()
             guard case .success(let config) = configResult else {
                 if case .failure(let err) = configResult { throw err }
                 throw PaceNeuralTTSModelError.approvedRootNotFound
             }
             let synthesized = try await worker.synthesizeSwedish(text: utterance.text, config: config)
+            wavData = PaceWAVEncoder.encodeWAV(samples: synthesized.samples, sampleRate: synthesized.sampleRate)
+
+        case .arabicSofelia:
+            await worker.unload()
+            let configResult = modelManager.resolveSofeliaConfiguration()
+            guard case .success(let config) = configResult else {
+                if case .failure(let err) = configResult { throw err }
+                throw PaceNeuralTTSModelError.approvedRootNotFound
+            }
+            let synthesized = try await sofeliaWorker.synthesizeArabic(text: utterance.text, config: config)
             wavData = PaceWAVEncoder.encodeWAV(samples: synthesized.samples, sampleRate: synthesized.sampleRate)
 
         case .appleFallback(let reason):

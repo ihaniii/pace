@@ -76,6 +76,28 @@ public struct PaceSwedishModelConfiguration: Equatable, Sendable {
     }
 }
 
+public struct PaceSofeliaModelConfiguration: Equatable, Sendable {
+    public let modelPath: String
+    public let lexiconPath: String
+    public let vocabPath: String
+    public let stylesPath: String
+    public let sampleRate: Int32
+
+    public init(
+        modelPath: String,
+        lexiconPath: String,
+        vocabPath: String,
+        stylesPath: String,
+        sampleRate: Int32 = 24000
+    ) {
+        self.modelPath = modelPath
+        self.lexiconPath = lexiconPath
+        self.vocabPath = vocabPath
+        self.stylesPath = stylesPath
+        self.sampleRate = sampleRate
+    }
+}
+
 public final class PaceNeuralTTSModelManager: Sendable {
     public static let shared = PaceNeuralTTSModelManager()
 
@@ -287,6 +309,111 @@ public final class PaceNeuralTTSModelManager: Sendable {
                 dataDirPath: espeakDir.path,
                 sampleRate: 22050,
                 configPath: fileManager.fileExists(atPath: configFile.path) ? configFile.path : nil
+            )
+            return .success(config)
+        }
+
+        return .failure(lastError)
+    }
+
+    /// Resolves Sofelia Palestinian Arabic configuration from the first approved root containing all required assets.
+    public func resolveSofeliaConfiguration() -> Result<PaceSofeliaModelConfiguration, PaceNeuralTTSModelError> {
+        let roots = approvedSearchRoots
+        guard !roots.isEmpty else {
+            return .failure(.approvedRootNotFound)
+        }
+
+        var lastError: PaceNeuralTTSModelError = .approvedRootNotFound
+
+        for root in roots {
+            let sofeliaDir = root.appendingPathComponent("Sofelia", isDirectory: true)
+
+            // Validate root security
+            let secureSofeliaDir: URL
+            do {
+                secureSofeliaDir = try validatePathSecurity(targetURL: sofeliaDir, approvedRoot: root)
+            } catch let error as PaceNeuralTTSModelError {
+                lastError = error
+                continue
+            } catch {
+                lastError = .securityViolation(reason: error.localizedDescription)
+                continue
+            }
+
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: secureSofeliaDir.path, isDirectory: &isDir), isDir.boolValue else {
+                lastError = .modelDirectoryNotFound(language: "Palestinian Arabic (Sofelia)", expectedPath: secureSofeliaDir.path)
+                continue
+            }
+
+            let modelFile = secureSofeliaDir.appendingPathComponent("sofelia_palestinian.onnx")
+            let lexiconFile = secureSofeliaDir.appendingPathComponent("ar_lexicon.json")
+            let vocabFile = secureSofeliaDir.appendingPathComponent("vocab.json")
+            let stylesFile = secureSofeliaDir.appendingPathComponent("eliaa_styles.bin")
+
+            // Validate model file
+            guard fileManager.fileExists(atPath: modelFile.path) else {
+                lastError = .requiredFileNotFound(fileName: "sofelia_palestinian.onnx", expectedPath: modelFile.path)
+                continue
+            }
+            guard fileManager.isReadableFile(atPath: modelFile.path) else {
+                lastError = .fileNotReadable(path: modelFile.path)
+                continue
+            }
+
+            // Validate size
+            if let attrs = try? fileManager.attributesOfItem(atPath: modelFile.path),
+               let size = attrs[.size] as? UInt64 {
+                guard size > 300_000_000 else {
+                    lastError = .securityViolation(reason: "sofelia_palestinian.onnx size \(size) bytes is below required threshold.")
+                    continue
+                }
+            }
+
+            // Validate lexicon
+            guard fileManager.fileExists(atPath: lexiconFile.path) else {
+                lastError = .requiredFileNotFound(fileName: "ar_lexicon.json", expectedPath: lexiconFile.path)
+                continue
+            }
+            guard fileManager.isReadableFile(atPath: lexiconFile.path) else {
+                lastError = .fileNotReadable(path: lexiconFile.path)
+                continue
+            }
+
+            // Validate vocab
+            guard fileManager.fileExists(atPath: vocabFile.path) else {
+                lastError = .requiredFileNotFound(fileName: "vocab.json", expectedPath: vocabFile.path)
+                continue
+            }
+            guard fileManager.isReadableFile(atPath: vocabFile.path) else {
+                lastError = .fileNotReadable(path: vocabFile.path)
+                continue
+            }
+
+            // Validate styles
+            guard fileManager.fileExists(atPath: stylesFile.path) else {
+                lastError = .requiredFileNotFound(fileName: "eliaa_styles.bin", expectedPath: stylesFile.path)
+                continue
+            }
+            guard fileManager.isReadableFile(atPath: stylesFile.path) else {
+                lastError = .fileNotReadable(path: stylesFile.path)
+                continue
+            }
+
+            if let attrs = try? fileManager.attributesOfItem(atPath: stylesFile.path),
+               let size = attrs[.size] as? UInt64 {
+                guard size == 522_240 else {
+                    lastError = .securityViolation(reason: "eliaa_styles.bin size is \(size), expected 522240 bytes.")
+                    continue
+                }
+            }
+
+            let config = PaceSofeliaModelConfiguration(
+                modelPath: modelFile.path,
+                lexiconPath: lexiconFile.path,
+                vocabPath: vocabFile.path,
+                stylesPath: stylesFile.path,
+                sampleRate: 24000
             )
             return .success(config)
         }

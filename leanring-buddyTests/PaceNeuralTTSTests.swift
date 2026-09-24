@@ -211,19 +211,10 @@ struct PaceNeuralTTSLanguageRouteTests {
         #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "sv") == .swedishAlma)
         #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "sv_FI") == .swedishAlma)
 
-        // Arabic variants (must route directly to Apple)
-        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar") else {
-            Issue.record("Expected appleFallback for ar")
-            return
-        }
-        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-SA") else {
-            Issue.record("Expected appleFallback for ar-SA")
-            return
-        }
-        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-001") else {
-            Issue.record("Expected appleFallback for ar-001")
-            return
-        }
+        // Arabic variants (now route to native Sofelia)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar") == .arabicSofelia)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-SA") == .arabicSofelia)
+        #expect(PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ar-001") == .arabicSofelia)
 
         // Unsupported languages (safe Apple fallback)
         guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: "", explicitLocale: "ru") else {
@@ -249,10 +240,7 @@ struct PaceNeuralTTSLanguageRouteTests {
         #expect(PaceNeuralTTSClient.determineRoute(for: swedishText) == .swedishAlma)
 
         let arabicText = "مرحباً هاني، هذا كيو يتحدث معك محلياً."
-        guard case .appleFallback = PaceNeuralTTSClient.determineRoute(for: arabicText) else {
-            Issue.record("Expected appleFallback for Arabic text")
-            return
-        }
+        #expect(PaceNeuralTTSClient.determineRoute(for: arabicText) == .arabicSofelia)
     }
 }
 
@@ -787,12 +775,11 @@ struct PaceNeuralTTSRuntimeValidationTests {
         #expect(await worker.hasLoadedEngine)
         logMetric("Step 7: Switch Swedish -> English (Kokoro af_heart): Latency=\(String(format: "%.2f", backLatencyMs)) ms | SampleRate=\(backAudio.sampleRate) Hz | Samples=\(backAudio.samples.count) | RSS=\(String(format: "%.2f", rssAfterBack)) MB")
 
-        // 7. Deterministic Arabic routing
+        // 7. Deterministic Arabic routing (Sofelia)
         let arabicRoute = PaceNeuralTTSClient.determineRoute(for: "مرحباً هاني، كيف حالك؟")
-        #expect(arabicRoute == .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)"))
+        #expect(arabicRoute == .arabicSofelia)
         try await client.speakText("مرحباً هاني، كيف حالك؟")
-        #expect(mockFallback.spokenTexts.contains("مرحباً هاني، كيف حالك؟"))
-        logMetric("Step 8: Arabic routing -> Apple fallback (Maged/Majed): PASS")
+        logMetric("Step 8: Arabic routing -> Sofelia neural Arabic: PASS")
 
         // 8. Unsupported language routing
         let ruRoute = PaceNeuralTTSClient.determineRoute(for: "Привет, мир!")
@@ -868,7 +855,7 @@ struct PacePhase22AudioParityAndQueueTests {
         }
     }
 
-    @Test("Requirement 8: Explicit Arabic routes to Apple TTS fallback")
+    @Test("Requirement 8: Explicit Arabic routes to Sofelia neural Arabic")
     func testExplicitArabicRouting() {
         let phrases = [
             "مرحبا هاني",
@@ -877,7 +864,7 @@ struct PacePhase22AudioParityAndQueueTests {
         ]
         for phrase in phrases {
             let route = PaceNeuralTTSClient.determineRoute(for: phrase, explicitLocale: "ar")
-            #expect(route == .appleFallback(reason: "Arabic routed to Apple TTS (Maged/Majed)"), "Phrase '\(phrase)' with explicit Arabic must route to Apple fallback")
+            #expect(route == .arabicSofelia, "Phrase '\(phrase)' with explicit Arabic must route to Sofelia")
         }
     }
 
