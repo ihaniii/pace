@@ -169,6 +169,7 @@ extension CompanionManager {
         // the pipeline already routed it but a second call is a no-op
         // and guarantees state even if the pipeline shape changes.
         ttsClient.stopPlayback()
+        clearActiveQCoreExecutionActivity()
         // Open a listening window so the wake-word path (Wave 2) or
         // an immediate PTT press resumes capture without re-arming.
         buddyDictationManager.openListeningWindow(

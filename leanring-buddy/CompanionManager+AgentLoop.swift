@@ -23,6 +23,7 @@ extension CompanionManager {
         currentTurnDispatchTask = nil
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        clearActiveQCoreExecutionActivity()
     }
 
     func isActiveTurn(_ turnLease: PaceTurnLease) -> Bool {

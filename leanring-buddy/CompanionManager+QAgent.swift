@@ -77,6 +77,20 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
             let snapshot = QRuntimeUISnapshot.from(plan: plan)
             self.activeQPlanSnapshot = snapshot
             self.applyPlanSnapshotToHUD(snapshot: snapshot)
+
+            // Phase 4.7E: Safe, deterministic parity with Current Activity / Now projection
+            switch plan.state {
+            case .running, .executing, .verifying:
+                self.recordQCoreExecutionStarted(taskId: plan.taskId, taskPrompt: plan.taskPrompt)
+            case .completed:
+                self.recordQCoreExecutionCompleted(taskId: plan.taskId)
+            case .cancelled:
+                self.recordQCoreExecutionCancelled(taskId: plan.taskId)
+            case .failed(let reason, _), .blocked(let reason, _):
+                self.recordQCoreExecutionFailed(taskId: plan.taskId, reason: reason)
+            case .pending, .waitingForPermission:
+                break
+            }
         }
     }
 
@@ -219,6 +233,8 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 detail: request.expectedEffect,
                 options: []
             )
+        } else {
+            recordQCoreExecutionCancelled(taskId: taskId)
         }
         // Denial's immediate HUD feedback is set synchronously by the caller
         // (CompanionManager+AgentLoop.resolveClarification) before this async call is dispatched,
@@ -233,6 +249,17 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 observer: self
             )
 
+            switch result.status {
+            case .completed:
+                recordQCoreExecutionCompleted(taskId: taskId)
+            case .cancelled:
+                recordQCoreExecutionCancelled(taskId: taskId)
+            case .failed(let reason):
+                recordQCoreExecutionFailed(taskId: taskId, reason: reason)
+            default:
+                break
+            }
+
             if case .completed = result.status, !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 recordConversationTurn(userTranscript: userTranscript, assistantResponse: result.summary)
             } else {
@@ -242,6 +269,7 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 try? await ttsClient.speakText(result.summary)
             }
         } catch {
+            recordQCoreExecutionFailed(taskId: taskId, reason: error.localizedDescription)
             currentTurnHUDState = PaceTurnHUDState.failed(error.localizedDescription)
             chatSession.appendCompletedTurn(userTranscript: userTranscript, assistantResponse: "Q Error: \(error.localizedDescription)")
         }
@@ -295,45 +323,12 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 turnContext: context
             )
 
-            switch result.status {
-            case .directAnswer(let text):
-                streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    recordConversationTurn(userTranscript: transcript, assistantResponse: text)
-                } else {
-                    chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: text)
-                }
-                if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
-                    try? await ttsClient.speakText(text, explicitLocale: detectedTurnLocale)
-                }
-
-            case .completed:
-                streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
-                if !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
-                } else {
-                    chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
-                }
-                if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
-                    try? await ttsClient.speakText(result.summary, explicitLocale: detectedTurnLocale)
-                }
-
-            case .cancelled(let reason):
-                streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
-                ttsClient.stopPlayback()
-
-            case .failed(let reason):
-                streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
-                ttsClient.stopPlayback()
-                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: "Q Failed: \(reason)")
-
-            case .awaitingApproval:
-                break
-            }
+            await handleQAgentTurnResult(result, transcript: transcript, detectedTurnLocale: detectedTurnLocale)
 
             voiceState = .idle
             return result
         } catch {
+            recordQCoreExecutionFailed(taskId: context?.turnId ?? UUID().uuidString, reason: error.localizedDescription)
             streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
             ttsClient.stopPlayback()
             qRuntimeState = .error
@@ -347,6 +342,48 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 status: .failed(reason: error.localizedDescription),
                 summary: "Error: \(error.localizedDescription)"
             )
+        }
+    }
+
+    func handleQAgentTurnResult(_ result: QAgentResult, transcript: String, detectedTurnLocale: String? = nil) async {
+        switch result.status {
+        case .directAnswer(let text):
+            // Direct conversational answers MUST NOT mutate Current Activity
+            streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: transcript, assistantResponse: text)
+            } else {
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: text)
+            }
+            if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
+                try? await ttsClient.speakText(text, explicitLocale: detectedTurnLocale)
+            }
+
+        case .completed:
+            recordQCoreExecutionCompleted(taskId: result.taskId)
+            streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
+            if !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
+            } else {
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
+            }
+            if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
+                try? await ttsClient.speakText(result.summary, explicitLocale: detectedTurnLocale)
+            }
+
+        case .cancelled(let reason):
+            recordQCoreExecutionCancelled(taskId: result.taskId)
+            streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+            ttsClient.stopPlayback()
+
+        case .failed(let reason):
+            recordQCoreExecutionFailed(taskId: result.taskId, reason: reason)
+            streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
+            ttsClient.stopPlayback()
+            chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: "Q Failed: \(reason)")
+
+        case .awaitingApproval:
+            break
         }
     }
 }

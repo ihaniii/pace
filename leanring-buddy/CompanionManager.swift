@@ -439,6 +439,9 @@ final class CompanionManager: ObservableObject {
     /// (see `activityGoalPersistenceStore`'s sibling comment and
     /// `PaceOutcomeFeedbackTelemetryProducerTests.swift`).
     var activityGoalPersistenceStore = PaceActivityGoalPersistenceStore()
+    /// Phase 4.7E: Most recent in-flight Q-Core activity observation identifier.
+    /// Tracked so subsequent updates or completions can link `supersedesObservationId`.
+    var activeQCoreObservationId: String?
     /// Slice 1 of the outcome-feedback-telemetry proposal
     /// (openspec/changes/2026-09-13-add-outcome-feedback-telemetry): a
     /// typed, bounded record of what happened after Pace suggested or
