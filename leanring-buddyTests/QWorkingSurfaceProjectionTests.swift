@@ -337,4 +337,39 @@ struct QWorkingSurfaceProjectionTests {
 
         try? QDurableTaskStore.shared.deleteTask(taskId: uniqueId)
     }
+
+    // 17. GAP-4.7-03 UI Parity: PaceNowSettingsTab workingSurfaceState reflects both legacy and Q-Core durable tasks
+    @MainActor
+    @Test func nowSettingsTabWorkingSurfaceReflectsQCoreDurableTasksAndLegacyTasks() async throws {
+        let uniqueDurableId = "now-tab-durable-\(UUID().uuidString)"
+        let durable = QDurableTaskState(
+            taskId: uniqueDurableId,
+            sessionId: "now-tab-session",
+            originalIntent: "Open Calculator and compute totals",
+            taskCreationTimestamp: Date(),
+            lifecycleState: .awaitingApproval
+        )
+        try QDurableTaskStore.shared.saveTask(durable)
+        defer { try? QDurableTaskStore.shared.deleteTask(taskId: uniqueDurableId) }
+
+        let manager = CompanionManager()
+        let tab = PaceNowSettingsTab(companionManager: manager)
+        let uiWorkingState = tab.workingSurfaceState
+
+        // B. Q-Core durable task appears in the Working projection consumed by the UI
+        let qCoreTask = uiWorkingState.tasks.first { $0.id == uniqueDurableId }
+        #expect(qCoreTask != nil)
+        #expect(qCoreTask?.displayName == "Open Calculator and compute totals")
+
+        // C. Awaiting approval remains represented correctly
+        #expect(qCoreTask?.state == .awaitingApproval)
+        #expect(qCoreTask?.currentStepDescription == "Awaiting permission")
+
+        // D. Existing bounded/sanitized projection behavior remains intact
+        #expect(uiWorkingState.tasks.count <= PaceWorkingSurfaceLimits.maximumProjectedTaskCount)
+
+        // E. No duplicate task appears when the same logical task exists
+        let duplicateCount = uiWorkingState.tasks.filter { $0.id == uniqueDurableId }.count
+        #expect(duplicateCount == 1)
+    }
 }

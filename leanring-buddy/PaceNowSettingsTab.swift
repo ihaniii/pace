@@ -48,8 +48,8 @@ struct PaceNowSettingsTab: View {
     @State private var nowSurfaceState: PaceNowSurfaceState = .empty
     @State private var memorySurfaceState: PaceMemorySurfaceState = .empty
 
-    private var workingSurfaceState: PaceWorkingSurfaceState {
-        PaceWorkingSurfaceProjection.project(backgroundAgentTasks: backgroundAgentRunner.tasks)
+    var workingSurfaceState: PaceWorkingSurfaceState {
+        companionManager.workingSurfaceState
     }
 
     var body: some View {
