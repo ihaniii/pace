@@ -6,10 +6,17 @@
 //  Language routing:
 //    - English: Kokoro-82M (af_heart, SID 3, lang en-us, 24kHz)
 //    - Swedish: Piper VITS (sv_SE-alma-medium, SID 0, 22.05kHz)
-//    - Arabic / unsupported: Apple AVSpeechSynthesizer fallback
+//    - Arabic: Sofelia Palestinian (ONNX); unsupported languages: Apple AVSpeechSynthesizer
 //  Failure posture:
-//    - Missing model or genuine synthesis failure falls back to LocalTTSClient.
-//    - Concurrency contention serializes through a bounded FIFO queue and does NOT fall back.
+//    - Never two voices at once: the queue is serial and Apple speech is awaited
+//      to completion before the next utterance starts.
+//    - One voice per turn for FAILURES (a turn begins at `stopPlayback()` or after
+//      an idle gap): once a neural voice has started speaking, a later failed
+//      chunk is dropped rather than switched to the Apple voice, and a turn that
+//      fell back to the Apple voice (e.g. model missing) stays on it. A language
+//      only the Apple voice supports is still spoken — serially, never overlapping.
+//    - A cancelled neural synthesis NEVER falls back to Apple TTS.
+//    - Concurrency contention serializes through a bounded FIFO queue.
 //  Zero network, zero external processes.
 //
 
@@ -37,6 +44,9 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         let explicitLocale: String?
         let isFinal: Bool
         let route: PaceNeuralTTSLanguageRoute
+        /// `playbackGeneration` at enqueue time; a later `stopPlayback()`
+        /// makes the utterance stale.
+        let playbackGeneration: Int
         let onPlaybackStarted: (@MainActor () -> Void)?
         let onCompletedOrFailed: (@MainActor () -> Void)?
     }
@@ -44,6 +54,36 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
     private var pendingQueue: [QueuedUtterance] = []
     private let maxPendingUtterances: Int = 4
     private var queueProcessingTask: Task<Void, Never>?
+
+    // MARK: - One Voice Path Per Turn
+
+    enum ActiveVoicePath: Equatable {
+        case none
+        case neural
+        case apple
+    }
+
+    /// Which voice this turn is speaking with. Reset by `stopPlayback()`, which
+    /// every new turn calls, and after the queue has been idle for
+    /// `voicePathIdleResetSeconds` (speech outside a turn — reminders, briefs —
+    /// must not inherit a lock from an earlier conversation).
+    private(set) var activeVoicePathForTurn: ActiveVoicePath = .none
+    private var voicePathIdleSince: Date?
+    private let voicePathIdleResetSeconds: TimeInterval
+
+    /// Incremented by every `stopPlayback()`. Distinguishes a legitimate stop
+    /// from a stale worker cancellation that raced into the next turn.
+    private var playbackGeneration: Int = 0
+
+    /// Upper bound on waiting for the Apple voice to finish one utterance, so
+    /// a synthesizer that never reports completion cannot wedge the queue.
+    static let appleVoiceCompletionWaitLimitSeconds: TimeInterval = 120
+
+    /// Synthesizes and plays one neural utterance. Defaults to the real
+    /// Kokoro/Alma/Sofelia path; tests inject a renderer to drive the queue
+    /// without models or audio hardware.
+    typealias NeuralUtteranceRenderer = @MainActor (QueuedUtterance) async throws -> Void
+    private let injectedNeuralUtteranceRenderer: NeuralUtteranceRenderer?
 
     #if DEBUG
     var debugPendingQueueCount: Int {
@@ -55,12 +95,16 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
         modelManager: PaceNeuralTTSModelManager = .shared,
         worker: PaceSherpaTTSWorker = .shared,
         sofeliaWorker: PaceArabicSofeliaONNXWorker = .shared,
-        fallbackClient: (any BuddyTTSClient)? = nil
+        fallbackClient: (any BuddyTTSClient)? = nil,
+        neuralUtteranceRenderer: NeuralUtteranceRenderer? = nil,
+        voicePathIdleResetSeconds: TimeInterval = 10
     ) {
+        self.voicePathIdleResetSeconds = voicePathIdleResetSeconds
         self.modelManager = modelManager
         self.worker = worker
         self.sofeliaWorker = sofeliaWorker
         self.fallbackClient = fallbackClient ?? LocalTTSClient()
+        self.injectedNeuralUtteranceRenderer = neuralUtteranceRenderer
         super.init()
     }
 
@@ -94,6 +138,9 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
     func stopPlayback() {
         internalLastStopReason = pendingStopReason ?? .manualStop
         pendingStopReason = nil
+        playbackGeneration += 1
+        activeVoicePathForTurn = .none
+        voicePathIdleSince = nil
 
         let wasProcessing = queueProcessingTask != nil || !pendingQueue.isEmpty
         if wasProcessing {
@@ -237,10 +284,10 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
 
         let route = Self.determineRoute(for: trimmed, explicitLocale: explicitLocale)
         switch route {
-        case .appleFallback(let reason):
-            print("[TTS] fallback reason=\(reason)")
-            try await fallbackClient.speakText(trimmed, explicitLocale: explicitLocale, isFinal: isFinal)
-            return
+        case .appleFallback:
+            // Queued like every other utterance: speaking it directly here
+            // bypassed the queue and could overlap a neural sentence.
+            break
 
         case .englishKokoro:
             print("[TTS] provider=neural locale=en-US engine=kokoro speaker=af_heart sid=3")
@@ -269,6 +316,7 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
                 explicitLocale: explicitLocale,
                 isFinal: isFinal,
                 route: route,
+                playbackGeneration: playbackGeneration,
                 onPlaybackStarted: {
                     resumeOnce()
                 },
@@ -331,9 +379,23 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
             let utterance = pendingQueue.removeFirst()
             let idPrefix = String(utterance.id.uuidString.prefix(8))
             print("[TTS] queue start id=\(idPrefix)")
+            resetVoicePathAfterIdleGapIfNeeded()
+
+            if case .appleFallback(let reason) = utterance.route {
+                // A deliberate language route, not a failure: the Apple voice is
+                // the only voice for this language. Spoken serially.
+                await speakWithAppleVoice(utterance, reason: reason, isFailureFallback: false)
+                utterance.onCompletedOrFailed?()
+                continue
+            }
+            if activeVoicePathForTurn == .apple {
+                await speakWithAppleVoice(utterance, reason: "turn fell back to the Apple voice", isFailureFallback: true)
+                utterance.onCompletedOrFailed?()
+                continue
+            }
 
             do {
-                try await synthesizeAndPlay(utterance)
+                try await renderNeuralUtterance(utterance)
                 print("[TTS] queue complete id=\(idPrefix)")
                 utterance.onCompletedOrFailed?()
             } catch {
@@ -343,33 +405,142 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
                     break
                 }
 
-                // If concurrency contention (alreadySynthesizing) occurred, retry through the serialized queue
-                let isContention = (error as? PaceSherpaTTSError) == .alreadySynthesizing || (error as? PaceSofeliaTTSError) == .alreadySynthesizing
-                if isContention {
+                if Self.isNeuralCancellation(error) {
+                    // Cancellation is never a reason to switch to the Apple voice.
+                    if utterance.playbackGeneration == playbackGeneration {
+                        // No stop happened since this utterance was queued, so the
+                        // cancellation was aimed at an earlier turn's synthesis and
+                        // raced into this one. Retry once on the neural voice.
+                        print("⚠️ [TTS] stale cancellation hit id=\(idPrefix); retrying neural synthesis once")
+                        do {
+                            try await renderNeuralUtterance(utterance)
+                            print("[TTS] queue complete id=\(idPrefix) (after stale-cancellation retry)")
+                        } catch {
+                            await handleFailedNeuralRetry(utterance, retryError: error)
+                        }
+                    } else {
+                        print("[TTS] queue cancelled id=\(idPrefix)")
+                    }
+                } else if Self.isNeuralContention(error) {
                     print("⚠️ [TTS] worker concurrency race detected; retrying in serialized queue...")
                     try? await Task.sleep(nanoseconds: 80_000_000)
                     do {
-                        try await synthesizeAndPlay(utterance)
+                        try await renderNeuralUtterance(utterance)
                         print("[TTS] queue complete id=\(idPrefix) (after retry)")
-                        utterance.onCompletedOrFailed?()
                     } catch {
-                        print("⚠️ [TTS] retry failed (\(error.localizedDescription)). Falling back to Apple TTS.")
-                        try? await fallbackClient.speakText(utterance.text, explicitLocale: utterance.explicitLocale, isFinal: utterance.isFinal)
-                        utterance.onCompletedOrFailed?()
+                        await handleFailedNeuralRetry(utterance, retryError: error)
                     }
                 } else {
-                    // Genuine synthesis failure or missing model -> fall back to Apple TTS
-                    print("⚠️ [TTS] synthesis failed (\(error.localizedDescription)). Falling back to Apple TTS.")
-                    try? await fallbackClient.speakText(utterance.text, explicitLocale: utterance.explicitLocale, isFinal: utterance.isFinal)
-                    utterance.onCompletedOrFailed?()
+                    await speakWithAppleVoice(
+                        utterance,
+                        reason: "neural synthesis failed (\(error.localizedDescription))",
+                        isFailureFallback: true
+                    )
                 }
+                utterance.onCompletedOrFailed?()
             }
         }
 
         queueProcessingTask = nil
         if pendingQueue.isEmpty && audioPlayer?.isPlaying != true {
             isCurrentlySpeakingOrPending = false
+            voicePathIdleSince = Date()
         }
+    }
+
+    /// A retry's own error decides what happens next: a cancellation is dropped
+    /// (never the Apple voice); a genuine failure follows the one-voice-per-turn
+    /// failure policy.
+    private func handleFailedNeuralRetry(_ utterance: QueuedUtterance, retryError: Error) async {
+        let idPrefix = String(utterance.id.uuidString.prefix(8))
+        if Self.isNeuralCancellation(retryError) || Task.isCancelled {
+            print("🔇 [TTS] dropping id=\(idPrefix): retry was cancelled; no Apple fallback for a cancelled synthesis")
+            return
+        }
+        await speakWithAppleVoice(
+            utterance,
+            reason: "neural retry failed (\(retryError.localizedDescription))",
+            isFailureFallback: true
+        )
+    }
+
+    private func resetVoicePathAfterIdleGapIfNeeded() {
+        defer { voicePathIdleSince = nil }
+        guard let idleSince = voicePathIdleSince,
+              Date().timeIntervalSince(idleSince) >= voicePathIdleResetSeconds else { return }
+        activeVoicePathForTurn = .none
+    }
+
+    /// Renders one neural utterance and marks the turn's voice path as neural
+    /// the moment its playback starts.
+    private func renderNeuralUtterance(_ utterance: QueuedUtterance) async throws {
+        let voicePathTrackingUtterance = QueuedUtterance(
+            id: utterance.id,
+            text: utterance.text,
+            explicitLocale: utterance.explicitLocale,
+            isFinal: utterance.isFinal,
+            route: utterance.route,
+            playbackGeneration: utterance.playbackGeneration,
+            onPlaybackStarted: { [weak self] in
+                if let self, utterance.playbackGeneration == self.playbackGeneration {
+                    self.activeVoicePathForTurn = .neural
+                }
+                utterance.onPlaybackStarted?()
+            },
+            onCompletedOrFailed: utterance.onCompletedOrFailed
+        )
+        if let injectedNeuralUtteranceRenderer {
+            try await injectedNeuralUtteranceRenderer(voicePathTrackingUtterance)
+        } else {
+            try await synthesizeAndPlay(voicePathTrackingUtterance)
+        }
+    }
+
+    /// Speaks `utterance` with the Apple voice and waits for it to finish, so the
+    /// next queued utterance cannot overlap it. A FAILURE fallback is refused
+    /// when the neural voice is already speaking this turn (the chunk is dropped
+    /// instead of switching voices mid-answer) and otherwise locks the turn to
+    /// the Apple voice.
+    private func speakWithAppleVoice(_ utterance: QueuedUtterance, reason: String, isFailureFallback: Bool) async {
+        let idPrefix = String(utterance.id.uuidString.prefix(8))
+        guard utterance.playbackGeneration == playbackGeneration else {
+            print("[TTS] queue cancelled id=\(idPrefix)")
+            return
+        }
+        if isFailureFallback {
+            guard activeVoicePathForTurn != .neural else {
+                print("🔇 [TTS] dropping id=\(idPrefix) (\(reason)): the neural voice is already speaking this turn")
+                return
+            }
+            activeVoicePathForTurn = .apple
+        }
+        print("[TTS] fallback reason=\(reason)")
+        try? await fallbackClient.speakText(utterance.text, explicitLocale: utterance.explicitLocale, isFinal: utterance.isFinal)
+        await waitUntilAppleVoiceFinishes(playbackGenerationAtStart: utterance.playbackGeneration)
+    }
+
+    /// `LocalTTSClient.speakText` returns as soon as the utterance is handed to
+    /// AVSpeechSynthesizer; without this wait the queue started the next neural
+    /// sentence while the Apple voice was still speaking.
+    private func waitUntilAppleVoiceFinishes(playbackGenerationAtStart: Int) async {
+        let deadline = Date().addingTimeInterval(Self.appleVoiceCompletionWaitLimitSeconds)
+        while fallbackClient.isPlaying
+            && playbackGenerationAtStart == playbackGeneration
+            && !Task.isCancelled
+            && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    static func isNeuralCancellation(_ error: Error) -> Bool {
+        (error as? PaceSofeliaTTSError) == .cancelled
+            || (error as? PaceSherpaTTSError) == .cancelled
+            || error is CancellationError
+    }
+
+    static func isNeuralContention(_ error: Error) -> Bool {
+        (error as? PaceSofeliaTTSError) == .alreadySynthesizing
+            || (error as? PaceSherpaTTSError) == .alreadySynthesizing
     }
 
     private func synthesizeAndPlay(_ utterance: QueuedUtterance) async throws {
@@ -406,10 +577,9 @@ final class PaceNeuralTTSClient: NSObject, BuddyTTSClient {
             let synthesized = try await sofeliaWorker.synthesizeArabic(text: utterance.text, config: config)
             wavData = PaceWAVEncoder.encodeWAV(samples: synthesized.samples, sampleRate: synthesized.sampleRate)
 
-        case .appleFallback(let reason):
-            print("[TTS] fallback reason=\(reason)")
-            try await fallbackClient.speakText(utterance.text, explicitLocale: utterance.explicitLocale, isFinal: utterance.isFinal)
-            utterance.onCompletedOrFailed?()
+        case .appleFallback:
+            // Handled by the queue loop before rendering, so the Apple voice is
+            // subject to the one-voice-per-turn rule.
             return
         }
 

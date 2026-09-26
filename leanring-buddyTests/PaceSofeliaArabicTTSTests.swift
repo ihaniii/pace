@@ -394,15 +394,46 @@ struct PaceSofeliaArabicTTSTests {
         let worker = PaceArabicSofeliaONNXWorker()
         defer { Task { await worker.unload() } }
 
+        // Before inference, with nothing in flight: a cancellation recorded on an
+        // idle worker must NOT fail the next, unrelated synthesis. (The previous
+        // expectation here — `.cancelled` — was the sticky-flag defect that made
+        // every Arabic turn's first sentence fall back to the Apple voice.)
         await worker.cancelActiveSynthesis()
-        do {
-            _ = try await worker.synthesizeArabic(text: "مرحبا هاني", config: config)
-            Issue.record("Expected cancellation error")
-        } catch let err as PaceSofeliaTTSError {
-            #expect(err == .cancelled)
-        } catch {
-            Issue.record("Unexpected error: \(error)")
+        #expect(await worker.hasPendingCancellation == false)
+        let afterIdleCancellation = try await worker.synthesizeArabic(text: "مرحبا هاني", config: config)
+        #expect(!afterIdleCancellation.samples.isEmpty)
+
+        // During inference: cancelling a synthesis that is genuinely in flight
+        // still stops it with `.cancelled`. Unloading first forces a model load,
+        // which is a suspension point where the cancellation can land.
+        await worker.unload()
+        let inFlightSynthesis = Task { try await worker.synthesizeArabic(text: "مرحبا هاني، كيفك اليوم؟", config: config) }
+        var observedInFlight = false
+        for _ in 0..<2_000 {
+            if await worker.isSynthesisInFlight {
+                observedInFlight = true
+                break
+            }
+            await Task.yield()
         }
+        if observedInFlight {
+            await worker.cancelActiveSynthesis()
+            do {
+                _ = try await inFlightSynthesis.value
+                Issue.record("Expected an in-flight cancellation to throw .cancelled")
+            } catch let err as PaceSofeliaTTSError {
+                #expect(err == .cancelled)
+            } catch {
+                Issue.record("Unexpected error: \(error)")
+            }
+        } else {
+            _ = try? await inFlightSynthesis.value
+            print("ℹ️ Synthesis completed without a suspension point; in-flight half not observable this run")
+        }
+
+        // After a cancellation: the next synthesis starts clean.
+        let afterCancellation = try await worker.synthesizeArabic(text: "مرحبا هاني", config: config)
+        #expect(!afterCancellation.samples.isEmpty)
     }
 
     // MARK: - W. Route Selection

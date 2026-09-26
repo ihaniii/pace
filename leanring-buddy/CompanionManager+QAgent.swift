@@ -355,9 +355,11 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
             } else {
                 chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: text)
             }
-            if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
-                try? await ttsClient.speakText(text, explicitLocale: detectedTurnLocale)
-            }
+            // Through the pipeline's deduplicated cursor: streamed sentences
+            // may still be mid-dispatch, so speaking the full answer directly
+            // here played it a second time. Mute and barge-in are enforced
+            // inside the pipeline.
+            await streamingSentenceTTSPipeline.speakFinalAnswerIfNeeded(text)
 
         case .completed:
             recordQCoreExecutionCompleted(taskId: result.taskId)
@@ -367,9 +369,7 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
             } else {
                 chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
             }
-            if streamingSentenceTTSPipeline.firstSpokenWordCharacterCount == 0 && !chatSession.isChatTTSMuted {
-                try? await ttsClient.speakText(result.summary, explicitLocale: detectedTurnLocale)
-            }
+            await streamingSentenceTTSPipeline.speakFinalAnswerIfNeeded(result.summary)
 
         case .cancelled(let reason):
             recordQCoreExecutionCancelled(taskId: result.taskId)

@@ -550,6 +550,27 @@ struct QCoreConversationalStreamingTests {
         }
         #expect(lastExtracted.contains("token100"))
     }
+
+    // MARK: - Y. Direct answer spoken once (single-voice regression)
+
+    @Test("Y. A streamed Q-Core direct answer is spoken exactly once through the pipeline")
+    @MainActor
+    func testY_streamedDirectAnswerSpokenOnce() async {
+        let mockTTS = MockTTSClient()
+        let pipeline = StreamingSentenceTTSPipeline(ttsClient: mockTTS)
+        pipeline.resetForNewTurn(locale: "ar")
+        pipeline.markIntentCommitted()
+
+        let directAnswer = "عاصمة السويد هي ستوكهولم. هي أكبر مدينة في السويد."
+        // Streamed deltas, the stream's completion flush, then the final
+        // direct-answer path — the three dispatchers of one Q-Core turn.
+        await pipeline.acceptStreamedText("عاصمة السويد هي ستوكهولم. هي")
+        await pipeline.acceptStreamedText(directAnswer)
+        await pipeline.flushFinal(finalSpokenText: directAnswer)
+        await pipeline.speakFinalAnswerIfNeeded(directAnswer)
+
+        #expect(mockTTS.spokenTexts == ["عاصمة السويد هي ستوكهولم.", "هي أكبر مدينة في السويد."])
+    }
 }
 
 // MARK: - Phase 4.7C Mandatory Test Suite (Tests A through L)

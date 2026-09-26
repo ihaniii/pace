@@ -116,11 +116,12 @@ public actor PaceArabicSofeliaONNXWorker {
             throw PaceSofeliaTTSError.alreadySynthesizing
         }
 
-        guard !isCancelled else {
-            isCancelled = false
-            throw PaceSofeliaTTSError.cancelled
-        }
-
+        // A new synthesis always starts clean (mirrors PaceSherpaTTSWorker).
+        // Cancellation targets only a synthesis that is in flight; a flag left
+        // over from an earlier stop must never fail the NEXT, unrelated
+        // utterance — that made every Arabic turn's first sentence throw
+        // `.cancelled` and fall back to the Apple voice.
+        isCancelled = false
         isSynthesizing = true
         defer {
             isSynthesizing = false
@@ -406,9 +407,25 @@ private func ortErrorMessage(api: UnsafePointer<OrtApi>, status: OpaquePointer?)
 
     // MARK: - Cancellation & Teardown
 
-    /// Cancels any currently active synthesis.
+    /// Cancels the synthesis that is currently in flight, if any. A no-op
+    /// while idle: every turn begins with `stopPlayback()`, and recording a
+    /// cancellation when nothing is running used to poison the next
+    /// synthesis.
     public func cancelActiveSynthesis() {
+        guard isSynthesizing else { return }
         isCancelled = true
+    }
+
+    /// Whether a cancellation is recorded for an in-flight synthesis.
+    /// Exposed for regression tests of the idle-cancellation contract.
+    public var hasPendingCancellation: Bool {
+        isCancelled
+    }
+
+    /// Whether a synthesis is currently in flight. Exposed so tests can cancel
+    /// a genuinely in-flight synthesis rather than an idle worker.
+    public var isSynthesisInFlight: Bool {
+        isSynthesizing
     }
 
     /// Unloads resident model and releases memory back to the OS.

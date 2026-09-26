@@ -24,6 +24,17 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// only the new completed sentence(s) get spoken.
     private var alreadyDispatchedSafeText: String = ""
 
+    /// True once any text has been handed to the TTS client for the current
+    /// turn (set when the chunk is RESERVED, before playback starts). The
+    /// final-answer path reads this instead of `firstSpokenWordCharacterCount`,
+    /// which only advances after playback has begun.
+    private(set) var hasQueuedAudioForTurn: Bool = false
+
+    /// Incremented whenever the dispatch cursor is reset (new turn or
+    /// supersede) so a chunk still in flight from the previous stream cannot
+    /// update the new stream's bookkeeping when its `speakText` returns.
+    private var dispatchEpoch: Int = 0
+
     /// Live UI mirror of the speakable text accumulated for the current
     /// turn. Updated on every chunk so SwiftUI surfaces (the chat
     /// transcript in particular) can render a streaming "assistant is
@@ -127,6 +138,8 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// history so the next chunk starts a fresh queue.
     func resetForNewTurn(locale: String? = nil) {
         alreadyDispatchedSafeText = ""
+        hasQueuedAudioForTurn = false
+        dispatchEpoch += 1
         intentCommittedAt = nil
         hasLoggedTimeToFirstSpokenWord = false
         isMutedForCurrentTurn = false
@@ -200,6 +213,8 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     func prepareForSupersedingStreamWithinTurn() {
         ttsClient.stopPlayback()
         alreadyDispatchedSafeText = ""
+        hasQueuedAudioForTurn = false
+        dispatchEpoch += 1
         inFlightStreamedText = ""
         hasDispatchedFirstSentenceOfTurn = false
         firstSpokenWordCharacterCount = 0
@@ -310,13 +325,26 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
             return
         }
 
+        // Reserve this portion BEFORE awaiting the TTS client. `speakText`
+        // suspends until playback STARTS (hundreds of ms for neural
+        // synthesis); advancing the cursor only afterwards let a
+        // concurrent `flushFinal` / final-answer dispatch see an empty
+        // cursor during that window and queue the same text again.
+        let previouslyDispatchedSafeText = alreadyDispatchedSafeText
+        let previouslyHadQueuedAudioForTurn = hasQueuedAudioForTurn
+        alreadyDispatchedSafeText = speakableSafePrefix
+        hasQueuedAudioForTurn = true
+        let reservingDispatchEpoch = dispatchEpoch
+
         do {
             try await ttsClient.speakText(
                 trimmedNewPortion,
                 explicitLocale: activeTurnLocale,
                 isFinal: allowShortFinalChunk
             )
-            alreadyDispatchedSafeText = speakableSafePrefix
+            // A turn reset or supersede happened while this chunk was in
+            // flight: its bookkeeping belongs to the previous stream.
+            guard dispatchEpoch == reservingDispatchEpoch else { return }
             // Wave 4: the FIRST successful dispatch flips the threshold
             // gate so subsequent dispatches use the higher 8-char floor.
             // Track total spoken character count so the speculative-
@@ -328,7 +356,35 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
             logTimeToFirstSpokenWordIfApplicable()
         } catch {
             print("⚠️ Streaming TTS submission failed: \(error.localizedDescription)")
+            // Release the reservation so a later delta can retry this text —
+            // but only if nothing advanced the cursor in the meantime.
+            if dispatchEpoch == reservingDispatchEpoch && alreadyDispatchedSafeText == speakableSafePrefix {
+                alreadyDispatchedSafeText = previouslyDispatchedSafeText
+                hasQueuedAudioForTurn = previouslyHadQueuedAudioForTurn
+            }
         }
+    }
+
+    /// Speaks a turn's FINAL answer through the same deduplicated cursor the
+    /// streamed sentences use, instead of handing the full answer to the TTS
+    /// client a second time.
+    ///
+    /// - Nothing queued yet this turn (e.g. a non-streamed fallback answer):
+    ///   the whole answer is dispatched.
+    /// - The streamed text is a prefix of the final answer: only the unspoken
+    ///   tail is dispatched (usually nothing).
+    /// - Audio was queued from text that is NOT a prefix of the final answer
+    ///   (a stream that diverged from what was committed): nothing more is
+    ///   spoken, rather than stitching a suffix of a different string or
+    ///   repeating the whole answer.
+    func speakFinalAnswerIfNeeded(_ finalAnswerText: String) async {
+        let finalSpeakableText = finalAnswerText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !finalSpeakableText.isEmpty else { return }
+        guard !hasQueuedAudioForTurn || finalSpeakableText.hasPrefix(alreadyDispatchedSafeText) else {
+            print("🔇 Final answer diverged from streamed speech; not re-speaking it.")
+            return
+        }
+        await dispatchDeltaIfReady(speakableSafePrefix: finalSpeakableText, allowShortFinalChunk: true)
     }
 
     /// On the first successful dispatch after `markIntentCommitted()`,
