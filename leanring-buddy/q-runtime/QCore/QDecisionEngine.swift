@@ -142,7 +142,8 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
         if matches(criticalHighRiskIndicators) {
             return TaskTypeClassification(taskType: .criticalHighRisk, matchedExplicitKeyword: true)
         }
-        if QArabicIntentNormalizer.containsExecutionIndicator(executionIndicators, in: normalizedIntent) {
+        if QArabicIntentNormalizer.containsExecutionIndicator(executionIndicators, in: normalizedIntent)
+            || containsExplicitResourceTarget(intent: intent) {
             return TaskTypeClassification(taskType: .execution, matchedExplicitKeyword: true)
         }
         if matches(codingIndicators) {
@@ -198,9 +199,74 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
         "read this file", "read the file", "read file", "read from ",
         // Volume / system media operations
         "change the volume", "set the volume", "adjust the volume", "turn up the volume", "turn down the volume", "mute", "unmute",
+        // Screen reading (routes to screen.ocr). Deliberately NOT "ocr" (inside "democracy") or
+        // "on screen" (inside "on screenplay") — only phrases that name the screen as a resource.
+        "visible text", "text on screen", "text on the screen", "text on my screen", "on my screen",
+        "on the screen", "on the current screen", "read the screen", "read my screen", "screen text",
         // Arabic execution indicators
-        "افتح", "اغلق", "سكر", "شغل", "انقر", "اضغط", "اكتب", "غير الصوت", "عدل الصوت", "انشئ مجلد", "اعمل مجلد"
+        "افتح", "اغلق", "سكر", "شغل", "انقر", "اضغط", "اكتب", "غير الصوت", "عدل الصوت", "انشئ مجلد", "اعمل مجلد",
+        // Arabic screen / file reading
+        "عالشاشة", "على الشاشة", "اقرا الشاشة", "اقرأ الشاشة", "اقرالي الشاشة",
+        "اقرا الملف", "اقرأ الملف", "اقرالي الملف"
     ]
+
+    // MARK: - Explicit Resource Targets
+
+    /// Absolute roots that count as a filesystem target even with a single component
+    /// (`/etc`, `/Users`). Other single-component `/word` tokens (e.g. a `/help` command) do not.
+    static let knownAbsoluteFilesystemRoots: Set<String> = [
+        "/etc", "/usr", "/bin", "/sbin", "/system", "/users", "/private", "/library",
+        "/applications", "/tmp", "/var", "/opt", "/volumes", "/cores", "/dev"
+    ]
+
+    /// True when the intent names a concrete filesystem resource — a path-shaped token
+    /// (`~/…`, `../…`, `./…`, `$HOME/…`, `/etc/passwd`, `/Users/…`) or a credential filename/
+    /// extension QResourceGuard already treats as sensitive (`id_rsa`, `.env`, `*.pem`).
+    ///
+    /// Why: a request such as "Read ~/.ssh/id_rsa" has an ambiguous verb ("read" alone is not an
+    /// execution indicator, so "I like to read" stays conversational), but its explicit resource
+    /// target makes it an action on the computer. Routing it to execution sends the target
+    /// through QResourceGuard, which denies and audits it — instead of a conversational answer
+    /// that never consults the guard. This only ever ADDS execution routing; it grants nothing:
+    /// QResourceGuard/QPermissionGate remain the sole authority over what may be accessed.
+    public static func containsExplicitResourceTarget(intent: String) -> Bool {
+        let tokenSeparators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\"'`«»“”‘’()[]{}<>,،;"))
+        // Strip sentence punctuation from the END only: a leading "." is part of `.env` / `./notes`.
+        let trailingPunctuationCharacters = Set(".,;:!?؟،")
+        let tokens = intent
+            .components(separatedBy: tokenSeparators)
+            .map { rawToken in
+                var token = Substring(rawToken)
+                while let lastCharacter = token.last, trailingPunctuationCharacters.contains(lastCharacter) {
+                    token = token.dropLast()
+                }
+                return String(token)
+            }
+            .filter { !$0.isEmpty }
+
+        return tokens.contains { token in
+            let lowercasedToken = token.lowercased()
+            if lowercasedToken.hasPrefix("~/") || lowercasedToken.hasPrefix("../")
+                || lowercasedToken.hasPrefix("./") || lowercasedToken.hasPrefix("$home/") {
+                return true
+            }
+            if lowercasedToken.hasPrefix("/") && lowercasedToken.count > 1 {
+                let pathComponents = lowercasedToken.split(separator: "/", omittingEmptySubsequences: true)
+                let firstComponentRoot = pathComponents.first.map { "/" + $0 } ?? ""
+                if pathComponents.count >= 2 || knownAbsoluteFilesystemRoots.contains(firstComponentRoot) {
+                    return true
+                }
+            }
+            let isSensitiveFilename = QResourceGuard.sensitiveFilenamePatterns.contains { pattern in
+                lowercasedToken == pattern || (pattern.hasSuffix(".") && lowercasedToken.hasPrefix(pattern))
+            }
+            if isSensitiveFilename {
+                return true
+            }
+            let fileExtension = (lowercasedToken as NSString).pathExtension
+            return lowercasedToken.contains(".") && QResourceGuard.sensitiveExtensions.contains(fileExtension)
+        }
+    }
 
     public static let codingIndicators: [String] = [
         "write a function", "write code", "write a script", "write a program",
@@ -252,6 +318,7 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
         }
         return matches(criticalHighRiskIndicators) ||
                QArabicIntentNormalizer.containsExecutionIndicator(executionIndicators, in: normalizedIntent) ||
+               containsExplicitResourceTarget(intent: intent) ||
                matches(codingIndicators) ||
                matches(planningIndicators) ||
                matches(researchIndicators)
