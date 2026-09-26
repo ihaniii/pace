@@ -41,7 +41,7 @@ const staticSurfaces: PublicSurface[] = [
     path: "/",
     markdownPath: "/index.md",
     kind: "static",
-    title: "Pace",
+    title: "HeyPace",
     description:
       "On-device macOS voice agent that listens, reads the screen, and acts with local models by default.",
     priority: "1.0",
@@ -309,7 +309,11 @@ const staticSurfaces: PublicSurface[] = [
       [
         "## Default",
         "",
-        "Pace processes voice, screen, meeting audio, and local journals on the Mac. It does not require an account and does not include analytics or telemetry SDKs.",
+        "Pace processes voice, screen, meeting audio, and local journals on the Mac. The native app does not require an account and does not include analytics or telemetry SDKs.",
+        "",
+        "## Public website analytics",
+        "",
+        "Pages on heypace.app use Microsoft Clarity for visits, session interaction, and heatmaps, plus Watchtower for aggregate route and performance measurement. The website has no Pace account or in-app voice, screen, meeting, or journal data, and the native app loads neither service.",
         "",
         "## Explicit network use",
         "",
