@@ -1329,12 +1329,15 @@ struct QCoreConversationalRoutingPhase47CTests {
             preferredBackend: .llamaCpp
         )
 
-        // Must recover as directAnswer using summary or text, NEVER as a plan to execute
+        // Must recover as directAnswer, NEVER as a plan to execute. Phase 4.7H: the action plan's
+        // `summary` is planner metadata and must not be promoted into the answer; this mock
+        // repeats the plan on the bounded retry, so the result is the safe fallback.
         guard case .directAnswer(let direct) = result else {
             Issue.record("Expected directAnswer recovery, got: \(result)")
             return
         }
-        #expect(direct.text.contains("Local AI is beneficial"))
+        #expect(!direct.text.contains("Local AI is beneficial"))
+        #expect(direct.provenance == "system:fallback")
         #expect(!direct.text.contains("test.noop"))
     }
 

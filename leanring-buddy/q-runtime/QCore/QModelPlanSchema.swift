@@ -1656,7 +1656,10 @@ public struct QModelPlanParser: Sendable {
             return ""
         }
         let afterColon = afterKey[afterKey.index(after: colonIndex)...]
-        guard let quoteIndex = afterColon.firstIndex(of: "\"") else {
+        // The value itself must be a string literal. For `"directAnswer": null` the next quote
+        // belongs to a later key (e.g. "taskPrompt") and must never be streamed as answer text.
+        guard let quoteIndex = afterColon.firstIndex(where: { !$0.isWhitespace }),
+              afterColon[quoteIndex] == "\"" else {
             return ""
         }
 

@@ -167,3 +167,20 @@ canonical tool registry.
 - **End-of-day shutdown:** narrowed and retained as `end-of-day-reset`; it now
   honestly opens Calendar and creates the promised reminder through native
   tools rather than pretending to review the schedule.
+
+## Rejected: conversational instructions in the qwen2.5:3b planner system prompt
+
+Phase 4.7H tried telling the local planner, in its **system prompt**, that a turn was
+already classified as conversational (answer in `directAnswer`, same language/dialect,
+no steps). Probed against real `qwen2.5:3b` it made answers worse, not safer:
+
+- Free-form instructions made the model abandon JSON and emit
+  `responseMode: directAnswer` / `directAnswer: …` lines as plain text.
+- A literal JSON template kept JSON but made it code-switch mid-answer
+  (`السويد ت首都是斯德哥尔摩`) and broke the Phase 6 Arabic-language check.
+
+What shipped instead: one short line appended to the **user** message
+(`Deterministic classification: conversational …`), which kept baseline JSON and
+language quality. The full conversational instructions live only in the prose-only
+bounded retry prompt. Safety never depends on the prompt: `QModelRouter` refuses
+action plans on conversational turns and never promotes plan metadata into answers.
