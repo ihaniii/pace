@@ -134,15 +134,15 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
     /// `.reasoning` (never `.simpleQA`, which would under-claim simplicity for something
     /// genuinely unclassified) with `matchedExplicitKeyword: false`.
     fileprivate static func classifyTaskType(intent: String) -> TaskTypeClassification {
-        let lowercasedIntent = intent.lowercased()
+        let normalizedIntent = QArabicIntentNormalizer.NormalizedIntent(rawIntent: intent)
         func matches(_ indicators: [String]) -> Bool {
-            indicators.contains { lowercasedIntent.contains($0) }
+            QArabicIntentNormalizer.containsSubstringIndicator(indicators, in: normalizedIntent)
         }
 
         if matches(criticalHighRiskIndicators) {
             return TaskTypeClassification(taskType: .criticalHighRisk, matchedExplicitKeyword: true)
         }
-        if matches(executionIndicators) {
+        if QArabicIntentNormalizer.containsExecutionIndicator(executionIndicators, in: normalizedIntent) {
             return TaskTypeClassification(taskType: .execution, matchedExplicitKeyword: true)
         }
         if matches(codingIndicators) {
@@ -246,12 +246,12 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
     /// Evaluates whether an intent string contains deterministic computer-side execution or mutation indicators.
     /// Used as defense-in-depth to ensure non-conversational execution routing even if taskType is advisory reasoning.
     public static func containsExecutionIndicators(intent: String) -> Bool {
-        let lowercased = intent.lowercased()
+        let normalizedIntent = QArabicIntentNormalizer.NormalizedIntent(rawIntent: intent)
         func matches(_ indicators: [String]) -> Bool {
-            indicators.contains { lowercased.contains($0) }
+            QArabicIntentNormalizer.containsSubstringIndicator(indicators, in: normalizedIntent)
         }
         return matches(criticalHighRiskIndicators) ||
-               matches(executionIndicators) ||
+               QArabicIntentNormalizer.containsExecutionIndicator(executionIndicators, in: normalizedIntent) ||
                matches(codingIndicators) ||
                matches(planningIndicators) ||
                matches(researchIndicators)
@@ -425,5 +425,190 @@ public struct QDeterministicDecisionEngine: QDecisionEngine, Sendable {
             level = .medium
         }
         return level
+    }
+}
+
+// MARK: - Arabic-Aware Indicator Matching
+
+/// Arabic orthographic normalization and indicator matching for `QDeterministicDecisionEngine`.
+///
+/// Why this exists: plain substring matching on raw text both MISSED ordinary Arabic requests
+/// (`إفتح`, `شغّل`, `فتحلي`, `بدي تفتح سفاري`) and FALSELY treated conversation as execution
+/// because short Arabic verbs occur inside unrelated words (`شو شغلك؟` "what's your job",
+/// `سكر الدم` "blood sugar", `العسكري` "the soldier"). See the Arabic golden set in
+/// `QArabicGoldenSet.swift` for every case this is measured against.
+///
+/// Safety shape (unchanged authority, deterministic, no model involvement):
+/// - English indicators keep their exact original lowercase-substring semantics.
+/// - Critical/high-risk and conversational categories keep SUBSTRING matching on normalized
+///   text, so normalization can only widen them — critical detection never narrows.
+/// - Only ARABIC EXECUTION indicators use whole-word matching with a reviewed set of attached
+///   clitics. Narrowing execution is fail-safe: a conversational turn never executes anything.
+public enum QArabicIntentNormalizer {
+
+    /// Normalizes text for indicator matching only (never shown to the user or sent to a model):
+    /// lowercases, strips Arabic diacritics (including shadda) and tatweel, maps `إ`/`آ`/`ٱ` to
+    /// bare alef, and alef maqsura to ya. Non-Arabic text is only lowercased.
+    ///
+    /// `أ` (hamza ABOVE) is deliberately kept: it marks the first person (`أفتح` "I open", as in
+    /// `بحب أفتح قلبي إلك`), which must not merge with the imperative `افتح`. `إفتح` is the
+    /// common misspelling of the imperative, so `إ` is normalized.
+    public static func normalizeForIntentMatching(_ text: String) -> String {
+        var normalizedScalars = String.UnicodeScalarView()
+        for scalar in text.lowercased().unicodeScalars {
+            switch scalar.value {
+            case 0x064B...0x065F, 0x0670, 0x0640:
+                continue
+            case 0x0622, 0x0625, 0x0671:
+                normalizedScalars.append(Unicode.Scalar(0x0627)!)
+            case 0x0649:
+                normalizedScalars.append(Unicode.Scalar(0x064A)!)
+            default:
+                normalizedScalars.append(scalar)
+            }
+        }
+        return String(normalizedScalars)
+    }
+
+    /// An intent normalized once and split into word tokens, shared by every category check.
+    public struct NormalizedIntent: Sendable {
+        public let normalizedText: String
+        public let tokens: [String]
+
+        public init(rawIntent: String) {
+            normalizedText = QArabicIntentNormalizer.normalizeForIntentMatching(rawIntent)
+            tokens = normalizedText
+                .components(separatedBy: CharacterSet.letters.union(.decimalDigits).inverted)
+                .filter { !$0.isEmpty }
+        }
+    }
+
+    static func containsArabicLetter(_ text: String) -> Bool {
+        text.unicodeScalars.contains { (0x0621...0x064A).contains($0.value) }
+    }
+
+    /// Substring semantics on normalized text (both sides normalized). For English indicators
+    /// this is identical to the original `lowercased().contains(indicator)` behaviour.
+    static func containsSubstringIndicator(_ indicators: [String], in intent: NormalizedIntent) -> Bool {
+        indicators.contains { indicator in
+            intent.normalizedText.contains(normalizeForIntentMatching(indicator))
+        }
+    }
+
+    /// Execution matching: English entries keep substring semantics; Arabic entries match whole
+    /// words (see `tokenMatchesArabicImperative`), and multi-word Arabic entries match as a
+    /// consecutive token sequence.
+    static func containsExecutionIndicator(_ indicators: [String], in intent: NormalizedIntent) -> Bool {
+        indicators.contains { indicator in
+            let normalizedIndicator = normalizeForIntentMatching(indicator)
+            guard containsArabicLetter(normalizedIndicator) else {
+                return intent.normalizedText.contains(normalizedIndicator)
+            }
+            let indicatorTokens = NormalizedIntent(rawIntent: normalizedIndicator).tokens
+            if indicatorTokens.count > 1 {
+                return containsConsecutiveTokens(indicatorTokens, in: intent.tokens)
+            }
+            guard let imperativeStem = indicatorTokens.first else { return false }
+            return intent.tokens.indices.contains { tokenIndex in
+                tokenMatchesArabicImperative(imperativeStem, atTokenIndex: tokenIndex, in: intent.tokens)
+            }
+        }
+    }
+
+    private static func containsConsecutiveTokens(_ sequence: [String], in tokens: [String]) -> Bool {
+        guard !sequence.isEmpty, tokens.count >= sequence.count else { return false }
+        return (0...(tokens.count - sequence.count)).contains { startIndex in
+            Array(tokens[startIndex..<(startIndex + sequence.count)]) == sequence
+        }
+    }
+
+    // MARK: Reviewed Arabic tables
+
+    /// Imperatives that are also common nouns: `شغل` "run" / "work", `سكر` "close" / "sugar".
+    /// A bare form only counts as a request when a recognisable target follows; with a
+    /// benefactive clitic (`شغللي`, `سكرلي`) it is unambiguous.
+    static let homographImperativeStems: Set<String> = ["شغل", "سكر"]
+
+    /// Attached pronoun/benefactive endings accepted on unambiguous imperatives
+    /// (`افتحلي`, `افتحي`, `افتحوا`, `افتحه`, `احذفهم`). Longest first.
+    static let unambiguousImperativeSuffixes: [String] = ["يلي", "ولي", "لنا", "لها", "لي", "لك", "له", "وا", "ها", "هم", "ي", "و", "ه", ""]
+
+    /// Only benefactive endings are accepted on homographs: `شغلي`/`شغلك`/`شغله` are "my/your/
+    /// his work" and `سكري` is "diabetic", so those endings must never count as requests.
+    static let homographImperativeSuffixes: [String] = ["لنا", "لي", "لك", ""]
+
+    /// Conjunctions that may attach to the front of a request: `وافتح`, `فافتح`.
+    static let attachedConjunctionPrefixes: [String] = ["و", "ف", ""]
+
+    /// Second-person request forms mapped to their imperative (`بدي تفتح سفاري`). The bare form
+    /// requires a request cue immediately before it (`الدكانة بتفتح` / `الوردة تفتح` are not
+    /// requests); with a benefactive clitic (`تفتحلي`) it is a request on its own.
+    static let secondPersonRequestForms: [String: String] = ["تفتح": "افتح", "تشغل": "شغل", "تسكر": "سكر", "تغلق": "اغلق"]
+
+    /// Colloquial imperatives that drop the initial alef; only valid with a clitic (`فتحلي`),
+    /// since bare `فتح` is the past tense "he opened".
+    static let alefDroppedImperatives: [String: String] = ["فتح": "افتح"]
+
+    static let requestCueTokens: Set<String> = normalizedTable(["بدي", "بدك", "ممكن", "بتقدر", "فيك", "فيكي", "لو", "رجاء", "please", "بليز", "ياريت"])
+
+    /// Words skipped between a homograph imperative and its target (`سكر لي سفاري`, `سكر كل التطبيقات`).
+    static let targetSearchSkippableTokens: Set<String> = normalizedTable(["لي", "لك", "هلق", "هلا", "هسا", "كل", "please", "بليز"])
+
+    /// Nouns that make a bare homograph imperative a request. Any Latin-script word also counts
+    /// (app names are commonly said in English: `شغل Calculator`).
+    static let homographTargetNouns: Set<String> = normalizedTable([
+        "الحاسبة", "حاسبة", "الآلة", "سفاري", "النوتس", "الملاحظات", "فايندر", "الفايندر",
+        "التطبيق", "تطبيق", "التطبيقات", "البرنامج", "برنامج", "البرامج", "النافذة", "الشباك",
+        "الملف", "المجلد", "الموسيقى", "موسيقى", "اغنية", "الاغنية", "الصوت", "الجهاز", "الماك",
+        "الكمبيوتر", "البلوتوث", "الواي"
+    ])
+
+    /// Tables are written in natural spelling and normalized exactly like the intent, so a
+    /// table entry can never silently fail to match because of alef maqsura, madda or diacritics.
+    private static func normalizedTable(_ entries: [String]) -> Set<String> {
+        Set(entries.map(normalizeForIntentMatching))
+    }
+
+    // MARK: Imperative matching
+
+    static func tokenMatchesArabicImperative(_ imperativeStem: String, atTokenIndex tokenIndex: Int, in tokens: [String]) -> Bool {
+        let token = tokens[tokenIndex]
+        let isHomograph = homographImperativeStems.contains(imperativeStem)
+        let allowedSuffixes = isHomograph ? homographImperativeSuffixes : unambiguousImperativeSuffixes
+
+        for conjunctionPrefix in attachedConjunctionPrefixes where token.hasPrefix(conjunctionPrefix) {
+            let tokenWithoutConjunction = String(token.dropFirst(conjunctionPrefix.count))
+            for suffix in allowedSuffixes where tokenWithoutConjunction.hasSuffix(suffix) {
+                let base = String(tokenWithoutConjunction.dropLast(suffix.count))
+                let hasClitic = !suffix.isEmpty
+
+                let isDirectImperative = base == imperativeStem
+                let isSecondPersonRequest = secondPersonRequestForms[base] == imperativeStem
+                    && (hasClitic || precedingTokenIsRequestCue(tokenIndex: tokenIndex, in: tokens))
+                let isAlefDroppedImperative = hasClitic && alefDroppedImperatives[base] == imperativeStem
+
+                guard isDirectImperative || isSecondPersonRequest || isAlefDroppedImperative else { continue }
+                if isHomograph && !hasClitic {
+                    return followingTokenIsRecognisableTarget(tokenIndex: tokenIndex, in: tokens)
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func precedingTokenIsRequestCue(tokenIndex: Int, in tokens: [String]) -> Bool {
+        tokenIndex > 0 && requestCueTokens.contains(tokens[tokenIndex - 1])
+    }
+
+    private static func followingTokenIsRecognisableTarget(tokenIndex: Int, in tokens: [String]) -> Bool {
+        var candidateIndex = tokenIndex + 1
+        while candidateIndex < tokens.count && targetSearchSkippableTokens.contains(tokens[candidateIndex]) {
+            candidateIndex += 1
+        }
+        guard candidateIndex < tokens.count else { return false }
+        let candidate = tokens[candidateIndex]
+        let isLatinWord = candidate.unicodeScalars.contains { $0.isASCII && CharacterSet.letters.contains($0) }
+        return isLatinWord || homographTargetNouns.contains(candidate)
     }
 }
