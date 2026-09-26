@@ -35,6 +35,17 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     /// update the new stream's bookkeeping when its `speakText` returns.
     private var dispatchEpoch: Int = 0
 
+    /// Per-turn presentation transform (e.g. the Palestinian Arabic style
+    /// layer) applied ONLY where text reaches the user: each spoken chunk,
+    /// the live UI mirror, and `presentedText(for:)` for history. The dispatch
+    /// cursor always tracks the RAW text, so deduplication never depends on
+    /// the transform. `nil` = identity. Cleared by `resetForNewTurn`.
+    private var presentationTransform: ((String) -> String)?
+
+    /// Raw counterpart of `inFlightStreamedText`, compared on each chunk so
+    /// the UI mirror only republishes when the raw prefix actually changed.
+    private var lastMirroredRawSpeakableText: String = ""
+
     /// Live UI mirror of the speakable text accumulated for the current
     /// turn. Updated on every chunk so SwiftUI surfaces (the chat
     /// transcript in particular) can render a streaming "assistant is
@@ -140,6 +151,8 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         alreadyDispatchedSafeText = ""
         hasQueuedAudioForTurn = false
         dispatchEpoch += 1
+        presentationTransform = nil
+        lastMirroredRawSpeakableText = ""
         intentCommittedAt = nil
         hasLoggedTimeToFirstSpokenWord = false
         isMutedForCurrentTurn = false
@@ -163,6 +176,21 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
     func finalizeInFlightStreamedTextForTurn() {
         hasFinalizedStreamedTextForTurn = true
         inFlightStreamedText = ""
+    }
+
+    /// Sets the presentation transform for the current turn only. It must be
+    /// a pure, sentence-local text function (see
+    /// `PalestinianConversationalStyler.presentationText(for:)`): it shapes
+    /// what the user hears and sees, never what the turn decided or did.
+    func setPresentationTransformForCurrentTurn(_ transform: @escaping (String) -> String) {
+        presentationTransform = transform
+    }
+
+    /// The user-facing form of `rawText` under this turn's presentation
+    /// transform — the text that is displayed and recorded as the assistant's
+    /// conversational answer, identical to what the chunks speak.
+    func presentedText(for rawText: String) -> String {
+        presentationTransform?(rawText) ?? rawText
     }
 
     /// Sets the per-turn mute flag. Called by `CompanionManager` right
@@ -216,6 +244,7 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         hasQueuedAudioForTurn = false
         dispatchEpoch += 1
         inFlightStreamedText = ""
+        lastMirroredRawSpeakableText = ""
         hasDispatchedFirstSentenceOfTurn = false
         firstSpokenWordCharacterCount = 0
     }
@@ -278,8 +307,9 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         // we STOP mirroring so the live row can't reappear over the
         // committed message — but audio dispatch below still runs, so
         // `flushFinal`'s tail still plays.
-        if !hasFinalizedStreamedTextForTurn && speakableSafePrefix != inFlightStreamedText {
-            inFlightStreamedText = speakableSafePrefix
+        if !hasFinalizedStreamedTextForTurn && speakableSafePrefix != lastMirroredRawSpeakableText {
+            lastMirroredRawSpeakableText = speakableSafePrefix
+            inFlightStreamedText = presentedText(for: speakableSafePrefix)
         }
 
         // Barge-in lock: once the user has interrupted, no more audio
@@ -338,7 +368,7 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
 
         do {
             try await ttsClient.speakText(
-                trimmedNewPortion,
+                presentedText(for: trimmedNewPortion),
                 explicitLocale: activeTurnLocale,
                 isFinal: allowShortFinalChunk
             )
@@ -484,7 +514,7 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         }()
 
         // 4. Bound to last complete sentence so we don't speak partial
-        //    words. Sentence terminators: `.` `!` `?` `\n`. Require
+        //    words. Sentence terminators: `.` `!` `?` `؟` `\n`. Require
         //    the terminator to be followed by whitespace OR end of text.
         return computeLastSentenceBoundedPrefix(of: safeFromOpenBracket)
     }
@@ -540,8 +570,11 @@ final class StreamingSentenceTTSPipeline: ObservableObject {
         // clause terminators only count when there's already enough
         // text to sound like a phrase (≥18 chars), so we don't speak
         // "hmm," or "sure," as a stub.
-        let sentenceTerminators: Set<Character> = [".", "!", "?", "\n"]
-        let clauseTerminators: Set<Character> = [",", ";", "—", ":"]
+        // Arabic: "؟" ends a sentence like "?"; "،" and "؛" are clause
+        // terminators like "," and ";" (same ≥18-char gate, so Arabic commas
+        // never fragment speech more than English commas do).
+        let sentenceTerminators: Set<Character> = [".", "!", "?", "؟", "\n"]
+        let clauseTerminators: Set<Character> = [",", ";", "—", ":", "،", "؛"]
         let minimumClauseLength: Int = 18
 
         // Walk backwards from the end, returning the prefix up to and

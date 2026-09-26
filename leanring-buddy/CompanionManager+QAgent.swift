@@ -226,6 +226,11 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         let decision: QApprovalDecision = approved ? .approved : .denied(reason: "Denied by user via HUD")
         let userTranscript = approved ? "Allow: \(request.expectedEffect)" : "Deny: \(request.expectedEffect)"
 
+        // The result is spoken through the same pipeline as every Q-Core turn, in the language
+        // of the ORIGINAL request (the synthetic "Allow:/Deny:" transcript is not the user's
+        // language). Prepared before resuming so any streamed text lands in this speech turn.
+        prepareQCoreSpeechTurn(locale: qCoreSpeechLocale(forUserText: snapshot.taskPrompt ?? ""))
+
         if approved {
             currentTurnHUDState = PaceTurnHUDState(
                 status: .acting,
@@ -260,14 +265,7 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
                 break
             }
 
-            if case .completed = result.status, !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                recordConversationTurn(userTranscript: userTranscript, assistantResponse: result.summary)
-            } else {
-                chatSession.appendCompletedTurn(userTranscript: userTranscript, assistantResponse: result.summary)
-            }
-            if !chatSession.isChatTTSMuted {
-                try? await ttsClient.speakText(result.summary)
-            }
+            await presentQCoreApprovalResult(result, userTranscript: userTranscript)
         } catch {
             recordQCoreExecutionFailed(taskId: taskId, reason: error.localizedDescription)
             currentTurnHUDState = PaceTurnHUDState.failed(error.localizedDescription)
@@ -275,6 +273,50 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         }
 
         voiceState = .idle
+    }
+
+    /// Records and speaks an approval-resumed result through the Q-Core speech pipeline:
+    /// same locale, same presentation layer, same deduplication, mute and barge-in handling
+    /// as every other Q-Core turn. Expects `prepareQCoreSpeechTurn` to have run for this turn.
+    func presentQCoreApprovalResult(_ result: QAgentResult, userTranscript: String) async {
+        let presentedSummary = streamingSentenceTTSPipeline.presentedText(for: result.summary)
+        if case .completed = result.status, !presentedSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            recordConversationTurn(userTranscript: userTranscript, assistantResponse: presentedSummary)
+        } else {
+            chatSession.appendCompletedTurn(userTranscript: userTranscript, assistantResponse: presentedSummary)
+        }
+        await streamingSentenceTTSPipeline.speakFinalAnswerIfNeeded(result.summary)
+    }
+
+    /// The TTS locale for a Q-Core speech turn, from the user's own words.
+    func qCoreSpeechLocale(forUserText userText: String) -> String {
+        // Any Arabic letter means the user spoke Arabic. Short mixed requests such as
+        // "سكّر Safari" are otherwise mis-detected (e.g. as Indonesian) and routed away from
+        // the Arabic voice — the same script rule PaceNeuralTTSClient.determineRoute applies.
+        if userText.unicodeScalars.contains(where: { (0x0621...0x064A).contains($0.value) }) {
+            return "ar"
+        }
+        return PaceSpeechVoiceResolver.detectLanguage(for: userText).flatMap { raw -> String? in
+            let base = raw.replacingOccurrences(of: "_", with: "-").lowercased().split(separator: "-").first.map(String.init) ?? raw
+            switch base {
+            case "en": return "en-US"
+            case "sv": return "sv-SE"
+            case "ar": return "ar"
+            default: return raw
+            }
+        } ?? "en-US"
+    }
+
+    /// Starts a fresh Q-Core speech turn: resets the pipeline for `locale`, applies the chat
+    /// mute, and — for Arabic turns only — the presentation-only Palestinian style layer.
+    func prepareQCoreSpeechTurn(locale: String) {
+        streamingSentenceTTSPipeline.resetForNewTurn(locale: locale)
+        streamingSentenceTTSPipeline.setMutedForCurrentTurn(chatSession.isChatTTSMuted)
+        if locale == "ar" {
+            streamingSentenceTTSPipeline.setPresentationTransformForCurrentTurn { text in
+                PalestinianConversationalStyler.presentationText(for: text)
+            }
+        }
     }
 
     // MARK: - Agent Execution Dispatch
@@ -286,20 +328,11 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         context: QAgentTurnContext? = nil,
         turnLease: PaceTurnLease? = nil
     ) async -> QAgentResult {
-        let detectedTurnLocale = PaceSpeechVoiceResolver.detectLanguage(for: transcript).flatMap { raw -> String? in
-            let base = raw.replacingOccurrences(of: "_", with: "-").lowercased().split(separator: "-").first.map(String.init) ?? raw
-            switch base {
-            case "en": return "en-US"
-            case "sv": return "sv-SE"
-            case "ar": return "ar"
-            default: return raw
-            }
-        } ?? "en-US"
+        let detectedTurnLocale = qCoreSpeechLocale(forUserText: transcript)
 
         qCoreStreamedAccumulatedText = ""
-        streamingSentenceTTSPipeline.resetForNewTurn(locale: detectedTurnLocale)
+        prepareQCoreSpeechTurn(locale: detectedTurnLocale)
         streamingSentenceTTSPipeline.markIntentCommitted()
-        streamingSentenceTTSPipeline.setMutedForCurrentTurn(chatSession.isChatTTSMuted)
 
         if (turnLease != nil && !isActiveTurn(turnLease!)) || Task.isCancelled {
             streamingSentenceTTSPipeline.drainQueueAndStopForBargeIn()
@@ -350,10 +383,13 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         case .directAnswer(let text):
             // Direct conversational answers MUST NOT mutate Current Activity
             streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
-            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                recordConversationTurn(userTranscript: transcript, assistantResponse: text)
+            // The presented (styled) answer is the conversational answer: it is what the user
+            // sees and hears, and what the next turns see as history.
+            let presentedAnswer = streamingSentenceTTSPipeline.presentedText(for: text)
+            if !presentedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: transcript, assistantResponse: presentedAnswer)
             } else {
-                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: text)
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: presentedAnswer)
             }
             // Through the pipeline's deduplicated cursor: streamed sentences
             // may still be mid-dispatch, so speaking the full answer directly
@@ -364,10 +400,11 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
         case .completed:
             recordQCoreExecutionCompleted(taskId: result.taskId)
             streamingSentenceTTSPipeline.finalizeInFlightStreamedTextForTurn()
-            if !result.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                recordConversationTurn(userTranscript: transcript, assistantResponse: result.summary)
+            let presentedSummary = streamingSentenceTTSPipeline.presentedText(for: result.summary)
+            if !presentedSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recordConversationTurn(userTranscript: transcript, assistantResponse: presentedSummary)
             } else {
-                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: result.summary)
+                chatSession.appendCompletedTurn(userTranscript: transcript, assistantResponse: presentedSummary)
             }
             await streamingSentenceTTSPipeline.speakFinalAnswerIfNeeded(result.summary)
 
