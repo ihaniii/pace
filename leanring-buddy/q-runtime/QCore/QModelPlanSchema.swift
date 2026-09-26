@@ -1813,6 +1813,11 @@ public struct QModelPlanParser: Sendable {
                 if let appName = args["appName"], appName.hasSuffix(".app") {
                     args["appName"] = String(appName.dropLast(4))
                 }
+                // A ui.open_app step that names no application is not executable. Fail closed here
+                // rather than guess; the router may recover only from the user's own request.
+                guard let appName = args["appName"], !appName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw QModelPlanParseError.missingRequiredField("step[\(index)].parameters.appName")
+                }
             }
 
             var targetResources = actionSchema.targetResources ?? []

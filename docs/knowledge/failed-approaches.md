@@ -184,3 +184,20 @@ What shipped instead: one short line appended to the **user** message
 language quality. The full conversational instructions live only in the prose-only
 bounded retry prompt. Safety never depends on the prompt: `QModelRouter` refuses
 action plans on conversational turns and never promotes plan metadata into answers.
+
+## Rejected: removing `riskLevel` from the qwen2.5:3b planner schema
+
+**Why rejected:** "Open Safari" failed (2026-09-26) because qwen2.5:3b guessed
+risk levels (`system.running_apps` at level1, `ui.open_app` at level2) that
+`QModelPlanParser` correctly rejects as `unauthorizedRiskLevel`. Dropping the
+`riskLevel` line from `QModelRouter.generateTurnPlan`'s system prompt made those
+plans parse, but it also changed which model plans are accepted everywhere
+else: "Read file from sandbox" previously failed risk validation and fell back
+to the deterministic sandbox template; without `riskLevel` the model's own
+`fs.read` plan (`path: "sandbox/file.txt"`, jailed into the sandbox) passed
+validation and read a file that does not exist, breaking
+`QAgentE2ETests.test3_safeFilesystemRead`. The prompt keeps `riskLevel`; explicit
+"open <Application>" requests recover through the deterministic fallback
+(`QModelRouter.explicitApplicationOpenName`), and the parser's risk-mismatch
+rejection is unchanged. Revisit only together with a review of every flow that
+currently relies on a risk-rejected model plan falling back to a template.

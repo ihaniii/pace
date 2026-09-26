@@ -134,6 +134,11 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
     ]
     public var localOnly: Bool = true
 
+    /// Where this router's model-inference audit records go. Production keeps the shared
+    /// logger; tests inject a logger backed by a temporary file so they never write into the
+    /// user's real `q-audit.log`.
+    public var auditLogger: QAuditLogger = .shared
+
     public init(localOnly: Bool = true) {
         self.localOnly = localOnly
         registerDefaultBackends()
@@ -295,7 +300,7 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
         let duration = Date().timeIntervalSince(start)
 
         // 3. Audit Logging
-        QAuditLogger.shared.record(
+        auditLogger.record(
             QAuditRecord(
                 sessionId: "model-session",
                 taskId: "inference",
@@ -353,7 +358,7 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
         let response = try await targetBackend.streamInference(request: request, onEvent: onEvent)
         let duration = Date().timeIntervalSince(start)
 
-        QAuditLogger.shared.record(
+        auditLogger.record(
             QAuditRecord(
                 sessionId: "model-session",
                 taskId: "inference-stream",
@@ -890,6 +895,29 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             )
             steps = [step0, step1]
         }
+        // Single Step: explicit "open <Application>" request. The application name comes only
+        // from the user's own request (`task.intent`), never from the failed model output, and
+        // the step carries ui.open_app's registered risk level. QResourceGuard, QPermissionGate,
+        // application resolution and verification still decide whether it runs.
+        else if let explicitApplicationName = Self.explicitApplicationOpenName(fromUserRequest: task.intent) {
+            guard let openApplicationRiskLevel = QModelPlanParser.registeredCapabilities["ui.open_app"]?.defaultRisk else {
+                return nil
+            }
+            steps = [
+                QPlanStep(
+                    index: 0,
+                    action: QPlannedAction(
+                        actionName: "ui.open_app",
+                        toolFamily: "app",
+                        riskLevel: openApplicationRiskLevel,
+                        literalAction: "Launch \(explicitApplicationName) app",
+                        targetResources: [explicitApplicationName],
+                        arguments: ["appName": explicitApplicationName]
+                    ),
+                    description: "Launch \(explicitApplicationName) application"
+                )
+            ]
+        }
         // Single Step: Running Apps
         else if intentLower.contains("running") || intentLower.contains("applications") || intentLower.contains("processes") {
             steps = [
@@ -1038,6 +1066,68 @@ public final class QModelRouter: QConversationalModelProvider, QDecisionContextA
             taskPrompt: task.intent,
             steps: steps
         )
+    }
+
+    // MARK: - Explicit Application Open (deterministic recovery)
+
+    /// Words that make an "open …" request something other than a plain application name, so
+    /// the request is left to the other deterministic branches or fails closed.
+    private static let nonApplicationOpenWords: Set<String> = [
+        "a", "an", "the", "my", "this", "that", "it", "new", "another", "some", "all",
+        "and", "then", "or", "with", "in", "on", "to", "from", "for", "at", "of", "by",
+        "app", "apps", "application", "applications",
+        "file", "files", "folder", "document", "tab", "window", "link", "url", "website", "page",
+        "clipboard", "screen", "sandbox", "running", "processes"
+    ]
+
+    private static let maximumExplicitApplicationNameWordCount = 4
+    private static let maximumExplicitApplicationNameLength = 48
+
+    /// Returns the application name from a request that is exactly "open <Application>"
+    /// (optionally "please open …", "… app", or trailing punctuation), or nil when the request
+    /// is anything else or the name is not a plain application name. Case is preserved;
+    /// application resolution is case-insensitive. Reads only the user's own request text.
+    public static func explicitApplicationOpenName(fromUserRequest userRequest: String) -> String? {
+        var requestWords = userRequest
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".!?")))
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+
+        if requestWords.first?.lowercased() == "please" {
+            requestWords.removeFirst()
+        }
+        guard requestWords.first?.lowercased() == "open" else {
+            return nil
+        }
+        requestWords.removeFirst()
+
+        if let lastWord = requestWords.last?.lowercased(), requestWords.count > 1, lastWord == "app" || lastWord == "application" {
+            requestWords.removeLast()
+        }
+        if let lastWord = requestWords.last, lastWord.lowercased().hasSuffix(".app"), lastWord.count > 4 {
+            requestWords[requestWords.count - 1] = String(lastWord.dropLast(4))
+        }
+
+        guard !requestWords.isEmpty, requestWords.count <= maximumExplicitApplicationNameWordCount else {
+            return nil
+        }
+
+        let allowedApplicationNameCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.&+'-")
+        for applicationNameWord in requestWords {
+            guard !nonApplicationOpenWords.contains(applicationNameWord.lowercased()),
+                  applicationNameWord.unicodeScalars.allSatisfy({ allowedApplicationNameCharacters.contains($0) }) else {
+                return nil
+            }
+        }
+        guard let firstScalar = requestWords[0].unicodeScalars.first, CharacterSet.letters.contains(firstScalar) else {
+            return nil
+        }
+
+        let applicationName = requestWords.joined(separator: " ")
+        guard applicationName.count <= maximumExplicitApplicationNameLength else {
+            return nil
+        }
+        return applicationName
     }
 
     // MARK: - Conversational Direct Answer Recovery (Phase 4.7C)
