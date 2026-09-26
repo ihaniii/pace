@@ -1817,6 +1817,17 @@ public struct QModelPlanParser: Sendable {
 
             var targetResources = actionSchema.targetResources ?? []
             if actionSchema.actionName == "fs.write_sandbox" || actionSchema.actionName == "fs.read" {
+                // SECURITY: when the model omits `path` but names a target, that target IS the
+                // requested resource. Adopt it so the branches below route it exactly like an
+                // explicit path — relative → jailed into the sandbox, absolute/`~` → evaluated by
+                // QResourceGuard (e.g. `~/.ssh/id_rsa` is denied). Substituting the benign sandbox
+                // default here would drop the requested resource before the guard ever saw it
+                // and report success for a forbidden request. The default below now applies only
+                // when there is no requested target at all.
+                if args["path"] == nil,
+                   let requestedTargetPath = targetResources.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                    args["path"] = requestedTargetPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
                 if let p = args["path"], !p.hasPrefix("/") && !p.hasPrefix("~") {
                     let sanitized = p.replacingOccurrences(of: " ", with: "-")
                     let filename = (sanitized.isEmpty || sanitized == "sandbox-file") ? "test-sandbox-data.txt" : sanitized
