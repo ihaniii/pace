@@ -708,7 +708,7 @@ private struct PaceMenuBarOverlayView: View {
             if companionControlCenter.preferences.isCompanionModeEnabled {
                 return "Que — \(companionControlCenter.runtimeStatusText)"
             }
-            return companionManager.isLMStudioReachable ? "Que" : "Local offline"
+            return companionManager.isLocalPlannerReachable ? "Que" : "Local offline"
         case .listening:
             return "Listening"
         case .processing:

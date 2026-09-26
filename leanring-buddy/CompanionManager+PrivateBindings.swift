@@ -3,7 +3,7 @@
 //  leanring-buddy
 //
 //  Extracted from CompanionManager.swift (god-class decomposition):
-//  permission polling, LM Studio reachability, barge-in VAD, wake-word, and shortcut bindings.
+//  permission polling, local planner reachability, barge-in VAD, wake-word, and shortcut bindings.
 //
 
 import AppKit
@@ -23,32 +23,29 @@ extension CompanionManager {
         }
     }
 
-    /// Polls the configured LM Studio HTTP root every 5 seconds so the
-    /// panel can show a live "is the backend up?" indicator. 5s is fast
-    /// enough that flipping LM Studio on/off feels responsive while
+    /// Polls the configured local planner's HTTP server every 5 seconds so
+    /// the panel can show a live "is the backend up?" indicator. 5s is fast
+    /// enough that starting/stopping the server feels responsive while
     /// staying well under one request per second of background traffic.
-    func startLMStudioReachabilityPolling() {
+    func startLocalPlannerReachabilityPolling() {
         // Fire once immediately so the panel doesn't sit on a stale
         // "not reachable" before the first 5-second tick.
-        Task { [weak self] in await self?.refreshLMStudioReachability() }
+        Task { [weak self] in await self?.refreshLocalPlannerReachability() }
 
-        lmStudioReachabilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            Task { [weak self] in await self?.refreshLMStudioReachability() }
+        localPlannerReachabilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { [weak self] in await self?.refreshLocalPlannerReachability() }
         }
     }
 
-    /// Sends a HEAD-equivalent GET to LM Studio's /v1/models endpoint
-    /// with a 2s timeout. Any 2xx response = reachable. Read the planner
-    /// base URL from Info.plist so the check tracks whichever endpoint
-    /// the runtime actually uses.
-    func refreshLMStudioReachability() async {
-        let baseURLString = AppBundleConfiguration.stringValue(forKey: "LocalPlannerBaseURL")
-            ?? "http://127.0.0.1:1234/v1"
-        let localPlannerBaseURL = PaceLocalEndpointGuard.resolvedLocalOpenAICompatibleBaseURL(
-            configuredURLString: baseURLString,
-            settingName: "LocalPlannerBaseURL"
-        )
-        let modelsURL = localPlannerBaseURL.appendingPathComponent("models")
+    /// Sends a GET to the local planner's /models endpoint with a 2s
+    /// timeout. Any 2xx response = reachable. The base URL comes from
+    /// `PaceLocalPlannerBackendSettings.effectiveBaseURL()` — the same
+    /// resolution the planner uses (env → UserDefaults → Info.plist →
+    /// default) — so the indicator follows a backend switch.
+    func refreshLocalPlannerReachability() async {
+        let localPlannerBaseURL = PaceLocalPlannerBackendSettings.effectiveBaseURL()
+        let modelsURL = PaceLocalPlannerBackendSettings.reachabilityProbeURL(plannerBaseURL: localPlannerBaseURL)
+        let localPlannerBackendDisplayName = PaceLocalPlannerBackendSettings.backendDisplayName(url: localPlannerBaseURL)
 
         var request = URLRequest(url: modelsURL)
         request.httpMethod = "GET"
@@ -65,10 +62,10 @@ extension CompanionManager {
         }
 
         await MainActor.run {
-            if self.isLMStudioReachable != reachable {
-                print("🧠 LM Studio reachability: \(reachable ? "up" : "down")")
+            if self.isLocalPlannerReachable != reachable {
+                print("🧠 Local planner reachability (\(localPlannerBackendDisplayName) at \(modelsURL.absoluteString)): \(reachable ? "up" : "down")")
             }
-            self.isLMStudioReachable = reachable
+            self.isLocalPlannerReachable = reachable
         }
     }
 

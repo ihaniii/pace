@@ -98,6 +98,24 @@ public enum PaceLocalPlannerBackendSettings {
         return url.port == 1234
     }
 
+    /// The endpoint the local-planner reachability indicator probes: the planner's
+    /// OpenAI-compatible model list, answered by both Ollama and LM Studio.
+    public static func reachabilityProbeURL(plannerBaseURL: URL) -> URL {
+        return plannerBaseURL.appendingPathComponent("models")
+    }
+
+    /// User-facing name of the server behind a planner endpoint, so the UI names the
+    /// backend the planner actually uses instead of assuming LM Studio.
+    public static func backendDisplayName(url: URL) -> String {
+        if isLMStudioBackend(url: url) {
+            return "LM Studio"
+        }
+        if url.port == 11434 {
+            return "Ollama"
+        }
+        return "local server"
+    }
+
     /// Switch active local planner configuration to Ollama.
     public static func switchToOllama() {
         UserDefaults.standard.set(PaceLocalPlannerPreset.ollama.rawValue, forKey: activePresetKey)

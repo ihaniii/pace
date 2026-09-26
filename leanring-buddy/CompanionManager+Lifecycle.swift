@@ -326,7 +326,7 @@ extension CompanionManager {
             }
         }
         startPermissionPolling()
-        startLMStudioReachabilityPolling()
+        startLocalPlannerReachabilityPolling()
         bindVoiceStateObservation()
         bindQueuedChatTurnDrainObservation()
         bindAudioPowerLevel()

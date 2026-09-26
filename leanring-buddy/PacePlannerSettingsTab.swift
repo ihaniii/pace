@@ -88,8 +88,8 @@ struct PacePlannerSettingsTab: View {
         switch plannerTier {
         case .local:
             return (
-                "Local — LM Studio",
-                "On-device reasoner (gemma-3-12b by default). Free. Nothing leaves your Mac."
+                "Local — Ollama",
+                "On-device reasoner (\(PaceLocalPlannerPreset.ollama.defaultModelIdentifier) by default). Free. Nothing leaves your Mac."
             )
         case .cliBridge:
             return (
@@ -138,20 +138,23 @@ struct PacePlannerSettingsTab: View {
     }
 
     private var plannerLocalDetailPanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("LM Studio")
+        let localPlannerBackendDisplayName = PaceLocalPlannerBackendSettings.backendDisplayName(
+            url: PaceLocalPlannerBackendSettings.effectiveBaseURL()
+        )
+        return VStack(alignment: .leading, spacing: 8) {
+            Text("Local planner (\(localPlannerBackendDisplayName))")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(DS.Colors.textSecondary)
             HStack(spacing: 8) {
                 Circle()
-                    .fill(companionManager.isLMStudioReachable ? DS.Colors.success : DS.Colors.warning)
+                    .fill(companionManager.isLocalPlannerReachable ? DS.Colors.success : DS.Colors.warning)
                     .frame(width: 8, height: 8)
-                Text(companionManager.isLMStudioReachable ? "Reachable" : "Not reachable — open LM Studio and load the configured model.")
+                Text(companionManager.isLocalPlannerReachable ? "Reachable" : "Not reachable — start \(localPlannerBackendDisplayName) and load the configured model.")
                     .font(.system(size: 12))
                     .foregroundColor(DS.Colors.textTertiary)
                 Spacer()
             }
-            Text("Default model: google/gemma-3-12b. Configure model name via Info.plist key LocalPlannerModelIdentifier.")
+            Text("Default: Ollama with \(PaceLocalPlannerPreset.ollama.defaultModelIdentifier). Configure the model via Info.plist key LocalPlannerModelIdentifier.")
                 .font(.system(size: 11))
                 .foregroundColor(DS.Colors.textTertiary)
         }
@@ -227,7 +230,7 @@ struct PacePlannerSettingsTab: View {
             Text("Apple Foundation Models")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(DS.Colors.textSecondary)
-            Text("Free, on-device. Requires Apple Intelligence to be enabled in System Settings. Best for short voice answers and routine tool calls. For harder action plans, upgrade to Local — LM Studio.")
+            Text("Free, on-device. Requires Apple Intelligence to be enabled in System Settings. Best for short voice answers and routine tool calls. For harder action plans, upgrade to the Local planner.")
                 .font(.system(size: 12))
                 .foregroundColor(DS.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -236,17 +239,18 @@ struct PacePlannerSettingsTab: View {
                     NSWorkspace.shared.open(appleIntelligenceURL)
                 }
             }
-            if companionManager.isLMStudioReachable {
-                // LM Studio is already running on the user's machine —
-                // surface the upgrade affordance prominently. This is the
-                // one-click hop from "first-run default" to "best quality"
-                // promised by docs/prds/first-run-experience.md.
+            if companionManager.isLocalPlannerReachable {
+                // The configured local planner server is already running on
+                // the user's machine — surface the upgrade affordance
+                // prominently. This is the one-click hop from "first-run
+                // default" to "best quality" promised by
+                // docs/prds/first-run-experience.md.
                 Divider().background(DS.Colors.borderSubtle).padding(.vertical, 4)
-                Text("LM Studio is running locally — upgrade for better quality on hard action plans.")
+                Text("A local planner (\(PaceLocalPlannerBackendSettings.backendDisplayName(url: PaceLocalPlannerBackendSettings.effectiveBaseURL()))) is running — upgrade for better quality on hard action plans.")
                     .font(.system(size: 11))
                     .foregroundColor(DS.Colors.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
-                paceSettingsButton("Upgrade to Local — LM Studio", systemName: "arrow.up.circle") {
+                paceSettingsButton("Upgrade to Local planner", systemName: "arrow.up.circle") {
                     companionManager.setActivePlannerTier(.local)
                 }
             }

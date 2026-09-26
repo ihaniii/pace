@@ -2,12 +2,12 @@
 //  PaceModelStatusView.swift
 //  leanring-buddy
 //
-//  Notch-panel "model readiness" rows: LM Studio reachability, the two
+//  Notch-panel "model readiness" rows: local planner reachability, the two
 //  active planner identifiers (main + answers), the ASR provider
 //  readiness, and the active TTS voice with upgrade hints. Each row is
 //  read-only — swapping the planner today still requires editing
 //  Info.plist and rebuilding — but surfacing the values in the panel
-//  saves users a debugging round when LM Studio isn't loaded or a
+//  saves users a debugging round when the planner server isn't up or a
 //  better Apple voice should be installed.
 //
 //  Extracted from CompanionPanelView.swift; the four rows used to live
@@ -24,35 +24,38 @@ struct PaceModelStatusView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            lmStudioStatusRow
+            localPlannerStatusRow
             activePlannerInfoRow
             transcriptionProviderInfoRow
             ttsVoiceInfoRow
         }
     }
 
-    /// Live indicator of whether Pace's configured LM Studio HTTP endpoint
-    /// is reachable. Most user "Pace isn't responding" reports trace back
-    /// to LM Studio being closed or not having loaded its models yet —
-    /// surfacing the state in the panel saves a round of debugging.
-    private var lmStudioStatusRow: some View {
-        HStack(spacing: 8) {
-            Image(systemName: companionManager.isLMStudioReachable
+    /// Live indicator of whether Pace's configured local planner server
+    /// (Ollama, LM Studio, …) is reachable. Most user "Pace isn't responding"
+    /// reports trace back to that server being closed or not having loaded
+    /// its model yet — surfacing the state in the panel saves a round of debugging.
+    private var localPlannerStatusRow: some View {
+        let localPlannerBackendDisplayName = PaceLocalPlannerBackendSettings.backendDisplayName(
+            url: PaceLocalPlannerBackendSettings.effectiveBaseURL()
+        )
+        return HStack(spacing: 8) {
+            Image(systemName: companionManager.isLocalPlannerReachable
                   ? "checkmark.seal.fill"
                   : "exclamationmark.triangle.fill")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundColor(companionManager.isLMStudioReachable
+                .foregroundColor(companionManager.isLocalPlannerReachable
                                  ? DS.Colors.success
                                  : DS.Colors.warning)
                 .frame(width: 16)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("LM Studio")
+                Text("Local planner (\(localPlannerBackendDisplayName))")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DS.Colors.textSecondary)
 
-                if !companionManager.isLMStudioReachable {
-                    Text("Not running — open LM Studio and load the models. See SETUP_LOCAL.md.")
+                if !companionManager.isLocalPlannerReachable {
+                    Text("Not running — start \(localPlannerBackendDisplayName) and load the planner model. See SETUP_LOCAL.md.")
                         .font(.system(size: 11))
                         .foregroundColor(DS.Colors.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)

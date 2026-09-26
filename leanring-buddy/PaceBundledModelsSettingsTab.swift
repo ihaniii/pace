@@ -192,7 +192,7 @@ struct PaceBundledModelsSettingsTab: View {
     ) -> (title: String, subtitle: String) {
         switch plannerTier {
         case .local:
-            return ("Local — LM Studio", "On-device reasoner. Free. Uses the most RAM.")
+            return ("Local — Ollama", "On-device reasoner (\(PaceLocalPlannerPreset.ollama.defaultModelIdentifier)). Free. Uses the most RAM.")
         case .appleFoundationModels:
             return ("Apple Foundation Models", "On-device 3B model. Free. Frees planner RAM.")
         case .cliDirect:

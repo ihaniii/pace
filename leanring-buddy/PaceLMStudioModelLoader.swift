@@ -12,6 +12,11 @@
 //    doesn't pay the cold-load tax (which is typically 5-15s on a
 //    14B class model).
 //
+//  Gated on configuration: only models actually served by LM Studio (a planner
+//  or screen-analysis endpoint on port 1234) are warmed or kept alive, and the
+//  keepalive only runs once LM Studio has answered. With the planner on Ollama
+//  and screen analysis off (or LM Studio not running), this sends nothing.
+//
 //  Failures are non-fatal: if LM Studio is offline at launch, Pace
 //  starts anyway and the first voice turn will hit the existing error path.
 //  LM Studio remains the owner of model unloading; Pace must not unload a
@@ -55,38 +60,39 @@ enum PaceLMStudioModelLoader {
             )
             return
         }
+        guard !configuredWarmupTargets().isEmpty else {
+            print("🔥 LM Studio warmup: skipped — neither the planner nor screen analysis is configured for LM Studio")
+            return
+        }
         Task.detached(priority: .userInitiated) {
-            await warmUpConfiguredModels()
-            await startKeepaliveLoopIfNotRunning()
+            let wasLMStudioReachable = await warmUpConfiguredModels()
+            // An unreachable LM Studio gets no recurring pings.
+            if shouldStartKeepalive(targets: configuredWarmupTargets(), isLMStudioReachable: wasLMStudioReachable) {
+                await startKeepaliveLoopIfNotRunning()
+            }
         }
     }
 
-    /// Awaitable version for tests / one-shot scripts.
-    static func warmUpConfiguredModels() async {
+    /// Awaitable version for tests / one-shot scripts. Returns whether LM Studio
+    /// was reachable; always false when no configured model is served by LM Studio.
+    @discardableResult
+    static func warmUpConfiguredModels() async -> Bool {
         guard !PaceBundledModelsSettings.isUsingMLXInProcessPlanner() else {
-            return
+            return false
         }
-        let configuredPlannerIdentifier =
-            AppBundleConfiguration
-            .stringValue(forKey: "LocalPlannerModelIdentifier")
-            ?? "qwen3-4b-instruct"
-        let useLocalVLM =
-            AppBundleConfiguration
-            .stringValue(forKey: "UseLocalVLMForScreenContext")?
-            .lowercased() == "true"
-        let vlmModelIdentifier =
-            AppBundleConfiguration
-            .stringValue(forKey: "LocalVLMModelIdentifier")
-            ?? "ui-venus-1.5-2b"
+        let warmupTargets = configuredWarmupTargets()
+        guard !warmupTargets.isEmpty else {
+            return false
+        }
         print(
-            "🔥 LM Studio warmup: starting (planner=\(configuredPlannerIdentifier), vlm=\(useLocalVLM ? vlmModelIdentifier : "off"))"
+            "🔥 LM Studio warmup: starting (planner=\(warmupTargets.plannerModelIdentifier ?? "not on LM Studio"), vlm=\(warmupTargets.vlmModelIdentifier ?? "not on LM Studio"))"
         )
 
         guard await isLMStudioReachable() else {
             print(
                 "⚠️  LM Studio warmup: server unreachable at 127.0.0.1:1234. Start LM Studio and ensure JIT loading is on."
             )
-            return
+            return false
         }
 
         // Resolve the planner identifier against what's actually
@@ -95,20 +101,27 @@ enum PaceLMStudioModelLoader {
         // caches that for the rest of the session — every subsequent
         // LocalPlannerClient picks it up via PacePlannerModelResolver
         // .resolvedIdentifier instead of 404ing.
-        let plannerModelIdentifier = await PacePlannerModelResolver.resolveAndCache(
-            configuredIdentifier: configuredPlannerIdentifier,
-            plannerBaseURL: lmStudioBaseURL.appendingPathComponent("v1")
-        )
+        var plannerModelIdentifier: String?
+        if let configuredPlannerIdentifier = warmupTargets.plannerModelIdentifier {
+            plannerModelIdentifier = await PacePlannerModelResolver.resolveAndCache(
+                configuredIdentifier: configuredPlannerIdentifier,
+                plannerBaseURL: lmStudioBaseURL.appendingPathComponent("v1")
+            )
+        }
 
         // Run independent model warmups concurrently. When one multimodal
         // model serves both roles, warm it only once; duplicate concurrent
         // requests make LM Studio create a wasteful `:2` instance.
-        async let plannerWarmup: Void = sendChatCompletionWarmup(
-            modelIdentifier: plannerModelIdentifier,
-            role: "planner"
-        )
+        async let plannerWarmup: Void = {
+            guard let plannerModelIdentifier else { return }
+            await sendChatCompletionWarmup(
+                modelIdentifier: plannerModelIdentifier,
+                role: "planner"
+            )
+        }()
         async let vlmWarmup: Void = {
-            guard useLocalVLM, vlmModelIdentifier != plannerModelIdentifier else { return }
+            guard let vlmModelIdentifier = warmupTargets.vlmModelIdentifier,
+                  vlmModelIdentifier != plannerModelIdentifier else { return }
             await sendChatCompletionWarmup(
                 modelIdentifier: vlmModelIdentifier,
                 role: "VLM"
@@ -116,6 +129,69 @@ enum PaceLMStudioModelLoader {
         }()
         _ = await (plannerWarmup, vlmWarmup)
         print("🔥 LM Studio warmup: complete")
+        return true
+    }
+
+    // MARK: - Which models LM Studio actually serves
+
+    /// The models this loader may warm and keep alive. A nil identifier means
+    /// that role is not served by LM Studio, so it gets no warmup and no pings.
+    struct WarmupTargets: Equatable {
+        let plannerModelIdentifier: String?
+        let vlmModelIdentifier: String?
+
+        var isEmpty: Bool { plannerModelIdentifier == nil && vlmModelIdentifier == nil }
+    }
+
+    /// Pure decision: a role is an LM Studio target only when its resolved endpoint
+    /// is LM Studio (port 1234) and it is not served in-process. The VLM is dropped
+    /// when it is the same model as the planner target (one model, one warmup).
+    nonisolated static func warmupTargets(
+        plannerBaseURL: URL,
+        plannerModelIdentifier: String,
+        isPlannerServedInProcess: Bool,
+        isScreenAnalysisEnabled: Bool,
+        vlmBaseURL: URL,
+        vlmModelIdentifier: String,
+        isVLMServedInProcess: Bool
+    ) -> WarmupTargets {
+        let isPlannerOnLMStudio = !isPlannerServedInProcess
+            && PaceLocalPlannerBackendSettings.isLMStudioBackend(url: plannerBaseURL)
+        let plannerTarget = isPlannerOnLMStudio ? plannerModelIdentifier : nil
+
+        let isVLMOnLMStudio = isScreenAnalysisEnabled
+            && !isVLMServedInProcess
+            && PaceLocalPlannerBackendSettings.isLMStudioBackend(url: vlmBaseURL)
+        let vlmTarget = isVLMOnLMStudio && vlmModelIdentifier != plannerTarget ? vlmModelIdentifier : nil
+
+        return WarmupTargets(plannerModelIdentifier: plannerTarget, vlmModelIdentifier: vlmTarget)
+    }
+
+    /// The keepalive only makes sense for models LM Studio serves, and only once
+    /// LM Studio has answered; otherwise it would post to a closed port every minute.
+    nonisolated static func shouldStartKeepalive(targets: WarmupTargets, isLMStudioReachable: Bool) -> Bool {
+        !targets.isEmpty && isLMStudioReachable
+    }
+
+    /// `warmupTargets` for the live configuration: the planner endpoint the planner
+    /// client resolves, and the screen-analysis endpoint `LocalVLMClient` resolves.
+    /// (`InProcessVLMClient` is never available, so only bundled MLX serves the VLM in-process.)
+    static func configuredWarmupTargets() -> WarmupTargets {
+        warmupTargets(
+            plannerBaseURL: PaceLocalPlannerBackendSettings.effectiveBaseURL(),
+            plannerModelIdentifier: PaceLocalPlannerBackendSettings.effectiveModelIdentifier(),
+            isPlannerServedInProcess: PaceBundledModelsSettings.isUsingMLXInProcessPlanner(),
+            isScreenAnalysisEnabled: AppBundleConfiguration
+                .stringValue(forKey: "UseLocalVLMForScreenContext")?
+                .lowercased() == "true",
+            vlmBaseURL: PaceLocalEndpointGuard.resolvedLocalOpenAICompatibleBaseURL(
+                configuredURLString: AppBundleConfiguration.stringValue(forKey: "LocalVLMBaseURL"),
+                settingName: "LocalVLMBaseURL"
+            ),
+            vlmModelIdentifier: AppBundleConfiguration.stringValue(forKey: "LocalVLMModelIdentifier")
+                ?? "ui-venus-1.5-2b",
+            isVLMServedInProcess: PaceBundledModelsSettings.isUsingMLXInProcessVLM()
+        )
     }
 
     /// Quick reachability check: hit `/v1/models` with a 2-second
@@ -234,23 +310,23 @@ enum PaceLMStudioModelLoader {
     /// Failures are silent — the model is either temporarily busy or
     /// has been unloaded by another agent; either way the next ping
     /// will catch it.
+    /// Re-checks configuration and reachability every tick, so a role moved off
+    /// LM Studio (or an LM Studio that quit) stops receiving pings.
     private static func sendKeepalivePings() async {
-        let plannerIdentifier =
-            PacePlannerModelResolver.resolvedIdentifier
-            ?? AppBundleConfiguration.stringValue(forKey: "LocalPlannerModelIdentifier")
-            ?? "qwen3-4b-instruct"
-        let useLocalVLM =
-            AppBundleConfiguration
-            .stringValue(forKey: "UseLocalVLMForScreenContext")?
-            .lowercased() == "true"
-        let vlmIdentifier =
-            AppBundleConfiguration
-            .stringValue(forKey: "LocalVLMModelIdentifier")
-            ?? "ui-venus-1.5-2b"
+        let warmupTargets = configuredWarmupTargets()
+        guard !warmupTargets.isEmpty, await isLMStudioReachable() else { return }
 
-        async let plannerPing: Void = sendSingleKeepalivePing(modelIdentifier: plannerIdentifier)
+        let plannerIdentifier = warmupTargets.plannerModelIdentifier.map { configuredPlannerIdentifier in
+            PacePlannerModelResolver.resolvedIdentifier ?? configuredPlannerIdentifier
+        }
+
+        async let plannerPing: Void = {
+            guard let plannerIdentifier else { return }
+            await sendSingleKeepalivePing(modelIdentifier: plannerIdentifier)
+        }()
         async let vlmPing: Void = {
-            guard useLocalVLM, vlmIdentifier != plannerIdentifier else { return }
+            guard let vlmIdentifier = warmupTargets.vlmModelIdentifier,
+                  vlmIdentifier != plannerIdentifier else { return }
             await sendSingleKeepalivePing(modelIdentifier: vlmIdentifier)
         }()
         _ = await (plannerPing, vlmPing)

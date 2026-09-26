@@ -154,11 +154,14 @@ final class CompanionManager: ObservableObject {
 
     let activeTTSVoiceSummary: PaceTTSVoiceSummary = PaceTTSVoiceSummary.current()
 
-    /// True when the configured LM Studio (or compatible) HTTP server
-    /// responds within a short timeout. Polled periodically so the panel
-    /// can show a "LM Studio not running" hint without the user having to
-    /// push-to-talk and watch for silent failure.
-    @Published var isLMStudioReachable = false
+    /// True when the configured local planner's HTTP server (Ollama, LM Studio,
+    /// or another OpenAI-compatible loopback server, per
+    /// `PaceLocalPlannerBackendSettings.effectiveBaseURL()`) responds within a
+    /// short timeout. Polled periodically so the panel can show a "planner not
+    /// running" hint without the user having to push-to-talk and watch for
+    /// silent failure. Not an LM Studio signal: LM Studio warmup for the screen
+    /// model has its own probe in `PaceLMStudioModelLoader`.
+    @Published var isLocalPlannerReachable = false
 
     /// Screen location (global AppKit coords) of a detected UI element the
     /// buddy should fly to and point at. Parsed from Claude's response;
@@ -800,7 +803,7 @@ final class CompanionManager: ObservableObject {
     /// two policies (toggle and PTT) compose cleanly.
     var wakeWordPTTBridgeCancellable: AnyCancellable?
     var accessibilityCheckTimer: Timer?
-    var lmStudioReachabilityCheckTimer: Timer?
+    var localPlannerReachabilityCheckTimer: Timer?
     var pendingKeyboardShortcutStartTask: Task<Void, Never>?
     var lastCalendarRetrievalRefreshAt: Date?
     var lastCalendarRetrievalAuthorizationStatus: EKAuthorizationStatus?

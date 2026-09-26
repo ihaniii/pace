@@ -268,7 +268,7 @@ extension CompanionManager {
 
     func startCompanionRuntimeIfEnabled() {
         let preferences = companionControlCenter.preferences
-        companionControlCenter.updateLocalModelReadiness(isLMStudioReachable)
+        companionControlCenter.updateLocalModelReadiness(isLocalPlannerReachable)
         guard preferences.isCompanionModeEnabled else { return }
         companionPreferencesChanged(preferences)
     }
