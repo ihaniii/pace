@@ -23,7 +23,7 @@ struct QAuditLoggerTestProcessIsolationTests {
     // MARK: - Fixtures
 
     private static let validXCTestMarkerEnvironment = [
-        QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: "/private/var/folders/fake/pace.xctestconfiguration"
+        PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: "/private/var/folders/fake/pace.xctestconfiguration"
     ]
 
     /// A fresh, test-owned sandbox holding a fake temp root, a fake
@@ -54,8 +54,9 @@ struct QAuditLoggerTestProcessIsolationTests {
             temporaryRootURL overridingTemporaryRootURL: URL? = nil,
             processIdentifier: Int32 = 4242,
             uniqueToken: String = UUID().uuidString
-        ) -> QAuditTestHostLogDestination {
-            QAuditLogger.resolveTestHostLogDestination(
+        ) -> PaceTestHostLogDestination {
+            PaceTestHostAuditIsolation.resolveTestHostLogDestination(
+                logFileName: QAuditLogger.auditLogFileName,
                 environment: environment,
                 isXCTestRuntimeLoaded: isXCTestRuntimeLoaded,
                 temporaryRootDirectoryURL: overridingTemporaryRootURL ?? temporaryRootURL,
@@ -76,13 +77,13 @@ struct QAuditLoggerTestProcessIsolationTests {
         return QAuditLogger.productionDefaultLogFileURL(applicationSupportDirectoryURL: realApplicationSupportURL)
     }
 
-    private static func isolatedLogURL(from destination: QAuditTestHostLogDestination) -> URL? {
+    private static func isolatedLogURL(from destination: PaceTestHostLogDestination) -> URL? {
         if case .isolatedTemporaryLog(let isolatedLogFileURL) = destination { return isolatedLogFileURL }
         return nil
     }
 
-    private static func isMemoryOnly(_ destination: QAuditTestHostLogDestination) -> Bool {
-        if case .memoryOnly = destination { return true }
+    private static func isMemoryOnly(_ destination: PaceTestHostLogDestination) -> Bool {
+        if case .isolationUnavailable = destination { return true }
         return false
     }
 
@@ -129,7 +130,8 @@ struct QAuditLoggerTestProcessIsolationTests {
 
         // No marker, no secondary signal, no XCTest runtime → the resolver
         // defers to init's unchanged production branch.
-        let destination = QAuditLogger.resolveTestHostLogDestination(
+        let destination = PaceTestHostAuditIsolation.resolveTestHostLogDestination(
+            logFileName: QAuditLogger.auditLogFileName,
             environment: ["HOME": "/Users/someone", "PATH": "/usr/bin"],
             isXCTestRuntimeLoaded: false,
             temporaryRootDirectoryURL: URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)"),
@@ -153,7 +155,7 @@ struct QAuditLoggerTestProcessIsolationTests {
         let resolvedTemporaryRootURL = roots.temporaryRootURL.resolvingSymlinksInPath()
 
         #expect(isolatedLogFileURL.lastPathComponent == "q-audit.log")
-        #expect(isolatedDirectoryURL.lastPathComponent == "pace-test-q-audit-777-token-a")
+        #expect(isolatedDirectoryURL.lastPathComponent == "pace-test-audit-777-token-a")
         #expect(isolatedDirectoryURL.deletingLastPathComponent().pathComponents == resolvedTemporaryRootURL.pathComponents)
 
         var isDirectory: ObjCBool = false
@@ -170,8 +172,8 @@ struct QAuditLoggerTestProcessIsolationTests {
         defer { roots.removeSandbox() }
 
         let currentXcodeEnvironment = [
-            QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: "",
-            QAuditLogger.xcTestSessionIdentifierEnvironmentMarkerKey: UUID().uuidString,
+            PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: "",
+            PaceTestHostAuditIsolation.xcTestSessionIdentifierEnvironmentMarkerKey: UUID().uuidString,
             "XCTestBundlePath": "Contents/PlugIns/leanring-buddyTests.xctest",
             "XCInjectBundleInto": "unused"
         ]
@@ -222,7 +224,7 @@ struct QAuditLoggerTestProcessIsolationTests {
 
         #expect(sharedLogFileURL.path != Self.realProductionLogFileURL.path)
         #expect(sharedDirectoryURL.deletingLastPathComponent().pathComponents == resolvedRealTemporaryRootURL.pathComponents)
-        #expect(sharedDirectoryURL.lastPathComponent.hasPrefix("pace-test-q-audit-\(ProcessInfo.processInfo.processIdentifier)-"))
+        #expect(sharedDirectoryURL.lastPathComponent.hasPrefix("pace-test-audit-\(ProcessInfo.processInfo.processIdentifier)-"))
         print("🧪 QAuditLogger.shared isolated test log: \(sharedLogFileURL.path)")
     }
 
@@ -256,15 +258,15 @@ struct QAuditLoggerTestProcessIsolationTests {
             ["XCTestSessionIdentifier": "ABC"],
             ["XCInjectBundleInto": "/tmp/Pace"],
             ["DYLD_INSERT_LIBRARIES": "/Applications/Xcode.app/usr/lib/libXCTestBundleInject.dylib"],
-            [QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: ""],
-            [QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: "   "],
-            [QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: "relative/path.xctestconfiguration"],
+            [PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: ""],
+            [PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: "   "],
+            [PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: "relative/path.xctestconfiguration"],
             [
-                QAuditLogger.xcTestConfigurationEnvironmentMarkerKey: "",
-                QAuditLogger.xcTestSessionIdentifierEnvironmentMarkerKey: "not-a-uuid",
+                PaceTestHostAuditIsolation.xcTestConfigurationEnvironmentMarkerKey: "",
+                PaceTestHostAuditIsolation.xcTestSessionIdentifierEnvironmentMarkerKey: "not-a-uuid",
                 "XCTestBundlePath": "Contents/PlugIns/leanring-buddyTests.xctest"
             ],
-            [QAuditLogger.xcTestSessionIdentifierEnvironmentMarkerKey: ""]
+            [PaceTestHostAuditIsolation.xcTestSessionIdentifierEnvironmentMarkerKey: ""]
         ]
         for environment in signalledButUnmarkedEnvironments {
             let destination = roots.resolve(environment: environment, isXCTestRuntimeLoaded: false)
@@ -297,7 +299,8 @@ struct QAuditLoggerTestProcessIsolationTests {
         #expect(Self.isMemoryOnly(roots.resolve(uniqueToken: "../escape")))
         #expect(Self.isMemoryOnly(roots.resolve(uniqueToken: "a/b")))
 
-        let destinationWithoutApplicationSupport = QAuditLogger.resolveTestHostLogDestination(
+        let destinationWithoutApplicationSupport = PaceTestHostAuditIsolation.resolveTestHostLogDestination(
+            logFileName: QAuditLogger.auditLogFileName,
             environment: Self.validXCTestMarkerEnvironment,
             isXCTestRuntimeLoaded: true,
             temporaryRootDirectoryURL: roots.temporaryRootURL,

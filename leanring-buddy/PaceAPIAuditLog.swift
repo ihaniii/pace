@@ -75,7 +75,10 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
     static let rotationByteThreshold = 5 * 1024 * 1024
 
     private let queue = DispatchQueue(label: "com.pace.api-audit", qos: .utility)
-    private let logFileURL: URL
+    /// `nil` only inside a unit-test host where isolation could not be
+    /// proven safe: entries are then discarded rather than ever reaching the
+    /// production file. Production always has a URL.
+    private let logFileURL: URL?
     private let encoder: JSONEncoder
     private let currentTurnIdLock = NSLock()
     private var _currentTurnId: String?
@@ -98,8 +101,30 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         return newTurnId
     }
 
-    init(logFileURL: URL? = nil) {
-        self.logFileURL = logFileURL ?? Self.defaultLogFileURL()
+    convenience init(logFileURL: URL? = nil) {
+        if let logFileURL {
+            self.init(resolvedLogFileURL: logFileURL)
+            return
+        }
+        // Unit tests run inside Pace.app as their test host; without this,
+        // every test that reaches a planner/VLM/TTS/action call site appends
+        // genuine-looking entries to the real log the Privacy dashboard
+        // reads. Release builds always take the production path.
+        switch PaceTestHostAuditIsolation.logDestinationForCurrentProcess(logFileName: "api-audit.jsonl") {
+        case .notRunningUnderTestHost:
+            self.init(resolvedLogFileURL: Self.defaultLogFileURL())
+        case .isolatedTemporaryLog(let isolatedLogFileURL):
+            self.init(resolvedLogFileURL: isolatedLogFileURL)
+        case .isolationUnavailable(let reason):
+            print("🛡️ PaceAPIAuditLog: test-host audit isolation unavailable (\(reason)) — API audit entries are discarded for this process")
+            self.init(resolvedLogFileURL: nil)
+        }
+    }
+
+    /// `resolvedLogFileURL == nil` discards every entry. Only reached from
+    /// the test-host fail-safe above (and directly by tests of that mode).
+    init(resolvedLogFileURL: URL?) {
+        self.logFileURL = resolvedLogFileURL
         let configuredEncoder = JSONEncoder()
         configuredEncoder.dateEncodingStrategy = .iso8601
         configuredEncoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -156,7 +181,7 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         // freshest data possible without us holding the read on the
         // audit queue.
         waitForPendingWrites()
-        guard let logFileData = try? Data(contentsOf: logFileURL) else {
+        guard let logFileURL, let logFileData = try? Data(contentsOf: logFileURL) else {
             return []
         }
         let decoder = JSONDecoder()
@@ -180,7 +205,15 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         return entries.reversed().first { $0.subsystem == subsystem }?.at
     }
 
+    /// Read-only view of where this log persists entries (`nil` means
+    /// entries are discarded). Exists so tests can prove the test-host log
+    /// never points at the production `api-audit.jsonl`.
+    var persistedLogFileURL: URL? {
+        logFileURL
+    }
+
     private func append(_ entry: PaceAPIAuditEntry) {
+        guard let logFileURL else { return }
         guard var lineData = try? encoder.encode(entry) else { return }
         lineData.append(0x0A)
 
@@ -188,7 +221,7 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         let directoryURL = logFileURL.deletingLastPathComponent()
         try? fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
 
-        rotateIfNeeded(fileManager: fileManager)
+        rotateIfNeeded(logFileURL: logFileURL, fileManager: fileManager)
 
         if let handle = try? FileHandle(forWritingTo: logFileURL) {
             defer { try? handle.close() }
@@ -199,7 +232,7 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         }
     }
 
-    private func rotateIfNeeded(fileManager: FileManager) {
+    private func rotateIfNeeded(logFileURL: URL, fileManager: FileManager) {
         guard let fileSize = (try? fileManager.attributesOfItem(atPath: logFileURL.path))?[.size] as? Int,
               fileSize >= Self.rotationByteThreshold else {
             return
