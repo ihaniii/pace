@@ -80,6 +80,15 @@ xcrun xccov view --report --json \
     /tmp/pace-test-derived-data/pace-tests.xcresult > coverage-report.json
 ```
 
+### Test-host isolation
+
+`test-pace.sh` builds the test host as `com.pace.app.unittesthost`, not
+`com.pace.app.debug`, so `UserDefaults.standard` in tests is a dedicated
+preferences domain — reset before every run — instead of your real Pace
+preferences. The script refuses to run if the override does not reach the
+host target, and re-checks the built bundle afterward. Xcode's Cmd+U does
+not use the script and still shares your Debug preferences.
+
 ## CI coverage enforcement
 
 Coverage is collected on every push and pull request by the `macos` job

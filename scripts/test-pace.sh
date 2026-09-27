@@ -30,6 +30,19 @@
 # on next Cmd+R, that hypothesis was wrong; close this script and
 # we'll switch to a stand-alone Swift Package approach for tests.
 #
+# UserDefaults isolation
+# ----------------------
+# Unit tests run inside the host app, and `UserDefaults.standard` is
+# keyed by the host's bundle identifier. Built as `com.pace.app.debug`
+# (the Debug app you run from Xcode), every test read and wrote your
+# real preferences — your settings leaked into tests, and tests could
+# leave consent/privacy flags changed if the host crashed mid-test.
+# This script builds the host as `com.pace.app.unittesthost` instead,
+# resets that domain before every run, proves the override reached the
+# host target BEFORE any test runs, and re-checks the built bundle after.
+# Xcode's Cmd+U does not use this script and still runs as
+# `com.pace.app.debug`.
+#
 # Usage
 # -----
 #   ./scripts/test-pace.sh                       # run all unit tests
@@ -44,6 +57,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 DERIVED_DATA_PATH="$HOME/.pace-test-derived-data"
+# Dedicated preferences domain for the test host (see header). Never one
+# of the user's real domains below.
+TEST_HOST_BUNDLE_IDENTIFIER="com.pace.app.unittesthost"
+REAL_PREFERENCES_DOMAINS=("com.pace.app.debug" "com.pace.app")
 PROJECT_PATH="$PROJECT_DIR/leanring-buddy.xcodeproj"
 # Scheme name kept as `leanring-buddy` (matches the Xcode default
 # scheme alongside the legacy folder name). The PRODUCT_NAME is `Pace`,
@@ -115,6 +132,48 @@ if [[ $ENABLE_COVERAGE -eq 1 ]]; then
     COVERAGE_VALUE="YES"
 fi
 
+# Pre-flight: prove the bundle-identifier override reaches the host target
+# BEFORE any test runs. If it did not, tests would silently read and write
+# the user's real preferences, so stop instead. (~5s; no build.)
+HOST_TARGET_NAME="$SCHEME"
+RESOLVED_HOST_BUNDLE_IDENTIFIER="$(
+    xcodebuild -showBuildSettings \
+        -project "$PROJECT_PATH" \
+        -scheme "$SCHEME" \
+        -destination "$DESTINATION" \
+        -derivedDataPath "$DERIVED_DATA_PATH" \
+        PRODUCT_BUNDLE_IDENTIFIER="$TEST_HOST_BUNDLE_IDENTIFIER" 2>/dev/null \
+    | awk -v hostHeader="Build settings for action build and target $HOST_TARGET_NAME:" '
+        $0 == hostHeader { inHostTarget = 1; next }
+        /^Build settings for action/ { inHostTarget = 0 }
+        inHostTarget && $1 == "PRODUCT_BUNDLE_IDENTIFIER" { print $3; exit }
+    ' || true
+)"
+if [[ "$RESOLVED_HOST_BUNDLE_IDENTIFIER" != "$TEST_HOST_BUNDLE_IDENTIFIER" ]]; then
+    echo "❌ Test host would build as '${RESOLVED_HOST_BUNDLE_IDENTIFIER:-<unresolved>}', not '$TEST_HOST_BUNDLE_IDENTIFIER'." >&2
+    echo "   Refusing to run: tests would use your real preferences." >&2
+    exit 3
+fi
+
+# Fingerprint the user's real preferences so a change during the run is
+# reported. A warning, not a failure: a running Pace legitimately writes them.
+real_preferences_fingerprint() {
+    local preferences_domain preferences_file
+    for preferences_domain in "${REAL_PREFERENCES_DOMAINS[@]}"; do
+        preferences_file="$HOME/Library/Preferences/$preferences_domain.plist"
+        if [[ -f "$preferences_file" ]]; then
+            shasum -a 256 "$preferences_file"
+        else
+            echo "absent $preferences_domain"
+        fi
+    done
+}
+REAL_PREFERENCES_FINGERPRINT_BEFORE_RUN="$(real_preferences_fingerprint)"
+
+# Every run starts from an empty test preferences domain, so no test
+# depends on state left behind by an earlier run.
+defaults delete "$TEST_HOST_BUNDLE_IDENTIFIER" >/dev/null 2>&1 || true
+
 set +e
 xcodebuild test \
     -project "$PROJECT_PATH" \
@@ -129,9 +188,25 @@ xcodebuild test \
     CODE_SIGN_IDENTITY="" \
     CODE_SIGNING_REQUIRED=NO \
     CODE_SIGNING_ALLOWED=NO \
+    PRODUCT_BUNDLE_IDENTIFIER="$TEST_HOST_BUNDLE_IDENTIFIER" \
     > "$BUILD_LOG_FILE" 2>&1
 EXIT_CODE=$?
 set -e
+
+# Post-run: the host that actually ran must carry the test identifier.
+BUILT_HOST_INFO_PLIST="$DERIVED_DATA_PATH/Build/Products/Debug/Pace.app/Contents/Info.plist"
+if [[ -f "$BUILT_HOST_INFO_PLIST" ]]; then
+    BUILT_HOST_BUNDLE_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUILT_HOST_INFO_PLIST" 2>/dev/null || true)"
+    if [[ "$BUILT_HOST_BUNDLE_IDENTIFIER" != "$TEST_HOST_BUNDLE_IDENTIFIER" ]]; then
+        echo "❌ The test host ran as '${BUILT_HOST_BUNDLE_IDENTIFIER:-<unreadable>}', not '$TEST_HOST_BUNDLE_IDENTIFIER'." >&2
+        echo "   Your real preferences may have been read or written by this run." >&2
+        exit 3
+    fi
+fi
+if [[ "$(real_preferences_fingerprint)" != "$REAL_PREFERENCES_FINGERPRINT_BEFORE_RUN" ]]; then
+    echo "⚠️  Your real Pace preferences (${REAL_PREFERENCES_DOMAINS[*]}) changed during this run."
+    echo "   Expected if Pace was running; otherwise the test-host isolation needs a look."
+fi
 
 if [[ $EXIT_CODE -ne 0 ]]; then
     echo "❌ xcodebuild exited $EXIT_CODE — surfacing the last 60 lines of build output:"
