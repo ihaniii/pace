@@ -11,6 +11,13 @@ suite cannot.
 
 Run the locally built Release app (not a dev build) on real hardware.
 
+## Auto-update (every release)
+
+- [ ] Launch the Release build from Terminal (`/path/to/Pace.app/Contents/MacOS/Pace`)
+      and confirm it logs `PaceAutoUpdateController: started (feed=https://raw.githubusercontent.com/HeyPace/pace/main/appcast.xml)`.
+      Debug builds and unit-test hosts log `automatic updates disabled` instead —
+      seeing that line from a Release build means auto-update is broken.
+
 ## Voice core (every release)
 
 - [ ] Hold ctrl+option, say "what time is it" — reply speaks within ~1 s.
