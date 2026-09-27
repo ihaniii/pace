@@ -168,8 +168,23 @@ public final class QAuditLogger: @unchecked Sendable {
     private let maxRotatedFileCount = 3
 
     public init(customLogURL: URL? = nil) {
+        // Only the default (no custom URL) path can ever be redirected. In
+        // Release builds `testHostLogDestinationForCurrentProcess()` is
+        // compiled down to `.notRunningUnderTestHost`, so production always
+        // falls through to the unchanged production branch below.
+        let testHostLogDestination: QAuditTestHostLogDestination = customLogURL == nil
+            ? Self.testHostLogDestinationForCurrentProcess()
+            : .notRunningUnderTestHost
+
         if let custom = customLogURL {
             self.logFileURL = custom
+        } else if case .isolatedTemporaryLog(let isolatedLogFileURL) = testHostLogDestination {
+            self.logFileURL = isolatedLogFileURL
+        } else if case .memoryOnly(let memoryOnlyReason) = testHostLogDestination {
+            // Inside a test host but isolation could not be proven safe:
+            // keep auditing in memory only. Never fall back to production.
+            print("🛡️ QAuditLogger: test-host audit isolation unavailable (\(memoryOnlyReason)) — audit records are memory-only for this process")
+            self.logFileURL = nil
         } else {
             let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             let paceDir = appSupport?.appendingPathComponent("Pace", isDirectory: true)
@@ -273,6 +288,13 @@ public final class QAuditLogger: @unchecked Sendable {
         try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: firstRotatedPath)
     }
 
+    /// Read-only view of where this logger persists records (`nil` means
+    /// memory-only). Exists so tests can prove the test-host logger never
+    /// points at the production `q-audit.log`.
+    nonisolated var persistedLogFileURL: URL? {
+        logFileURL
+    }
+
     public func getRecentRecords(limit: Int = 100) -> [QAuditRecord] {
         lock.lock()
         defer { lock.unlock() }
@@ -284,5 +306,207 @@ public final class QAuditLogger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         inMemoryRecords.removeAll()
+    }
+}
+
+// MARK: - Test-Host Audit Isolation
+
+/// Where the default (`customLogURL == nil`) logger writes when the process
+/// might be an XCTest host. Unit tests run inside Pace.app as their test host,
+/// and the host's own launch bootstraps the Q runtime (which touches
+/// `QAuditLogger.shared`) before any test code can run — so isolation has to be
+/// decided here, at construction, not from a test-side hook.
+nonisolated enum QAuditTestHostLogDestination: Equatable, Sendable {
+    /// No test-host signal at all: the unchanged production path is used.
+    case notRunningUnderTestHost
+    /// A validated, freshly-created, per-process temporary audit log.
+    case isolatedTemporaryLog(URL)
+    /// A test-host signal is present but isolation could not be proven safe.
+    /// Records stay in memory; the production log is never used.
+    case memoryOnly(reason: String)
+}
+
+extension QAuditLogger {
+
+    /// Markers Xcode sets in the environment of a unit-test host process.
+    /// Older toolchains put an absolute `.xctestconfiguration` path in
+    /// `XCTestConfigurationFilePath`; current ones leave that key present but
+    /// EMPTY and identify the run with a UUID in `XCTestSessionIdentifier`.
+    /// Either well-formed marker is accepted; an empty/relative path or a
+    /// non-UUID session id is not. `leanring_buddyApp.swift` also keys its
+    /// test-host detection off `XCTestConfigurationFilePath` being present.
+    nonisolated static let xcTestConfigurationEnvironmentMarkerKey = "XCTestConfigurationFilePath"
+    nonisolated static let xcTestSessionIdentifierEnvironmentMarkerKey = "XCTestSessionIdentifier"
+
+    /// Any of these means "this process is (probably) an XCTest host", even if
+    /// neither marker above is well-formed. Their presence alone is enough to
+    /// refuse the production log; it is never enough to pick a disk
+    /// destination.
+    nonisolated static let secondaryTestHostEnvironmentSignalKeys = [
+        "XCTestBundlePath",
+        "XCTestSessionIdentifier",
+        "XCInjectBundleInto"
+    ]
+
+    nonisolated static let isolatedTestAuditDirectoryNamePrefix = "pace-test-q-audit-"
+
+    /// The production default location, computed without creating anything.
+    /// Must stay in sync with the production branch of `init(customLogURL:)`;
+    /// used here only to reject test destinations that would land on it.
+    nonisolated static func productionDefaultLogFileURL(applicationSupportDirectoryURL: URL) -> URL {
+        applicationSupportDirectoryURL
+            .appendingPathComponent("Pace", isDirectory: true)
+            .appendingPathComponent("q-audit.log")
+    }
+
+    /// Reads the real process state. Debug-only: Release builds never consult
+    /// the environment and always use the production path.
+    nonisolated private static func testHostLogDestinationForCurrentProcess() -> QAuditTestHostLogDestination {
+        #if DEBUG
+        return resolveTestHostLogDestination(
+            environment: ProcessInfo.processInfo.environment,
+            isXCTestRuntimeLoaded: NSClassFromString("XCTestCase") != nil,
+            temporaryRootDirectoryURL: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            applicationSupportDirectoryURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first,
+            homeDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            processIdentifier: ProcessInfo.processInfo.processIdentifier,
+            uniqueToken: UUID().uuidString
+        )
+        #else
+        return .notRunningUnderTestHost
+        #endif
+    }
+
+    /// Pure decision (apart from creating the isolated directory) so tests can
+    /// drive every branch with fake roots. Once any test-host signal is seen,
+    /// every failure returns `.memoryOnly` — there is no path from here back to
+    /// the production log.
+    nonisolated static func resolveTestHostLogDestination(
+        environment: [String: String],
+        isXCTestRuntimeLoaded: Bool,
+        temporaryRootDirectoryURL: URL,
+        applicationSupportDirectoryURL: URL?,
+        homeDirectoryURL: URL,
+        processIdentifier: Int32,
+        uniqueToken: String
+    ) -> QAuditTestHostLogDestination {
+        let fileManager = FileManager.default
+
+        let hasPrimaryMarkerKey = environment[xcTestConfigurationEnvironmentMarkerKey] != nil
+        let hasSecondaryEnvironmentSignal = secondaryTestHostEnvironmentSignalKeys.contains { environment[$0] != nil }
+        let hasInjectedXCTestLibrary = environment["DYLD_INSERT_LIBRARIES"]?.contains("XCTest") ?? false
+        guard hasPrimaryMarkerKey || hasSecondaryEnvironmentSignal || hasInjectedXCTestLibrary || isXCTestRuntimeLoaded else {
+            return .notRunningUnderTestHost
+        }
+
+        // From here on this is (probably) a test host. Fail closed.
+
+        let configurationFilePathMarker = environment[xcTestConfigurationEnvironmentMarkerKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasValidConfigurationFilePathMarker = configurationFilePathMarker.hasPrefix("/")
+        let sessionIdentifierMarker = environment[xcTestSessionIdentifierEnvironmentMarkerKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasValidSessionIdentifierMarker = UUID(uuidString: sessionIdentifierMarker) != nil
+        guard hasValidConfigurationFilePathMarker || hasValidSessionIdentifierMarker else {
+            return .memoryOnly(reason: "XCTest marker missing or invalid")
+        }
+
+        guard let applicationSupportDirectoryURL else {
+            return .memoryOnly(reason: "cannot locate Application Support to rule out the production path")
+        }
+
+        guard processIdentifier > 0 else {
+            return .memoryOnly(reason: "invalid process identifier")
+        }
+
+        // The token becomes a path component: ASCII letters, digits, and
+        // hyphens only, so it can never introduce `/` or `..`.
+        let allowedTokenCharacters = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+        guard !uniqueToken.isEmpty, uniqueToken.allSatisfy({ allowedTokenCharacters.contains($0) }) else {
+            return .memoryOnly(reason: "invalid unique token")
+        }
+
+        // Resolve symlinks up front so every containment check below compares
+        // real locations — a temp root that is a symlink into Application
+        // Support must be caught as Application Support.
+        let resolvedTemporaryRootURL = temporaryRootDirectoryURL.standardizedFileURL.resolvingSymlinksInPath()
+        var temporaryRootIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: resolvedTemporaryRootURL.path, isDirectory: &temporaryRootIsDirectory),
+              temporaryRootIsDirectory.boolValue
+        else {
+            return .memoryOnly(reason: "temporary root does not exist or is not a directory")
+        }
+
+        guard resolvedTemporaryRootURL.pathComponents.count > 1 else {
+            return .memoryOnly(reason: "temporary root resolves to the filesystem root")
+        }
+
+        let resolvedHomeDirectoryURL = homeDirectoryURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolvedTemporaryRootURL.pathComponents != resolvedHomeDirectoryURL.pathComponents else {
+            return .memoryOnly(reason: "temporary root resolves to the home directory")
+        }
+
+        let productionLogFileURL = productionDefaultLogFileURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
+        let productionAuditDirectoryURL = productionLogFileURL.deletingLastPathComponent()
+
+        guard !isPath(resolvedTemporaryRootURL, equalToOrInside: applicationSupportDirectoryURL),
+              !isPath(resolvedTemporaryRootURL, equalToOrInside: productionAuditDirectoryURL)
+        else {
+            return .memoryOnly(reason: "temporary root resolves into the production application data directory")
+        }
+
+        let isolatedDirectoryName = "\(isolatedTestAuditDirectoryNamePrefix)\(processIdentifier)-\(uniqueToken)"
+        let isolatedDirectoryURL = resolvedTemporaryRootURL.appendingPathComponent(isolatedDirectoryName, isDirectory: true)
+
+        // `withIntermediateDirectories: false` makes an existing item at this
+        // path an error, so a collision can never reuse someone else's dir.
+        do {
+            try fileManager.createDirectory(
+                at: isolatedDirectoryURL,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            return .memoryOnly(reason: "cannot create a fresh isolated audit directory")
+        }
+
+        // Re-validate what was actually created. `attributesOfItem` does not
+        // follow a final symlink, so a swapped-in symlink is rejected here.
+        guard let isolatedDirectoryAttributes = try? fileManager.attributesOfItem(atPath: isolatedDirectoryURL.path),
+              isolatedDirectoryAttributes[.type] as? FileAttributeType == .typeDirectory
+        else {
+            return .memoryOnly(reason: "isolated audit directory is not a real directory")
+        }
+
+        let resolvedIsolatedDirectoryURL = isolatedDirectoryURL.resolvingSymlinksInPath()
+        guard resolvedIsolatedDirectoryURL.pathComponents == resolvedTemporaryRootURL.pathComponents + [isolatedDirectoryName] else {
+            return .memoryOnly(reason: "isolated audit directory escaped the temporary root")
+        }
+
+        let isolatedLogFileURL = resolvedIsolatedDirectoryURL.appendingPathComponent("q-audit.log")
+
+        // A brand-new directory must be empty; anything already at the log
+        // path (including a dangling symlink) is refused.
+        guard (try? fileManager.attributesOfItem(atPath: isolatedLogFileURL.path)) == nil else {
+            return .memoryOnly(reason: "isolated audit log path is already occupied")
+        }
+
+        guard isolatedLogFileURL.standardizedFileURL.path != productionLogFileURL.standardizedFileURL.path,
+              !isPath(isolatedLogFileURL, equalToOrInside: productionAuditDirectoryURL),
+              !isPath(isolatedLogFileURL, equalToOrInside: applicationSupportDirectoryURL)
+        else {
+            return .memoryOnly(reason: "isolated audit log resolves to the production location")
+        }
+
+        return .isolatedTemporaryLog(isolatedLogFileURL)
+    }
+
+    /// Component-wise containment (not string-prefix), after resolving
+    /// symlinks on both sides, so `/a/bc` is never treated as inside `/a/b`.
+    nonisolated private static func isPath(_ candidateURL: URL, equalToOrInside ancestorURL: URL) -> Bool {
+        let candidatePathComponents = candidateURL.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let ancestorPathComponents = ancestorURL.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        guard candidatePathComponents.count >= ancestorPathComponents.count else { return false }
+        return Array(candidatePathComponents.prefix(ancestorPathComponents.count)) == ancestorPathComponents
     }
 }
