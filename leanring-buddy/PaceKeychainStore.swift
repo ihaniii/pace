@@ -13,6 +13,10 @@
 //      the Mac is locked. Pace turns can't fire then anyway.
 //    - Service identifier is Pace-scoped so revoking these keys never
 //      touches the user's other apps.
+//    - Unit tests run inside Pace.app as their test host. Any test-host
+//      signal resolves every query to a separate, test-only service
+//      (`unitTestServiceIdentifier`), so tests can never read, overwrite,
+//      or delete the user's real keys. Release builds never see a test host.
 //    - The returned API key string is held in-process only. Callers must
 //      NEVER write it to disk, plist, log, or audit-log entry.
 //
@@ -27,7 +31,24 @@ enum PaceKeychainStore {
     /// Pace-scoped service identifier. Distinct from any other keychain
     /// entries on the user's Mac so revoking Pace's keys never touches
     /// their other apps.
-    static let serviceIdentifier = "com.pace.app.plannerAPIKeys"
+    nonisolated static let serviceIdentifier = "com.pace.app.plannerAPIKeys"
+
+    /// Test-only namespace. Same item class, accounts, and storage rules as
+    /// production — only the service differs, so tests still exercise real
+    /// Keychain semantics without ever touching the user's real keys.
+    nonisolated static let unitTestServiceIdentifier = "com.pace.app.unittest.plannerAPIKeys"
+
+    /// The service every query in this store uses, resolved once per process.
+    /// Fails closed: ANY test-host signal — even a missing or malformed XCTest
+    /// marker — selects the test namespace, never production.
+    nonisolated static let activeServiceIdentifier: String = resolveServiceIdentifier(
+        isRunningUnderTestHost: PaceTestHostDataIsolation.isRunningUnderTestHost
+    )
+
+    /// Pure decision so tests can prove both branches without a second process.
+    nonisolated static func resolveServiceIdentifier(isRunningUnderTestHost: Bool) -> String {
+        isRunningUnderTestHost ? unitTestServiceIdentifier : serviceIdentifier
+    }
 
     /// Account names follow `directAPI.<provider>.apiKey` so additional
     /// future key categories (e.g. embeddings) get their own namespace.
@@ -51,7 +72,7 @@ enum PaceKeychainStore {
 
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceIdentifier,
+            kSecAttrService as String: activeServiceIdentifier,
             kSecAttrAccount as String: accountName
         ]
 
@@ -98,7 +119,7 @@ enum PaceKeychainStore {
 
         let lookupQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceIdentifier,
+            kSecAttrService as String: activeServiceIdentifier,
             kSecAttrAccount as String: accountName,
             kSecReturnData as String: kCFBooleanTrue!,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -129,7 +150,7 @@ enum PaceKeychainStore {
         let accountName = keychainAccountName(for: provider)
         let deleteQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: serviceIdentifier,
+            kSecAttrService as String: activeServiceIdentifier,
             kSecAttrAccount as String: accountName
         ]
         let deleteStatus = SecItemDelete(deleteQuery as CFDictionary)
