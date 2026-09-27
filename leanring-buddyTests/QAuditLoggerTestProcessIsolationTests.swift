@@ -334,7 +334,11 @@ struct QAuditLoggerTestProcessIsolationTests {
 
     // MARK: - Format and retention unchanged
 
-    @Test("Records written to the isolated log are byte-identical to a custom-URL logger's")
+    /// Semantic, not byte-for-byte: `QAuditLogger` encodes with a plain
+    /// `JSONEncoder` (no `.sortedKeys`), so two encodes of the same record may
+    /// order keys differently. That ordering has never been part of the
+    /// production format; the content — every key and every value — is.
+    @Test("Records written to the isolated log are semantically identical to a custom-URL logger's")
     func recordStructureIsUnchanged() throws {
         let roots = try FakeFilesystemRoots()
         defer { roots.removeSandbox() }
@@ -346,13 +350,26 @@ struct QAuditLoggerTestProcessIsolationTests {
         QAuditLogger(customLogURL: isolatedLogFileURL).record(record)
         QAuditLogger(customLogURL: referenceLogFileURL).record(record)
 
-        let isolatedBytes = try Data(contentsOf: isolatedLogFileURL)
-        #expect(isolatedBytes == (try Data(contentsOf: referenceLogFileURL)))
+        let isolatedLines = try String(contentsOf: isolatedLogFileURL, encoding: .utf8).split(separator: "\n")
+        let referenceLines = try String(contentsOf: referenceLogFileURL, encoding: .utf8).split(separator: "\n")
+        #expect(isolatedLines.count == 1)
+        #expect(referenceLines.count == 1)
+        let isolatedLineData = Data(try #require(isolatedLines.first).utf8)
+        let referenceLineData = Data(try #require(referenceLines.first).utf8)
 
+        // Same keys and same values, independent of key order.
+        let isolatedJSONObject = try #require(try JSONSerialization.jsonObject(with: isolatedLineData) as? [String: Any])
+        let referenceJSONObject = try #require(try JSONSerialization.jsonObject(with: referenceLineData) as? [String: Any])
+        #expect(Set(isolatedJSONObject.keys) == Set(referenceJSONObject.keys))
+        #expect(NSDictionary(dictionary: isolatedJSONObject).isEqual(to: referenceJSONObject))
+
+        // And both decode to exactly the record that was written.
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let decodedLine = try #require(String(data: isolatedBytes, encoding: .utf8)?.split(separator: "\n").first)
-        #expect(try decoder.decode(QAuditRecord.self, from: Data(decodedLine.utf8)) == record)
+        let decodedIsolatedRecord = try decoder.decode(QAuditRecord.self, from: isolatedLineData)
+        let decodedReferenceRecord = try decoder.decode(QAuditRecord.self, from: referenceLineData)
+        #expect(decodedIsolatedRecord == record)
+        #expect(decodedReferenceRecord == record)
 
         let permissions = try FileManager.default.attributesOfItem(atPath: isolatedLogFileURL.path)[.posixPermissions] as? Int
         #expect(permissions == 0o600)
