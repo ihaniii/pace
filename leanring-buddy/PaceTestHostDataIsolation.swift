@@ -1,20 +1,23 @@
 //
-//  PaceTestHostAuditIsolation.swift
+//  PaceTestHostDataIsolation.swift
 //  leanring-buddy
 //
-//  Keeps unit-test runs out of the user's real audit logs
-//  (~/Library/Application Support/Pace/q-audit.log and api-audit.jsonl).
+//  Keeps unit-test runs out of the user's real on-disk data in
+//  ~/Library/Application Support/Pace — the audit logs (q-audit.log,
+//  api-audit.jsonl), the memory stores (memory-index.json,
+//  thread-memory.json, activity-goal-model.json, retrieval-index.json),
+//  and the Q runtime SQLite stores (QMemory, q-data).
 //
 //  Unit tests run inside Pace.app as their test host, and runtime code
-//  reaches the audit loggers' shared singletons long before (or without)
-//  any test-side hook. So each logger's default initializer asks this
+//  reaches these stores' default paths long before (or without) any
+//  test-side hook. So each store's default path resolution asks this
 //  helper where it may write. The decision is made once per process:
 //
-//    • no test-host signal      → the logger's unchanged production path
+//    • no test-host signal      → the store's unchanged production path
 //    • valid XCTest test host   → one validated, freshly-created temp
-//                                 directory shared by every audit log in
-//                                 this process
-//    • test host, but isolation → the logger keeps nothing on disk
+//                                 directory shared by every store in this
+//                                 process
+//    • test host, but isolation → the store keeps nothing on disk
 //      cannot be proven safe      (never the production path)
 //
 //  Release builds compile the test-host branch out and never consult the
@@ -24,8 +27,8 @@
 import Foundation
 
 /// Outcome of the once-per-process directory decision.
-nonisolated enum PaceTestHostAuditDirectory: Equatable, Sendable {
-    /// No test-host signal at all: loggers use their production paths.
+nonisolated enum PaceTestHostDataDirectory: Equatable, Sendable {
+    /// No test-host signal at all: stores use their production paths.
     case notRunningUnderTestHost
     /// A validated, freshly-created, per-process temporary directory.
     case isolatedDirectory(URL)
@@ -33,18 +36,18 @@ nonisolated enum PaceTestHostAuditDirectory: Equatable, Sendable {
     case unavailable(reason: String)
 }
 
-/// Where one specific audit log file should go.
-nonisolated enum PaceTestHostLogDestination: Equatable, Sendable {
-    /// No test-host signal at all: the logger's unchanged production path.
+/// Where one specific store file should go.
+nonisolated enum PaceTestHostFileDestination: Equatable, Sendable {
+    /// No test-host signal at all: the store's unchanged production path.
     case notRunningUnderTestHost
-    /// A validated log file inside the per-process temporary directory.
-    case isolatedTemporaryLog(URL)
-    /// Inside a test host but isolation could not be proven safe. The logger
-    /// must keep nothing on disk; the production log is never used.
+    /// A validated file location inside the per-process temporary directory.
+    case isolatedTemporaryFile(URL)
+    /// Inside a test host but isolation could not be proven safe. The store
+    /// must keep nothing on disk; the production path is never used.
     case isolationUnavailable(reason: String)
 }
 
-nonisolated enum PaceTestHostAuditIsolation {
+nonisolated enum PaceTestHostDataIsolation {
 
     /// Markers Xcode sets in the environment of a unit-test host process.
     /// Older toolchains put an absolute `.xctestconfiguration` path in
@@ -58,7 +61,7 @@ nonisolated enum PaceTestHostAuditIsolation {
 
     /// Any of these means "this process is (probably) an XCTest host", even if
     /// neither marker above is well-formed. Their presence alone is enough to
-    /// refuse the production logs; it is never enough to pick a disk
+    /// refuse the production paths; it is never enough to pick a disk
     /// destination.
     static let secondaryTestHostEnvironmentSignalKeys = [
         "XCTestBundlePath",
@@ -66,35 +69,44 @@ nonisolated enum PaceTestHostAuditIsolation {
         "XCInjectBundleInto"
     ]
 
-    static let isolatedTestAuditDirectoryNamePrefix = "pace-test-audit-"
+    static let isolatedTestDataDirectoryNamePrefix = "pace-test-data-"
 
-    /// The production directory that holds every Pace audit log, computed
-    /// without creating anything. Used only to reject test destinations
-    /// that would land on or inside it.
-    static func productionAuditDirectoryURL(applicationSupportDirectoryURL: URL) -> URL {
+    /// The production directory that holds every Pace store covered here,
+    /// computed without creating anything. Used only to reject test
+    /// destinations that would land on or inside it.
+    static func productionDataDirectoryURL(applicationSupportDirectoryURL: URL) -> URL {
         applicationSupportDirectoryURL.appendingPathComponent("Pace", isDirectory: true)
     }
 
     /// Computed once, lazily and thread-safely (Swift `static let`), on the
-    /// first audit logger construction in this process — so every audit log
-    /// in one test process shares one isolated directory and one decision.
-    static let currentProcessAuditDirectory: PaceTestHostAuditDirectory = resolveCurrentProcessAuditDirectory()
+    /// first store path resolution in this process — so every store in one
+    /// test process shares one isolated directory and one decision.
+    static let currentProcessDataDirectory: PaceTestHostDataDirectory = resolveCurrentProcessDataDirectory()
 
-    /// What a logger's default (no custom URL) initializer should use for
-    /// `logFileName` in this process.
-    static func logDestinationForCurrentProcess(logFileName: String) -> PaceTestHostLogDestination {
-        resolveLogFile(
-            named: logFileName,
-            in: currentProcessAuditDirectory,
+    /// True when this process shows any test-host signal — whether or not an
+    /// isolated directory could be created. For side effects that have no
+    /// file path to redirect (e.g. the system Spotlight index), which must
+    /// simply be skipped under tests.
+    static var isRunningUnderTestHost: Bool {
+        currentProcessDataDirectory != .notRunningUnderTestHost
+    }
+
+    /// What a store's default path resolution should use for
+    /// `relativePath` (e.g. `"memory-index.json"` or
+    /// `"QMemory/q_memory_wal.sqlite"`) in this process.
+    static func fileDestinationForCurrentProcess(relativePath: String) -> PaceTestHostFileDestination {
+        resolveFile(
+            relativePath: relativePath,
+            in: currentProcessDataDirectory,
             applicationSupportDirectoryURL: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
         )
     }
 
     /// Reads the real process state. Debug-only: Release builds never consult
     /// the environment and always use the production paths.
-    private static func resolveCurrentProcessAuditDirectory() -> PaceTestHostAuditDirectory {
+    private static func resolveCurrentProcessDataDirectory() -> PaceTestHostDataDirectory {
         #if DEBUG
-        return resolveTestHostAuditDirectory(
+        return resolveTestHostDataDirectory(
             environment: ProcessInfo.processInfo.environment,
             isXCTestRuntimeLoaded: NSClassFromString("XCTestCase") != nil,
             temporaryRootDirectoryURL: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
@@ -110,8 +122,8 @@ nonisolated enum PaceTestHostAuditIsolation {
 
     /// Convenience for tests: the directory decision followed by the per-file
     /// decision, driven entirely by injected (fake) roots.
-    static func resolveTestHostLogDestination(
-        logFileName: String,
+    static func resolveTestHostFileDestination(
+        relativePath: String,
         environment: [String: String],
         isXCTestRuntimeLoaded: Bool,
         temporaryRootDirectoryURL: URL,
@@ -119,8 +131,8 @@ nonisolated enum PaceTestHostAuditIsolation {
         homeDirectoryURL: URL,
         processIdentifier: Int32,
         uniqueToken: String
-    ) -> PaceTestHostLogDestination {
-        let directoryDecision = resolveTestHostAuditDirectory(
+    ) -> PaceTestHostFileDestination {
+        let directoryDecision = resolveTestHostDataDirectory(
             environment: environment,
             isXCTestRuntimeLoaded: isXCTestRuntimeLoaded,
             temporaryRootDirectoryURL: temporaryRootDirectoryURL,
@@ -129,8 +141,8 @@ nonisolated enum PaceTestHostAuditIsolation {
             processIdentifier: processIdentifier,
             uniqueToken: uniqueToken
         )
-        return resolveLogFile(
-            named: logFileName,
+        return resolveFile(
+            relativePath: relativePath,
             in: directoryDecision,
             applicationSupportDirectoryURL: applicationSupportDirectoryURL
         )
@@ -139,8 +151,8 @@ nonisolated enum PaceTestHostAuditIsolation {
     /// Pure decision (apart from creating the isolated directory) so tests can
     /// drive every branch with fake roots. Once any test-host signal is seen,
     /// every failure returns `.unavailable` — there is no path from here back
-    /// to the production logs.
-    static func resolveTestHostAuditDirectory(
+    /// to the production data.
+    static func resolveTestHostDataDirectory(
         environment: [String: String],
         isXCTestRuntimeLoaded: Bool,
         temporaryRootDirectoryURL: URL,
@@ -148,7 +160,7 @@ nonisolated enum PaceTestHostAuditIsolation {
         homeDirectoryURL: URL,
         processIdentifier: Int32,
         uniqueToken: String
-    ) -> PaceTestHostAuditDirectory {
+    ) -> PaceTestHostDataDirectory {
         let fileManager = FileManager.default
 
         let hasPrimaryMarkerKey = environment[xcTestConfigurationEnvironmentMarkerKey] != nil
@@ -204,14 +216,14 @@ nonisolated enum PaceTestHostAuditIsolation {
             return .unavailable(reason: "temporary root resolves to the home directory")
         }
 
-        let productionDirectoryURL = productionAuditDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
+        let productionDirectoryURL = productionDataDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
         guard !isPath(resolvedTemporaryRootURL, equalToOrInside: applicationSupportDirectoryURL),
               !isPath(resolvedTemporaryRootURL, equalToOrInside: productionDirectoryURL)
         else {
             return .unavailable(reason: "temporary root resolves into the production application data directory")
         }
 
-        let isolatedDirectoryName = "\(isolatedTestAuditDirectoryNamePrefix)\(processIdentifier)-\(uniqueToken)"
+        let isolatedDirectoryName = "\(isolatedTestDataDirectoryNamePrefix)\(processIdentifier)-\(uniqueToken)"
         let isolatedDirectoryURL = resolvedTemporaryRootURL.appendingPathComponent(isolatedDirectoryName, isDirectory: true)
 
         // `withIntermediateDirectories: false` makes an existing item at this
@@ -223,7 +235,7 @@ nonisolated enum PaceTestHostAuditIsolation {
                 attributes: [.posixPermissions: 0o700]
             )
         } catch {
-            return .unavailable(reason: "cannot create a fresh isolated audit directory")
+            return .unavailable(reason: "cannot create a fresh isolated data directory")
         }
 
         // Re-validate what was actually created. `attributesOfItem` does not
@@ -231,69 +243,97 @@ nonisolated enum PaceTestHostAuditIsolation {
         guard let isolatedDirectoryAttributes = try? fileManager.attributesOfItem(atPath: isolatedDirectoryURL.path),
               isolatedDirectoryAttributes[.type] as? FileAttributeType == .typeDirectory
         else {
-            return .unavailable(reason: "isolated audit directory is not a real directory")
+            return .unavailable(reason: "isolated data directory is not a real directory")
         }
 
         let resolvedIsolatedDirectoryURL = isolatedDirectoryURL.resolvingSymlinksInPath()
         guard resolvedIsolatedDirectoryURL.pathComponents == resolvedTemporaryRootURL.pathComponents + [isolatedDirectoryName] else {
-            return .unavailable(reason: "isolated audit directory escaped the temporary root")
+            return .unavailable(reason: "isolated data directory escaped the temporary root")
         }
 
         // A brand-new directory must be empty.
         guard (try? fileManager.contentsOfDirectory(atPath: resolvedIsolatedDirectoryURL.path))?.isEmpty == true else {
-            return .unavailable(reason: "isolated audit directory is not empty")
+            return .unavailable(reason: "isolated data directory is not empty")
         }
 
         guard !isPath(resolvedIsolatedDirectoryURL, equalToOrInside: productionDirectoryURL),
               !isPath(resolvedIsolatedDirectoryURL, equalToOrInside: applicationSupportDirectoryURL)
         else {
-            return .unavailable(reason: "isolated audit directory resolves to the production location")
+            return .unavailable(reason: "isolated data directory resolves to the production location")
         }
 
         return .isolatedDirectory(resolvedIsolatedDirectoryURL)
     }
 
-    /// Maps the directory decision to one log file inside it. The directory
-    /// is shared by every audit log in the process, so an existing regular
-    /// file is expected (another instance of the same log already wrote);
-    /// anything else at that path — a symlink, a directory — is refused.
-    static func resolveLogFile(
-        named logFileName: String,
-        in directoryDecision: PaceTestHostAuditDirectory,
+    /// Maps the directory decision to one store file inside it.
+    /// `relativePath` may contain subdirectories (`QMemory/q_memory_wal.sqlite`);
+    /// every component is validated, missing subdirectories are created
+    /// (0700) inside the isolated directory, and the result is re-checked
+    /// after symlink resolution so nothing can escape it. The directory is
+    /// shared by every store in the process, so an existing regular file is
+    /// expected (another instance of the same store already wrote); anything
+    /// else at that path — a symlink, a directory — is refused.
+    static func resolveFile(
+        relativePath: String,
+        in directoryDecision: PaceTestHostDataDirectory,
         applicationSupportDirectoryURL: URL?
-    ) -> PaceTestHostLogDestination {
+    ) -> PaceTestHostFileDestination {
         switch directoryDecision {
         case .notRunningUnderTestHost:
             return .notRunningUnderTestHost
         case .unavailable(let reason):
             return .isolationUnavailable(reason: reason)
         case .isolatedDirectory(let isolatedDirectoryURL):
-            guard !logFileName.isEmpty,
-                  logFileName != ".", logFileName != "..",
-                  logFileName.allSatisfy({ isSafePathComponentCharacter($0, allowingDot: true) })
-            else {
-                return .isolationUnavailable(reason: "invalid audit log file name")
+            let relativePathComponents = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            let everyComponentIsSafe = relativePathComponents.allSatisfy { pathComponent in
+                !pathComponent.isEmpty
+                    && pathComponent != "." && pathComponent != ".."
+                    && pathComponent.allSatisfy({ isSafePathComponentCharacter($0, allowingDot: true) })
+            }
+            guard !relativePathComponents.isEmpty, everyComponentIsSafe else {
+                return .isolationUnavailable(reason: "invalid store file path")
             }
 
             guard let applicationSupportDirectoryURL else {
                 return .isolationUnavailable(reason: "cannot locate Application Support to rule out the production path")
             }
 
-            let isolatedLogFileURL = isolatedDirectoryURL.appendingPathComponent(logFileName)
+            let fileManager = FileManager.default
+            let subdirectoryComponents = Array(relativePathComponents.dropLast())
+            var parentDirectoryURL = isolatedDirectoryURL
+            for subdirectoryComponent in subdirectoryComponents {
+                parentDirectoryURL = parentDirectoryURL.appendingPathComponent(subdirectoryComponent, isDirectory: true)
+            }
+            if !subdirectoryComponents.isEmpty {
+                try? fileManager.createDirectory(
+                    at: parentDirectoryURL,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                guard let parentAttributes = try? fileManager.attributesOfItem(atPath: parentDirectoryURL.path),
+                      parentAttributes[.type] as? FileAttributeType == .typeDirectory,
+                      parentDirectoryURL.resolvingSymlinksInPath().pathComponents
+                        == isolatedDirectoryURL.resolvingSymlinksInPath().pathComponents + subdirectoryComponents
+                else {
+                    return .isolationUnavailable(reason: "isolated store subdirectory is not a real directory inside the isolated data directory")
+                }
+            }
 
-            if let existingItemAttributes = try? FileManager.default.attributesOfItem(atPath: isolatedLogFileURL.path),
+            let isolatedFileURL = parentDirectoryURL.appendingPathComponent(relativePathComponents[relativePathComponents.count - 1])
+
+            if let existingItemAttributes = try? fileManager.attributesOfItem(atPath: isolatedFileURL.path),
                existingItemAttributes[.type] as? FileAttributeType != .typeRegular {
-                return .isolationUnavailable(reason: "isolated audit log path is occupied by a non-regular file")
+                return .isolationUnavailable(reason: "isolated store path is occupied by a non-regular file")
             }
 
-            let productionDirectoryURL = productionAuditDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
-            guard !isPath(isolatedLogFileURL, equalToOrInside: productionDirectoryURL),
-                  !isPath(isolatedLogFileURL, equalToOrInside: applicationSupportDirectoryURL)
+            let productionDirectoryURL = productionDataDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
+            guard !isPath(isolatedFileURL, equalToOrInside: productionDirectoryURL),
+                  !isPath(isolatedFileURL, equalToOrInside: applicationSupportDirectoryURL)
             else {
-                return .isolationUnavailable(reason: "isolated audit log resolves to the production location")
+                return .isolationUnavailable(reason: "isolated store path resolves to the production location")
             }
 
-            return .isolatedTemporaryLog(isolatedLogFileURL)
+            return .isolatedTemporaryFile(isolatedFileURL)
         }
     }
 

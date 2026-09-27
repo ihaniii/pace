@@ -81,16 +81,32 @@ public final class QRuntimeBootstrap: @unchecked Sendable {
 
         // 5. Initialize SQLite WAL Memory Store
         let dbPath: String
+        // Only the production default (no custom path, not a test host) opens
+        // the real on-disk stores. Unit tests run inside Pace.app, whose own
+        // launch calls `bootstrap()` with no path — so a test host gets an
+        // isolated temp QMemory database (or `:memory:` when isolation can't
+        // be proven safe), and, like a custom-path caller, an in-memory
+        // capability store (step 9b). Release builds never see a test host.
+        var usesProductionDefaultStores = false
         if let customPath = databasePath {
             dbPath = customPath
         } else {
-            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            let qDir = appSupport?.appendingPathComponent("Pace/QMemory", isDirectory: true)
-            if let qDir = qDir {
-                try? FileManager.default.createDirectory(at: qDir, withIntermediateDirectories: true)
-                dbPath = qDir.appendingPathComponent("q_memory_wal.sqlite").path
-            } else {
+            switch PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: "QMemory/q_memory_wal.sqlite") {
+            case .isolatedTemporaryFile(let isolatedDatabaseURL):
+                dbPath = isolatedDatabaseURL.path
+            case .isolationUnavailable(let reason):
+                print("🛡️ QRuntimeBootstrap: test-host data isolation unavailable (\(reason)) — QMemory is in-memory for this process")
                 dbPath = ":memory:"
+            case .notRunningUnderTestHost:
+                usesProductionDefaultStores = true
+                let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                let qDir = appSupport?.appendingPathComponent("Pace/QMemory", isDirectory: true)
+                if let qDir = qDir {
+                    try? FileManager.default.createDirectory(at: qDir, withIntermediateDirectories: true)
+                    dbPath = qDir.appendingPathComponent("q_memory_wal.sqlite").path
+                } else {
+                    dbPath = ":memory:"
+                }
             }
         }
 
@@ -120,11 +136,11 @@ public final class QRuntimeBootstrap: @unchecked Sendable {
 
         // 9b. Model Capability Memory (Phase 2D/2E) — ADVISORY routing memory only. Backed by the
         // existing `QDurableTaskStore` (SQLite WAL) in its default on-disk location; a caller that
-        // supplies a custom `databasePath` (tests/tools) gets a non-persistent in-memory store so
-        // no unrelated file is written. A failure to open it simply disables learning — it never
-        // blocks boot and never touches an authority.
+        // supplies a custom `databasePath` (tests/tools), or any unit-test host, gets a
+        // non-persistent in-memory store so no unrelated file is written. A failure to open it
+        // simply disables learning — it never blocks boot and never touches an authority.
         var capabilityMemory: QModelCapabilityMemory?
-        if let capabilityStore = try? QDurableTaskStore(databasePath: databasePath == nil ? "default" : ":memory:") {
+        if let capabilityStore = try? QDurableTaskStore(databasePath: usesProductionDefaultStores ? "default" : ":memory:") {
             capabilityMemory = QModelCapabilityMemory(store: capabilityStore)
             activeComponents.append("QModelCapabilityMemory (Advisory, Bounded)")
         }

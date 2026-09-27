@@ -402,10 +402,9 @@ final class PaceLocalChatHistoryReader: PaceChatHistorySource {
     }
 
     private nonisolated static func retrievalIndexFileURL() -> URL? {
-        FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first?
-            .appendingPathComponent("Pace/retrieval-index.json")
+        // Same resolver as the writer, so a test host reads the isolated
+        // index rather than the user's real one.
+        PaceLocalRetriever.defaultPersistenceURL()
     }
 
     /// Pace history docs are stored as "User: …\nPace: …". Same logic

@@ -1302,8 +1302,21 @@ final class PaceLocalRetriever: PaceRetriever {
         }
     }
 
-    private static func defaultPersistenceURL() -> URL? {
-        FileManager.default.urls(
+    /// Also used by `PaceChatSession` so the reader and the writer of the
+    /// retrieval index always agree on its location.
+    nonisolated static func defaultPersistenceURL() -> URL? {
+        // Test hosts get an isolated temp file, or no persistence (nil) when
+        // isolation can't be proven safe — never the user's real index.
+        // Release builds always take the production path below.
+        switch PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: "retrieval-index.json") {
+        case .isolatedTemporaryFile(let isolatedFileURL):
+            return isolatedFileURL
+        case .isolationUnavailable:
+            return nil
+        case .notRunningUnderTestHost:
+            break
+        }
+        return FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
         ).first?

@@ -110,10 +110,10 @@ nonisolated final class PaceAPIAuditLog: @unchecked Sendable {
         // every test that reaches a planner/VLM/TTS/action call site appends
         // genuine-looking entries to the real log the Privacy dashboard
         // reads. Release builds always take the production path.
-        switch PaceTestHostAuditIsolation.logDestinationForCurrentProcess(logFileName: "api-audit.jsonl") {
+        switch PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: "api-audit.jsonl") {
         case .notRunningUnderTestHost:
             self.init(resolvedLogFileURL: Self.defaultLogFileURL())
-        case .isolatedTemporaryLog(let isolatedLogFileURL):
+        case .isolatedTemporaryFile(let isolatedLogFileURL):
             self.init(resolvedLogFileURL: isolatedLogFileURL)
         case .isolationUnavailable(let reason):
             print("🛡️ PaceAPIAuditLog: test-host audit isolation unavailable (\(reason)) — API audit entries are discarded for this process")
