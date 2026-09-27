@@ -28,7 +28,7 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
     private static let apiAuditLogFileName = "api-audit.jsonl"
 
     private static let validXCTestMarkerEnvironment = [
-        PaceTestHostAuditIsolation.xcTestSessionIdentifierEnvironmentMarkerKey: UUID().uuidString
+        PaceTestHostDataIsolation.xcTestSessionIdentifierEnvironmentMarkerKey: UUID().uuidString
     ]
 
     /// A fresh, test-owned sandbox holding a fake temp root, a fake
@@ -52,8 +52,8 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
             )
         }
 
-        func resolveDirectory(uniqueToken: String = UUID().uuidString) -> PaceTestHostAuditDirectory {
-            PaceTestHostAuditIsolation.resolveTestHostAuditDirectory(
+        func resolveDirectory(uniqueToken: String = UUID().uuidString) -> PaceTestHostDataDirectory {
+            PaceTestHostDataIsolation.resolveTestHostDataDirectory(
                 environment: PaceAPIAuditLogTestProcessIsolationTests.validXCTestMarkerEnvironment,
                 isXCTestRuntimeLoaded: true,
                 temporaryRootDirectoryURL: temporaryRootURL,
@@ -64,9 +64,9 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
             )
         }
 
-        func resolveLogFile(named logFileName: String, in directoryDecision: PaceTestHostAuditDirectory) -> PaceTestHostLogDestination {
-            PaceTestHostAuditIsolation.resolveLogFile(
-                named: logFileName,
+        func resolveLogFile(named logFileName: String, in directoryDecision: PaceTestHostDataDirectory) -> PaceTestHostFileDestination {
+            PaceTestHostDataIsolation.resolveFile(
+                relativePath: logFileName,
                 in: directoryDecision,
                 applicationSupportDirectoryURL: applicationSupportURL
             )
@@ -83,12 +83,12 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
             .appendingPathComponent(apiAuditLogFileName)
     }
 
-    private static func isolatedLogURL(from destination: PaceTestHostLogDestination) -> URL? {
-        if case .isolatedTemporaryLog(let isolatedLogFileURL) = destination { return isolatedLogFileURL }
+    private static func isolatedLogURL(from destination: PaceTestHostFileDestination) -> URL? {
+        if case .isolatedTemporaryFile(let isolatedLogFileURL) = destination { return isolatedLogFileURL }
         return nil
     }
 
-    private static func isIsolationUnavailable(_ destination: PaceTestHostLogDestination) -> Bool {
+    private static func isIsolationUnavailable(_ destination: PaceTestHostFileDestination) -> Bool {
         if case .isolationUnavailable = destination { return true }
         return false
     }
@@ -130,8 +130,8 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
     func productionDefaultPathIsUnchanged() {
         #expect(Self.realProductionAPIAuditLogFileURL.path.hasSuffix("/Library/Application Support/Pace/api-audit.jsonl"))
 
-        let destination = PaceTestHostAuditIsolation.resolveTestHostLogDestination(
-            logFileName: Self.apiAuditLogFileName,
+        let destination = PaceTestHostDataIsolation.resolveTestHostFileDestination(
+            relativePath: Self.apiAuditLogFileName,
             environment: ["HOME": "/Users/someone", "PATH": "/usr/bin"],
             isXCTestRuntimeLoaded: false,
             temporaryRootDirectoryURL: URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)"),
@@ -163,7 +163,7 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
         #expect(sharedAPILogFileURL.lastPathComponent == Self.apiAuditLogFileName)
         #expect(sharedAPILogFileURL.path != Self.realProductionAPIAuditLogFileURL.path)
         #expect(sharedDirectoryURL.deletingLastPathComponent().pathComponents == resolvedRealTemporaryRootURL.pathComponents)
-        #expect(sharedDirectoryURL.lastPathComponent.hasPrefix("pace-test-audit-\(ProcessInfo.processInfo.processIdentifier)-"))
+        #expect(sharedDirectoryURL.lastPathComponent.hasPrefix("pace-test-data-\(ProcessInfo.processInfo.processIdentifier)-"))
 
         let sharedQAuditLogFileURL = try #require(QAuditLogger.shared.persistedLogFileURL)
         #expect(sharedQAuditLogFileURL.deletingLastPathComponent() == sharedDirectoryURL)
@@ -237,7 +237,7 @@ struct PaceAPIAuditLogTestProcessIsolationTests {
         defer { roots.removeSandbox() }
 
         let directoryDecision = roots.resolveDirectory()
-        for unsafeLogFileName in ["", ".", "..", "a/b", "../api-audit.jsonl", "/etc/passwd", "api audit.jsonl"] {
+        for unsafeLogFileName in ["", ".", "..", "a/../b", "a//b", "a/", "../api-audit.jsonl", "/etc/passwd", "api audit.jsonl"] {
             #expect(
                 Self.isIsolationUnavailable(roots.resolveLogFile(named: unsafeLogFileName, in: directoryDecision)),
                 "log file name \(unsafeLogFileName) must be refused"

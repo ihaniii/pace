@@ -33,11 +33,29 @@ final class PaceActivityGoalPersistenceStore {
     }
 
     nonisolated static func defaultFileURL() -> URL? {
-        FileManager.default
+        // Test hosts get an isolated temp file, or no persistence (nil) when
+        // isolation can't be proven safe — never the user's real file.
+        // Release builds always take the production path below.
+        switch PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: "activity-goal-model.json") {
+        case .isolatedTemporaryFile(let isolatedFileURL):
+            return isolatedFileURL
+        case .isolationUnavailable:
+            return nil
+        case .notRunningUnderTestHost:
+            break
+        }
+        return FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first?
             .appendingPathComponent("Pace", isDirectory: true)
             .appendingPathComponent("activity-goal-model.json", isDirectory: false)
+    }
+
+    /// Read-only view of where this store persists (`nil` means it does
+    /// not). Exists so tests can prove a test host never points at the
+    /// user's real file.
+    var persistedFileURL: URL? {
+        fileURL
     }
 
     /// Load the persisted observations, or an empty list when nothing has

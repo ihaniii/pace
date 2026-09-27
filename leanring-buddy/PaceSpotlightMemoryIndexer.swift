@@ -28,14 +28,28 @@ import Foundation
 final class PaceSpotlightMemoryIndexer {
 
     private let spotlightDomainIdentifier = "com.pace.app.memory"
-    private let spotlightIndex: CSSearchableIndex
+    /// `nil` inside a unit-test host: tests must never push test memories
+    /// into the user's real system Spotlight index.
+    private let spotlightIndex: CSSearchableIndex?
 
     /// Lightweight contract so unit tests can verify the mapping
     /// helpers without touching the live CSSearchableIndex. Behind
     /// the scenes the production indexer just forwards to
     /// `CSSearchableIndex.default()`.
-    init(spotlightIndex: CSSearchableIndex = .default()) {
+    init(spotlightIndex: CSSearchableIndex? = PaceSpotlightMemoryIndexer.defaultSpotlightIndexForCurrentProcess()) {
         self.spotlightIndex = spotlightIndex
+    }
+
+    /// The system index in production; `nil` (mirroring disabled) in any
+    /// unit-test host. Release builds never see a test host.
+    nonisolated static func defaultSpotlightIndexForCurrentProcess() -> CSSearchableIndex? {
+        PaceTestHostDataIsolation.isRunningUnderTestHost ? nil : .default()
+    }
+
+    /// Whether `syncMirror` will reach a Spotlight index at all. Exists so
+    /// tests can prove a test host never mirrors into the real index.
+    var isMirroringEnabled: Bool {
+        spotlightIndex != nil
     }
 
     /// Replace the Spotlight mirror with the current active entries.
@@ -43,6 +57,7 @@ final class PaceSpotlightMemoryIndexer {
     /// are upserted. Called from CompanionManager after every memory
     /// mutation, matching the source JSON's write cadence.
     func syncMirror(toMatch activeEntries: [PaceMemoryEntry]) {
+        guard let spotlightIndex else { return }
         let searchableItems = Self.buildSearchableItems(
             fromActiveEntries: activeEntries,
             domainIdentifier: spotlightDomainIdentifier

@@ -169,16 +169,16 @@ public final class QAuditLogger: @unchecked Sendable {
 
     public init(customLogURL: URL? = nil) {
         // Only the default (no custom URL) path can ever be redirected. In
-        // Release builds `PaceTestHostAuditIsolation` never reports a test
+        // Release builds `PaceTestHostDataIsolation` never reports a test
         // host, so production always falls through to the unchanged
         // production branch below.
-        let testHostLogDestination: PaceTestHostLogDestination = customLogURL == nil
-            ? PaceTestHostAuditIsolation.logDestinationForCurrentProcess(logFileName: Self.auditLogFileName)
+        let testHostLogDestination: PaceTestHostFileDestination = customLogURL == nil
+            ? PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: Self.auditLogFileName)
             : .notRunningUnderTestHost
 
         if let custom = customLogURL {
             self.logFileURL = custom
-        } else if case .isolatedTemporaryLog(let isolatedLogFileURL) = testHostLogDestination {
+        } else if case .isolatedTemporaryFile(let isolatedLogFileURL) = testHostLogDestination {
             self.logFileURL = isolatedLogFileURL
         } else if case .isolationUnavailable(let memoryOnlyReason) = testHostLogDestination {
             // Inside a test host but isolation could not be proven safe:
@@ -319,8 +319,8 @@ extension QAuditLogger {
     /// Must stay in sync with the production branch of `init(customLogURL:)`;
     /// used by tests to prove the test-host logger never points at it.
     nonisolated static func productionDefaultLogFileURL(applicationSupportDirectoryURL: URL) -> URL {
-        PaceTestHostAuditIsolation
-            .productionAuditDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
+        PaceTestHostDataIsolation
+            .productionDataDirectoryURL(applicationSupportDirectoryURL: applicationSupportDirectoryURL)
             .appendingPathComponent(auditLogFileName)
     }
 }

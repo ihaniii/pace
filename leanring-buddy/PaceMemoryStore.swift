@@ -25,12 +25,34 @@ final class PaceMemoryStore {
     private let fileURL: URL?
 
     init() {
+        // Unit tests run inside Pace.app as their test host; a test that
+        // builds a CompanionManager must never load or overwrite the user's
+        // real file. Test hosts get an isolated temp file, or no persistence
+        // (nil) when isolation can't be proven safe. Release builds always
+        // take the production path below.
+        switch PaceTestHostDataIsolation.fileDestinationForCurrentProcess(relativePath: "memory-index.json") {
+        case .isolatedTemporaryFile(let isolatedFileURL):
+            fileURL = isolatedFileURL
+            return
+        case .isolationUnavailable:
+            fileURL = nil
+            return
+        case .notRunningUnderTestHost:
+            break
+        }
         let applicationSupportRootURL = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first
         fileURL = applicationSupportRootURL?
             .appendingPathComponent("Pace", isDirectory: true)
             .appendingPathComponent("memory-index.json", isDirectory: false)
+    }
+
+    /// Read-only view of where this store persists (`nil` means it does
+    /// not). Exists so tests can prove a test host never points at the
+    /// user's real file.
+    var persistedFileURL: URL? {
+        fileURL
     }
 
     /// Load the persisted entries, or an empty list when nothing has been
