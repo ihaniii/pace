@@ -504,6 +504,9 @@ struct QSemanticElementReadTests {
         let secret = "sk-elementread0123456789012345678901"
         let (window, _) = makeTextFieldWindow(identifier: "secret-read-\(suffix)", value: secret)
         defer { window.close() }
+        // The read resolves through the frontmost application's Accessibility tree; without this,
+        // a headless test run leaves another app frontmost and the read never happens.
+        NSApp.activate(ignoringOtherApps: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -548,12 +551,21 @@ struct QSemanticElementReadTests {
             return
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_value" })
+        // Preconditions: the redaction assertions below are only meaningful if the read step
+        // actually ran and persisted its result. If the read failed (e.g. the fixture was not the
+        // frontmost app) the plan is replanned and this step is absent — every `?.contains(...)`
+        // below would then evaluate to nil and fail in a way that LOOKS like a leak. Stop here
+        // with the real reason instead.
+        let persistedReadStep = try #require(stepSnapshot, "The ui.read_element_value step is missing from the final durable plan — the read did not complete (replanned), so redaction was not exercised")
+        _ = try #require(persistedReadStep.resultSummary, "The persisted read step has no resultSummary — redaction was not exercised")
+        _ = try #require(persistedReadStep.verifiedEvidence, "The persisted read step has no verifiedEvidence — redaction was not exercised")
         #expect(stepSnapshot?.resultSummary?.contains(secret) == false)
         #expect(stepSnapshot?.resultSummary?.contains("[REDACTED_SECRET]") == true)
         #expect(stepSnapshot?.verifiedEvidence?.contains(secret) == false)
 
         // Memory: redacted.
         let memoryRecord = try memory.getByKey("plan_\(planId)", sessionId: task.sessionId)
+        _ = try #require(memoryRecord, "No plan memory record was written — memory redaction was not exercised")
         #expect(memoryRecord?.content.contains(secret) == false)
 
         // Audit: no record for this task leaks the literal.

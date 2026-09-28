@@ -463,6 +463,9 @@ struct QSemanticFocusedElementReadTests {
         let (window, field) = makeSecureFieldWindow(identifier: "safe-durable-\(suffix)")
         defer { window.close() }
         window.makeFirstResponder(field)
+        // The focused element is resolved system-wide; without this, a headless test run leaves
+        // another app frontmost, the cross-app check fails closed, and the read never happens.
+        NSApp.activate(ignoringOtherApps: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -503,6 +506,14 @@ struct QSemanticFocusedElementReadTests {
             return
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_focused_element" })
+        // Preconditions: the "never contains the withheld value" assertions below are only
+        // meaningful if the read step actually ran and persisted its result. If it did not (e.g.
+        // focus belonged to another app, so the read failed closed and the plan was replanned),
+        // this step is absent and every `?.contains(...)` below would evaluate to nil and fail in a
+        // way that LOOKS like a leak. Stop here with the real reason instead.
+        let persistedReadStep = try #require(stepSnapshot, "The ui.read_focused_element step is missing from the final durable plan — the read did not complete (replanned), so the secure-field boundary was not exercised")
+        _ = try #require(persistedReadStep.resultSummary, "The persisted read step has no resultSummary — the secure-field boundary was not exercised")
+        _ = try #require(persistedReadStep.verifiedEvidence, "The persisted read step has no verifiedEvidence — the secure-field boundary was not exercised")
         #expect(stepSnapshot?.resultSummary?.contains("super-secret-password") == false)
         #expect(stepSnapshot?.verifiedEvidence?.contains("super-secret-password") == false)
 
