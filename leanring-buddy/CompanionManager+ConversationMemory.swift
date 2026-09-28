@@ -19,7 +19,9 @@ extension CompanionManager {
             threadMemoryStore.clear()
             return
         }
-        threadMemoryStore.save(threadMemory.snapshot(now: Date()))
+        // Only the persisted copy is sanitized (PaceDurableConversationContent); the live
+        // in-session window keeps the original turns for the next prompt's context.
+        threadMemoryStore.save(PaceDurableConversationContent.durableSnapshot(threadMemory.snapshot(now: Date())))
     }
 
     /// Rehydrate the prior conversation at launch. Called once from
@@ -66,6 +68,13 @@ extension CompanionManager {
         // Push the turn into the verbatim window. If the window
         // overflowed, the displaced pair is what feeds the next
         // detached summarizer call.
+        // What of this turn may reach DURABLE memory: the original turn, or — when it contains
+        // credential-shaped content — metadata-only descriptors for the whole turn. Transient
+        // surfaces below (thread window, chat session, PacePad) keep the original text.
+        let durableTurn = PaceDurableConversationContent.durableTurn(
+            userTranscript: userTranscript,
+            assistantResponse: assistantResponse
+        )
         let displacedTurnPair = threadMemory.record(
             userTurn: userTranscript,
             assistantTurn: assistantResponse,
@@ -74,8 +83,8 @@ extension CompanionManager {
         )
 
         localRetriever.recordPaceHistory(
-            userTranscript: userTranscript,
-            assistantResponse: assistantResponse
+            userTranscript: durableTurn.userTranscript,
+            assistantResponse: durableTurn.assistantResponse
         )
         // Mirror the same turn into the in-window chat surface so the
         // Conversations tab stays aligned with the canonical
@@ -90,8 +99,8 @@ extension CompanionManager {
         let frontmostAppName = NSWorkspace.shared.frontmostApplication?.localizedName
         // 1. Fast pattern extractor — inline, sub-millisecond.
         let patternExtractedFacts = episodicPatternExtractor.extractFacts(
-            from: userTranscript,
-            assistantText: assistantResponse,
+            from: durableTurn.userTranscript,
+            assistantText: durableTurn.assistantResponse,
             frontmostApplicationName: frontmostAppName,
             sourceTurnId: stableTurnId
         )
@@ -103,8 +112,8 @@ extension CompanionManager {
         //    delta. LM Studio fallback is loopback-only. Either
         //    failure is silent — episodic memory is best-effort.
         scheduleDetachedEpisodicLLMExtractionCall(
-            userTranscript: userTranscript,
-            assistantSpokenText: assistantResponse,
+            userTranscript: durableTurn.userTranscript,
+            assistantSpokenText: durableTurn.assistantResponse,
             frontmostAppName: frontmostAppName,
             turnId: stableTurnId,
             intentRoute: lastIntentRouteForEpisodicExtraction
@@ -117,8 +126,8 @@ extension CompanionManager {
 
         // Dual-write the turn into the unified memory index (ships dark).
         recordUnifiedMemoryTurn(
-            userTranscript: userTranscript,
-            assistantResponse: assistantResponse,
+            userTranscript: durableTurn.userTranscript,
+            assistantResponse: durableTurn.assistantResponse,
             turnId: stableTurnId,
             recordedAt: recordedAt
         )
@@ -143,9 +152,10 @@ extension CompanionManager {
     ) {
         let priorSummaryForCall = threadMemory.currentSummaryText()
         let reservedSummaryVersion = threadMemory.reserveNextSummaryVersion()
+        // The rolling summary is persisted, so the summarizer only ever sees durable-safe input.
         let summarizerInput = PaceThreadSummarizerInput(
-            priorSummary: priorSummaryForCall,
-            displacedTurnPair: displacedTurnPair,
+            priorSummary: priorSummaryForCall.map { PaceDurableConversationContent.durableText($0, label: "conversation summary") },
+            displacedTurnPair: PaceDurableConversationContent.durableTurnPair(displacedTurnPair),
             sessionStartedAt: recordedAt,
             frontmostApplicationName: NSWorkspace.shared.frontmostApplication?.localizedName
         )

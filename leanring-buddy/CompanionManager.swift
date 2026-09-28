@@ -1183,7 +1183,7 @@ final class CompanionManager: ObservableObject {
                 guard let self else { return }
                 self.localRetriever.recordPaceHistory(
                     userTranscript: "(system) proactive nudge",
-                    assistantResponse: utterance.spokenText
+                    assistantResponse: PaceDurableConversationContent.durableText(utterance.spokenText, label: "proactive nudge")
                 )
                 self.refreshLocalRetrievalPublishedState()
             },

@@ -180,7 +180,9 @@ extension CompanionManager {
             : lastSpokenPrefix
         localRetriever.recordPaceHistory(
             userTranscript: "(system) barge-in interrupted assistant turn",
-            assistantResponse: "[interrupted-mid-speech] \(prefixForJournalLine)"
+            // The prefix is the assistant's own spoken text, so it passes the same durable-memory
+            // policy as a full turn (PaceDurableConversationContent).
+            assistantResponse: "[interrupted-mid-speech] \(PaceDurableConversationContent.durableText(prefixForJournalLine, label: "interrupted assistant speech"))"
         )
         refreshLocalRetrievalPublishedState()
     }
