@@ -14,6 +14,18 @@ import Foundation
 public final class QCoreRuntime: @unchecked Sendable {
     public static let shared = QCoreRuntime()
 
+    /// Where this runtime's executors write each completed plan's `plan_<planId>` memory record:
+    /// the runtime's own memory store when its provider is one, otherwise nowhere. A runtime never
+    /// falls back to the process-wide store, which would split one task's memory across two
+    /// stores. (In production the bootstrap's runtime provider IS the process-wide store instance,
+    /// so this resolves to that same store.)
+    static func planMemoryDestination(for memoryProvider: QMemoryProvider?) -> QPlanMemoryDestination {
+        if let runtimeMemoryStore = memoryProvider as? any QMemoryStore {
+            return .store(runtimeMemoryStore)
+        }
+        return .none
+    }
+
     private let lock = NSRecursiveLock()
     private var modelProvider: QModelProvider?
     private var memoryProvider: QMemoryProvider?
@@ -642,7 +654,10 @@ public final class QCoreRuntime: @unchecked Sendable {
         )
 
         // 6. Autonomous Closed-Loop Execution, Goal Evaluation & Controlled Replanning (Phase 2C & 2D)
-        let executor = QPlanExecutor(executionProvider: exec)
+        let executor = QPlanExecutor(
+            executionProvider: exec,
+            planMemoryDestination: Self.planMemoryDestination(for: memoryProvider)
+        )
         let goalEvaluator = QGoalEvaluator.shared
         let replanController = QReplanController(maxReplans: budget.maxReplans)
 
@@ -1399,7 +1414,10 @@ public final class QCoreRuntime: @unchecked Sendable {
         if case .waitingForPermission = plan.state {
             plan.state = .pending
         }
-        let executor = QPlanExecutor(executionProvider: exec)
+        let executor = QPlanExecutor(
+            executionProvider: exec,
+            planMemoryDestination: Self.planMemoryDestination(for: memoryProvider)
+        )
         let goalEvaluator = QGoalEvaluator.shared
 
         // If all steps in the plan are already complete, evaluate goal

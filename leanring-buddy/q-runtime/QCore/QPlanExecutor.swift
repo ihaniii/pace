@@ -15,13 +15,31 @@ public protocol QPlanExecutionObserver: AnyObject, Sendable {
     func stepDidTransition(step: QPlanStep, planId: UUID)
 }
 
+/// Where a completed plan's `plan_<planId>` memory record is written.
+public enum QPlanMemoryDestination: Sendable {
+    /// The process-wide store (`QRuntimeBootstrap.shared.getMemoryStore()`). The default for a
+    /// bare executor, preserving its original behavior.
+    case processDefault
+    /// Exactly this store — the owning runtime's own memory, so a task's plan record and its
+    /// other memory records always land in the same place.
+    case store(any QMemoryStore)
+    /// No plan record anywhere: the owning runtime has no `QMemoryStore`, and writing into a
+    /// different (process-wide) store would silently split that task's memory.
+    case none
+}
+
 public final class QPlanExecutor: Sendable {
     public static let shared = QPlanExecutor()
 
     private let executionService: any QExecutionProvider
+    private let planMemoryDestination: QPlanMemoryDestination
 
-    public init(executionProvider: (any QExecutionProvider)? = nil) {
+    public init(
+        executionProvider: (any QExecutionProvider)? = nil,
+        planMemoryDestination: QPlanMemoryDestination = .processDefault
+    ) {
         self.executionService = executionProvider ?? QExecutionService.shared
+        self.planMemoryDestination = planMemoryDestination
     }
 
     /// Executes a multi-step plan sequentially with strict verification gating at each step.
@@ -456,7 +474,16 @@ public final class QPlanExecutor: Sendable {
         // from that capability's own executor never placing it in QActionResult.summary/
         // verifiedEvidence — see QSafeTextEntryVerificationEvidence in
         // QTextEntrySecurityContracts.swift and docs/PHASE_2I_TEXT_ENTRY_SECURITY_REMEDIATION.md.
-        if let memory = QRuntimeBootstrap.shared.getMemoryStore() {
+        let planMemoryStore: (any QMemoryStore)?
+        switch planMemoryDestination {
+        case .processDefault:
+            planMemoryStore = QRuntimeBootstrap.shared.getMemoryStore()
+        case .store(let ownerMemoryStore):
+            planMemoryStore = ownerMemoryStore
+        case .none:
+            planMemoryStore = nil
+        }
+        if let memory = planMemoryStore {
             let memoryRecord = QMemoryRecord(
                 sessionId: plan.sessionId,
                 taskId: plan.taskId,
