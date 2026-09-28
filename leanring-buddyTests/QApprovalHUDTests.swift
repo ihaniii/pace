@@ -204,7 +204,7 @@ struct QApprovalHUDTests {
         manager.activeQPlanSnapshot = snapshot
 
         // This is the actual production entry point the clarification-chip Button calls.
-        manager.resolveClarification(option: "Deny")
+        manager.resolveClarification(option: "Deny", triggeringEvent: nil)
 
         // Immediate synchronous feedback — no execution wait, since nothing is running.
         #expect(manager.currentTurnHUDState.status == .unsupported)

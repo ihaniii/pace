@@ -311,7 +311,7 @@ struct QPlanUIObservationTests {
         manager.activeQPlanSnapshot = snapshot
 
         // User denies permission
-        manager.resolveClarification(option: "Deny")
+        manager.resolveClarification(option: "Deny", triggeringEvent: nil)
 
         #expect(manager.currentTurnHUDState.status == .unsupported)
         #expect(manager.currentTurnHUDState.title == "Local only")

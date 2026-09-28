@@ -63,7 +63,9 @@ struct PaceTurnHUDView: View {
                     HStack(spacing: 6) {
                         ForEach(companionManager.currentTurnHUDState.options, id: \.self) { option in
                             Button(action: {
-                                companionManager.resolveClarification(option: option)
+                                // The event that pressed this chip: Que refuses to resolve an
+                                // approval with an event its own process synthesized.
+                                companionManager.resolveClarification(option: option, triggeringEvent: NSApp.currentEvent)
                             }) {
                                 Text(option)
                                     .font(.system(size: 10, weight: .semibold))

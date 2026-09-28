@@ -178,7 +178,10 @@ extension CompanionManager {
         }
     }
 
-    func resolveClarification(option: String) {
+    /// `triggeringEvent` is the input event that pressed the HUD chip (`NSApp.currentEvent`
+    /// at the Button action), or nil for an Accessibility press. It is required, not
+    /// defaulted, so no caller can reach the approval branch without it being considered.
+    func resolveClarification(option: String, triggeringEvent: NSEvent?) {
         // A pending click-target clarification carries an exact target the
         // user just chose, so it takes precedence over the transcript-rewrite
         // path: resolving it clicks the chosen candidate directly instead of
@@ -191,6 +194,13 @@ extension CompanionManager {
         // Q Security Architecture — Handle Live QPlan Permission HUD resolution (Phase 2F)
         if let snapshot = activeQPlanSnapshot,
            case .waitingForPermission = snapshot.planState {
+            // Que must never approve (or deny) its own pending action: a click or keystroke that
+            // Que's own executors synthesized is refused here, before anything is resolved. The
+            // approval stays pending and the chips stay up, so the user can still decide.
+            guard PaceApprovalInputOrigin.verdict(forTriggeringEvent: triggeringEvent) == .allowed else {
+                recordSelfSynthesizedApprovalAttemptRefused(snapshot: snapshot, option: option)
+                return
+            }
             let approved = option.lowercased() == "allow"
             if !approved {
                 // Denial needs no execution wait — nothing is running, so reflect it in the HUD

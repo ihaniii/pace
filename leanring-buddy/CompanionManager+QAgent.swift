@@ -196,6 +196,27 @@ extension CompanionManager: QAgentStateObserver, QPlanExecutionObserver {
 
     // MARK: - Permission UX Resolution (Phase 2F)
 
+    /// Audit trail for an approval chip pressed by an event Que itself synthesized
+    /// (`PaceApprovalInputOrigin`). Nothing is resolved; the request stays pending. Only the
+    /// request's own metadata is recorded — `rawArguments` is hashed by `QAuditRecord`.
+    func recordSelfSynthesizedApprovalAttemptRefused(snapshot: QRuntimeUISnapshot, option: String) {
+        let pendingRequest = snapshot.pendingApproval
+        let taskId = pendingRequest?.taskId ?? snapshot.taskId ?? "unknown"
+        QAuditLogger.shared.record(
+            QAuditRecord(
+                sessionId: taskId,
+                taskId: taskId,
+                tool: pendingRequest?.toolName ?? "unknown",
+                riskLevel: pendingRequest?.riskLevel ?? .level2UserApproval,
+                rawArguments: pendingRequest?.literalAction ?? "",
+                authorizationResult: "deny",
+                provenance: "untrusted:self-synthesized-input",
+                executionSummary: "Refused approval chip '\(option)': the triggering input event was synthesized by Que's own process. The approval remains pending.",
+                error: "self_synthesized_approval_input"
+            )
+        )
+    }
+
     /// Handles user clicking "Allow" or "Deny" in the permission HUD.
     ///
     /// Resolves the pending approval through the real Phase 2E API
