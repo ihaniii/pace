@@ -481,7 +481,10 @@ public final class QCoreRuntime: @unchecked Sendable {
                             payload: ["directAnswer": directAnswer.text]
                         )
                     )
-                    try? await memoryProvider?.recordTaskCompletion(task, result: directAnswer.text)
+                    try? await memoryProvider?.recordTaskCompletion(
+                        task,
+                        result: QTaskCompletionMemoryContent.durableDescriptor(for: .directAnswer, completionText: directAnswer.text)
+                    )
                     QAuditLogger.shared.record(
                         QAuditRecord(
                             sessionId: sessionId,
@@ -946,7 +949,11 @@ public final class QCoreRuntime: @unchecked Sendable {
                     )
                 )
 
-                try? await memoryProvider?.recordTaskCompletion(task, result: finalSummary)
+                // Durable memory gets metadata only — never the model's prose (see QTaskCompletionMemoryContent).
+                try? await memoryProvider?.recordTaskCompletion(
+                    task,
+                    result: QTaskCompletionMemoryContent.durableDescriptor(for: .completionSummary, completionText: finalSummary)
+                )
 
                 // HIGH-1 remediation: `finalSummary` is the model-grounded
                 // natural-language response text — "do not log raw model
@@ -1151,7 +1158,10 @@ public final class QCoreRuntime: @unchecked Sendable {
                         payload: ["reason": finalFailureSummary]
                     )
                 )
-                try? await memoryProvider?.recordTaskCompletion(task, result: "Failed: \(denialReason)")
+                try? await memoryProvider?.recordTaskCompletion(
+                    task,
+                    result: QTaskCompletionMemoryContent.durableDescriptor(for: .failureReason, completionText: "Failed: \(denialReason)")
+                )
                 return task
             }
         }
