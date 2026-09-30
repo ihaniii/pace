@@ -18,6 +18,9 @@
 //  branches on AXIsProcessTrusted() and no-ops rather than fabricating a pass, mirroring the exact
 //  convention every prior semantic AX test suite in this codebase already established.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -30,33 +33,29 @@ import ApplicationServices
 /// A genuine, real, live `NSWindow` — already a real `AXWindow`-role AXUIElement via default
 /// AppKit Accessibility bridging, with no custom `NSAccessibility` override needed. Its
 /// `kAXMinimizedAttribute` is wired to the window's own real miniaturized state.
-@MainActor
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host), then made key,
+/// ordered front and optionally miniaturized within the fixture app exactly as the in-process
+/// helper did. Returns the fixture's window token.
+@discardableResult
 private func makeMinimizableWindow(
+    in fixture: PaceAXFixture,
     title: String,
     identifier: String? = nil,
     initiallyMinimized: Bool = false
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled, .miniaturizable],
-        backing: .buffered,
-        defer: false
+) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 200,
+        height: 80,
+        styles: ["titled", "miniaturizable"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
     if initiallyMinimized {
-        window.miniaturize(nil)
+        try await fixture.perform(windowToken, "miniaturize")
     }
-    return window
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    return windowToken
 }
 
 @Suite("QSemanticWindowMinimizedStateTests")
@@ -113,16 +112,18 @@ struct QSemanticWindowMinimizedStateTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: nil, desiredMinimized: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: nil, desiredMinimized: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.set_window_minimized", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Minimize window",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "desiredMinimized": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "desiredMinimized": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-window"))
         #expect(result.success == false)
@@ -133,10 +134,12 @@ struct QSemanticWindowMinimizedStateTests {
 
     @Test("6/7. Missing/invalid desiredMinimized fails closed with a deterministic error")
     func missingOrInvalidDesiredMinimizedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.set_window_minimized", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Minimize window",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-minimized"))
         #expect(missingResult.success == false)
@@ -146,7 +149,7 @@ struct QSemanticWindowMinimizedStateTests {
             let request = QActionRequest(
                 toolName: "ui.set_window_minimized", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Minimize window",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x", "desiredMinimized": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x", "desiredMinimized": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-minimized"))
             #expect(result.success == false, "Invalid desiredMinimized '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -163,10 +166,12 @@ struct QSemanticWindowMinimizedStateTests {
 
     @Test("9-18. AXApplication, AXGroup, AXButton, AXSheet, AXRow, AXTable, AXOutline, AXMenuBar, AXDrawer, and an unrecognized role are all rejected for window-minimized-state mutation at the role-policy gate")
     func nonWindowRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXApplication", "AXGroup", "AXButton", "AXSheet", "AXRow", "AXTable", "AXOutline", "AXMenuBar", "AXDrawer", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedWindowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredMinimized: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredMinimized: true
                 )
             }
         }
@@ -179,18 +184,19 @@ struct QSemanticWindowMinimizedStateTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "PresentWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMinimizableWindow(in: fixture, title: "PresentWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)", desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)", desiredMinimized: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredMinimized: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredMinimized: true
             )
         }
 
@@ -208,12 +214,13 @@ struct QSemanticWindowMinimizedStateTests {
     func identifierPreferredOverTitle() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "SharedTitle-\(suffix)", identifier: "unique-window-id-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "SharedTitle-\(suffix)", identifier: "unique-window-id-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: "unique-window-id-\(suffix)", title: nil, desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: "unique-window-id-\(suffix)", title: nil, desiredMinimized: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
     }
@@ -225,17 +232,15 @@ struct QSemanticWindowMinimizedStateTests {
     func ambiguousDuplicateTitleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeMinimizableWindow(title: "DupWindow-\(suffix)")
-        let windowB = makeMinimizableWindow(title: "DupWindow-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMinimizableWindow(in: fixture, title: "DupWindow-\(suffix)")
+        try await makeMinimizableWindow(in: fixture, title: "DupWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DupWindow-\(suffix)", desiredMinimized: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DupWindow-\(suffix)", desiredMinimized: true
             )
         }
     }
@@ -263,18 +268,19 @@ struct QSemanticWindowMinimizedStateTests {
     func nonExactTitleVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "ExactWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "ExactWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExactWindow-", desiredMinimized: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExactWindow-", desiredMinimized: true
             )
         }
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "EXACTWINDOW-\(suffix)".uppercased(), desiredMinimized: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "EXACTWINDOW-\(suffix)".uppercased(), desiredMinimized: true
             )
         }
         // No index/position-based parameter exists in the schema at all (only
@@ -307,11 +313,12 @@ struct QSemanticWindowMinimizedStateTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
 
-        let minimizedWindow = makeMinimizableWindow(title: "AlreadyMin-\(suffix)", initiallyMinimized: true)
-        defer { minimizedWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMinimizableWindow(in: fixture, title: "AlreadyMin-\(suffix)", initiallyMinimized: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let outcomeTrue = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AlreadyMin-\(suffix)", desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AlreadyMin-\(suffix)", desiredMinimized: true
         )
         // .alreadyDesired is the ONLY branch in setWindowMinimizedState's implementation that
         // returns without an intervening AXUIElementSetAttributeValue call — structurally proving
@@ -321,11 +328,10 @@ struct QSemanticWindowMinimizedStateTests {
         #expect(outcomeTrue.previousMinimized == true)
         #expect(outcomeTrue.currentMinimized == true)
 
-        let restoredWindow = makeMinimizableWindow(title: "AlreadyRestored-\(suffix)", initiallyMinimized: false)
-        defer { restoredWindow.close() }
+        try await makeMinimizableWindow(in: fixture, title: "AlreadyRestored-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
         let outcomeFalse = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AlreadyRestored-\(suffix)", desiredMinimized: false
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AlreadyRestored-\(suffix)", desiredMinimized: false
         )
         #expect(outcomeFalse.changeKind == .alreadyDesired)
         #expect(outcomeFalse.previousMinimized == false)
@@ -340,25 +346,26 @@ struct QSemanticWindowMinimizedStateTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
 
-        let window = makeMinimizableWindow(title: "ToMinimize-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "ToMinimize-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let minimizeOutcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ToMinimize-\(suffix)", desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ToMinimize-\(suffix)", desiredMinimized: true
         )
         #expect(minimizeOutcome.changeKind == .changed)
         #expect(minimizeOutcome.previousMinimized == false)
         #expect(minimizeOutcome.currentMinimized == true)
-        #expect(window.isMiniaturized == true)
+        #expect(try await fixture.bool(window, "isMiniaturized") == true)
 
         let restoreOutcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ToMinimize-\(suffix)", desiredMinimized: false
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ToMinimize-\(suffix)", desiredMinimized: false
         )
         #expect(restoreOutcome.changeKind == .changed)
         #expect(restoreOutcome.previousMinimized == true)
         #expect(restoreOutcome.currentMinimized == false)
-        #expect(window.isMiniaturized == false)
+        #expect(try await fixture.bool(window, "isMiniaturized") == false)
     }
 
     // MARK: - 31. Approval required, never dispatches silently
@@ -406,8 +413,9 @@ struct QSemanticWindowMinimizedStateTests {
     func denyBlocksSetWindowMinimized() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "DenyWindow-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "DenyWindow-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -420,7 +428,7 @@ struct QSemanticWindowMinimizedStateTests {
                   "actionName": "ui.set_window_minimized",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified window's minimized state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "DenyWindow-\(suffix)", "desiredMinimized": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "DenyWindow-\(suffix)", "desiredMinimized": "true"}
                 }
               ]
             }
@@ -443,7 +451,7 @@ struct QSemanticWindowMinimizedStateTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(window.isMiniaturized == false)
+        #expect(try await fixture.bool(window, "isMiniaturized") == false)
     }
 
     // MARK: - 33. Persisted / expiry-equivalent approval never self-authorizes
@@ -554,8 +562,9 @@ struct QSemanticWindowMinimizedStateTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "PredispatchWindow-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "PredispatchWindow-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -568,7 +577,7 @@ struct QSemanticWindowMinimizedStateTests {
                   "actionName": "ui.set_window_minimized",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified window's minimized state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "PredispatchWindow-\(suffix)", "desiredMinimized": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "PredispatchWindow-\(suffix)", "desiredMinimized": "true"}
                 }
               ]
             }
@@ -581,7 +590,7 @@ struct QSemanticWindowMinimizedStateTests {
             endpointName: "semantic-window-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Minimize the window")
-        #expect(window.isMiniaturized == false)
+        #expect(try await fixture.bool(window, "isMiniaturized") == false)
     }
 
     @Test("37. Approving the request minimizes the window exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -589,8 +598,9 @@ struct QSemanticWindowMinimizedStateTests {
     func allowMinimizesWindowAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "AllowWindow-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "AllowWindow-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -603,7 +613,7 @@ struct QSemanticWindowMinimizedStateTests {
                   "actionName": "ui.set_window_minimized",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified window's minimized state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "AllowWindow-\(suffix)", "desiredMinimized": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "AllowWindow-\(suffix)", "desiredMinimized": "true"}
                 }
               ]
             }
@@ -630,7 +640,7 @@ struct QSemanticWindowMinimizedStateTests {
         // Execution happens entirely inside executeSetWindowMinimized, invoked only after the
         // approval grant is consumed — resolution (collectMatches) is therefore always fresh,
         // never a reference held from before approval. Real, observed outcome:
-        #expect(window.isMiniaturized == true)
+        #expect(try await fixture.bool(window, "isMiniaturized") == true)
     }
 
     // MARK: - 38. Minimized-state drift between the two internal reads surrounding dispatch fails closed (documented)
@@ -656,17 +666,18 @@ struct QSemanticWindowMinimizedStateTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "VerifyMatch-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "VerifyMatch-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "VerifyMatch-\(suffix)", desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "VerifyMatch-\(suffix)", desiredMinimized: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axWindowMinimizedStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "VerifyMatch-\(suffix)",
@@ -684,17 +695,18 @@ struct QSemanticWindowMinimizedStateTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "VerifyMismatch-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "VerifyMismatch-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "VerifyMismatch-\(suffix)", desiredMinimized: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "VerifyMismatch-\(suffix)", desiredMinimized: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axWindowMinimizedStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "VerifyMismatch-\(suffix)",
@@ -709,12 +721,14 @@ struct QSemanticWindowMinimizedStateTests {
 
     @Test("41. An unresolvable/ambiguous target after the mutation fails verification rather than assuming success — a window's disappearance is never automatically interpreted as success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axWindowMinimizedStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "vanished-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=vanished",
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=vanished",
             desiredMinimized: true
         )
         let result = QActionResult(actionId: "verify-vanished-window", success: true, summary: "n/a")
@@ -725,12 +739,14 @@ struct QSemanticWindowMinimizedStateTests {
 
     @Test("42. A successful attribute-set alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axWindowMinimizedStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "insufficient-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=insufficient",
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=insufficient",
             desiredMinimized: true
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-window", success: true, summary: "Window minimized-state mutation attempted. Independent closed-loop verification pending.")
@@ -746,8 +762,9 @@ struct QSemanticWindowMinimizedStateTests {
     func recoveryRecognizesAlreadyDesiredAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "RecoveredWindow-\(suffix)", initiallyMinimized: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "RecoveredWindow-\(suffix)", initiallyMinimized: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -761,7 +778,7 @@ struct QSemanticWindowMinimizedStateTests {
             stepId: "step-uncertain-window", index: 0, actionName: "ui.set_window_minimized", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Minimize window",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "RecoveredWindow-\(suffix)", "desiredMinimized": "true"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "RecoveredWindow-\(suffix)", "desiredMinimized": "true"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -818,8 +835,9 @@ struct QSemanticWindowMinimizedStateTests {
     func recoveryHandlesFalseDirectionToo() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "RecoveredRestore-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "RecoveredRestore-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -833,7 +851,7 @@ struct QSemanticWindowMinimizedStateTests {
             stepId: "step-uncertain-window-restore", index: 0, actionName: "ui.set_window_minimized", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Restore window",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "RecoveredRestore-\(suffix)", "desiredMinimized": "false"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "RecoveredRestore-\(suffix)", "desiredMinimized": "false"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -928,8 +946,9 @@ struct QSemanticWindowMinimizedStateTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "SafeEvidence-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "SafeEvidence-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -942,7 +961,7 @@ struct QSemanticWindowMinimizedStateTests {
                   "actionName": "ui.set_window_minimized",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified window's minimized state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "SafeEvidence-\(suffix)", "desiredMinimized": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "SafeEvidence-\(suffix)", "desiredMinimized": "true"}
                 }
               ]
             }
@@ -1027,11 +1046,12 @@ struct QSemanticWindowMinimizedStateTests {
             return
         }
         let suffix = UUID().uuidString
-        let window = makeMinimizableWindow(title: "E2EWindow-\(suffix)", initiallyMinimized: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMinimizableWindow(in: fixture, title: "E2EWindow-\(suffix)", initiallyMinimized: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(window.isMiniaturized == false)
+        #expect(try await fixture.bool(window, "isMiniaturized") == false)
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -1043,7 +1063,7 @@ struct QSemanticWindowMinimizedStateTests {
                   "actionName": "ui.set_window_minimized",
                   "toolFamily": "ui",
                   "description": "Minimize the window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "E2EWindow-\(suffix)", "desiredMinimized": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "E2EWindow-\(suffix)", "desiredMinimized": "true"}
                 }
               ]
             }
@@ -1069,9 +1089,9 @@ struct QSemanticWindowMinimizedStateTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(window.isMiniaturized == true)
+        #expect(try await fixture.bool(window, "isMiniaturized") == true)
         let evidenceAfterMinimize = await QBridgeAccessibility.shared.observeWindowMinimizedStateEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)"
         )
         guard case .resolved(let currentMinimizedAfterMinimize) = evidenceAfterMinimize else {
             #expect(Bool(false), "Expected the window to remain resolvable with a readable minimized state, got: \(evidenceAfterMinimize)")
@@ -1082,12 +1102,12 @@ struct QSemanticWindowMinimizedStateTests {
         // Also directly exercise the restore direction through the bridge layer, independent of
         // the full runtime/approval plumbing already proven above.
         let restoreOutcome = try await QBridgeAccessibility.shared.setWindowMinimizedState(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)", desiredMinimized: false
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)", desiredMinimized: false
         )
         #expect(restoreOutcome.changeKind == .changed)
-        #expect(window.isMiniaturized == false)
+        #expect(try await fixture.bool(window, "isMiniaturized") == false)
         let evidenceAfterRestore = await QBridgeAccessibility.shared.observeWindowMinimizedStateEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2EWindow-\(suffix)"
         )
         guard case .resolved(let currentMinimizedAfterRestore) = evidenceAfterRestore else {
             #expect(Bool(false), "Expected the window to remain resolvable with a readable minimized state, got: \(evidenceAfterRestore)")

@@ -14,6 +14,9 @@
 //  See docs/PHASE_2I_TEXT_ENTRY_SECURITY_REMEDIATION.md for the full privacy contract this
 //  capability implements.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: a same-process AX value write into AppKit's own text system deadlocks (NSTextView) or crashes on a main-queue assertion.
+//
 
 import Testing
 import AppKit
@@ -34,74 +37,54 @@ private func rawAXFocusedIdentifier() -> String? {
     return idValue as? String
 }
 
-/// Best-effort real focus establishment for a test fixture control — activates the test host
-/// app, makes the window key, and makes the control the first responder, then polls the REAL
-/// system-wide AX focused element (not just `NSWindow.firstResponder`) until it reports the
-/// expected identifier. Environments without a genuine window-server focus session (e.g. some CI
-/// runners) may never converge; callers must treat a `false` return as "cannot establish real
-/// focus here" and no-op rather than fail, exactly like the existing `AXIsProcessTrusted()` gate.
+/// Best-effort real focus establishment for a fixture control — activates the out-of-process
+/// fixture app, makes its window key, and makes the control the first responder, then polls the
+/// REAL system-wide AX focused element (not just the fixture's own first responder) until it
+/// reports the expected identifier. Environments without a genuine window-server focus session
+/// (e.g. some CI runners) may never converge; callers must treat a `false` return as "cannot
+/// establish real focus here" and no-op rather than fail, exactly like the existing
+/// `AXIsProcessTrusted()` gate.
 @MainActor
 @discardableResult
-private func establishRealAXFocus(window: NSWindow, responder: NSResponder, identifier: String, timeout: TimeInterval = 3.0) async -> Bool {
+private func establishRealAXFocus(in fixture: PaceAXFixture, window: String, responder: String, identifier: String, timeout: TimeInterval = 3.0) async -> Bool {
     guard AXIsProcessTrusted() else { return false }
-    NSApp.activate(ignoringOtherApps: true)
-    window.makeKeyAndOrderFront(nil)
-    _ = window.makeFirstResponder(responder)
+    try? await fixture.applicationOperation("activate")
+    NSRunningApplication(processIdentifier: fixture.processIdentifier)?.activate()
+    try? await fixture.perform(window, "makeKeyAndOrderFront")
+    try? await fixture.perform(responder, "makeFirstResponderInWindow")
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if rawAXFocusedIdentifier() == identifier { return true }
-        _ = window.makeFirstResponder(responder)
+        try? await fixture.perform(responder, "makeFirstResponderInWindow")
         try? await Task.sleep(nanoseconds: 150_000_000)
     }
     return rawAXFocusedIdentifier() == identifier
 }
 
-@MainActor
-private func makeTextFieldWindow(identifier: String, initialValue: String) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real, editable NSTextField in a titled window, built inside the out-of-process
+/// PaceAXFixtureHost (never in this XCTest host) with the same geometry and initial value the
+/// in-process helper used. Returns the fixture window token and the field's fixture handle (also
+/// its AX identifier).
+private func makeTextFieldWindow(in fixture: PaceAXFixture, identifier: String, initialValue: String) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTextEntryTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField", identifier: identifier, windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["stringValue": initialValue]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTextEntryTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = initialValue
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeTextAreaWindow(identifier: String, initialValue: String) -> (window: NSWindow, view: NSTextView) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 160),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real, editable, bare (not scroll-view-hosted) NSTextView in a titled window, built inside the
+/// out-of-process PaceAXFixtureHost exactly like the in-process helper did.
+private func makeTextAreaWindow(in fixture: PaceAXFixture, identifier: String, initialValue: String) async throws -> (window: String, view: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTextEntryTestFixture", width: 300, height: 160, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textView", identifier: identifier, windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 260, height: 120), properties: ["inScrollView": false, "string": initialValue]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTextEntryTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 160))
-    let textView = NSTextView(frame: NSRect(x: 20, y: 20, width: 260, height: 120))
-    textView.string = initialValue
-    textView.isEditable = true
-    textView.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(textView)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, textView)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @discardableResult
@@ -380,24 +363,27 @@ struct QSemanticTextEntryTests {
     func validTextAreaTargetIsWritten() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, view) = makeTextAreaWindow(identifier: "area-\(suffix)", initialValue: "old body")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: view, identifier: "area-\(suffix)") else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, view) = try await makeTextAreaWindow(in: fixture, identifier: "area-\(suffix)", initialValue: "old body")
+        guard await establishRealAXFocus(in: fixture, window: window, responder: view, identifier: "area-\(suffix)") else { return }
 
         let outcome = try await QBridgeAccessibility.shared.setTextValue(
-            applicationName: currentProcessAppName, role: "AXTextArea", identifier: "area-\(suffix)", title: nil, newValue: "new body text"
+            applicationName: fixture.applicationName, role: "AXTextArea", identifier: "area-\(suffix)", title: nil, newValue: "new body text"
         )
         #expect(outcome.valueChanged == true)
-        #expect(view.string == "new body text")
+        #expect(try await fixture.string(view, "string") == "new body text")
     }
 
     // MARK: - 4. Disallowed role (AXSecureTextField) rejected before any search
 
     @Test("4. A secure-text-field role is rejected before any AX search is even attempted")
     func secureTextFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedTargetRole("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil, newValue: "x"
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil, newValue: "x"
             )
         }
     }
@@ -406,15 +392,17 @@ struct QSemanticTextEntryTests {
 
     @Test("4b. An unrecognized role is rejected by the same fail-closed allowlist check")
     func unknownRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedTargetRole("AXCustomWidgetRole")) {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXCustomWidgetRole", identifier: "whatever", title: nil, newValue: "x"
+                applicationName: fixture.applicationName, role: "AXCustomWidgetRole", identifier: "whatever", title: nil, newValue: "x"
             )
         }
         // AXStaticText specifically, since it is a real, common AX role (unlike a made-up one).
         await #expect(throws: QAXInteractionError.disallowedTargetRole("AXStaticText")) {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXStaticText", identifier: "whatever", title: nil, newValue: "x"
+                applicationName: fixture.applicationName, role: "AXStaticText", identifier: "whatever", title: nil, newValue: "x"
             )
         }
     }
@@ -426,13 +414,14 @@ struct QSemanticTextEntryTests {
     func zeroMatchesFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "present-\(suffix)", initialValue: "x")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "present-\(suffix)", initialValue: "x")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil, newValue: "y"
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil, newValue: "y"
             )
         }
     }
@@ -444,26 +433,24 @@ struct QSemanticTextEntryTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldA.isEditable = true
-        fieldA.setAccessibilityIdentifier("dup-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        fieldB.isEditable = true
-        fieldB.setAccessibilityIdentifier("dup-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real, editable text fields that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "textField", identifier: "dup-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "textField", identifier: "dup-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setTextValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-\(suffix)", title: nil, newValue: "z"
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-\(suffix)", title: nil, newValue: "z"
             )
         }
     }
@@ -514,16 +501,17 @@ struct QSemanticTextEntryTests {
     func alreadyEqualValueIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "noop-\(suffix)", initialValue: "same value")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "noop-\(suffix)") else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "noop-\(suffix)", initialValue: "same value")
+        guard await establishRealAXFocus(in: fixture, window: window, responder: field, identifier: "noop-\(suffix)") else { return }
 
         let outcome = try await QBridgeAccessibility.shared.setTextValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil, newValue: "same value"
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil, newValue: "same value"
         )
         #expect(outcome.valueChanged == false)
         #expect(outcome.previousLength == outcome.currentLength)
-        #expect(field.stringValue == "same value")
+        #expect(try await fixture.string(field, "stringValue") == "same value")
     }
 
     // MARK: - 8b. Stale target comparison primitive
@@ -597,9 +585,10 @@ struct QSemanticTextEntryTests {
     func denyBlocksSetTextValue() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "deny-target-\(suffix)", initialValue: "untouched")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "deny-target-\(suffix)") else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "deny-target-\(suffix)", initialValue: "untouched")
+        guard await establishRealAXFocus(in: fixture, window: window, responder: field, identifier: "deny-target-\(suffix)") else { return }
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -611,7 +600,7 @@ struct QSemanticTextEntryTests {
                   "actionName": "ui.set_text_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified text field's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "deny-target-\(suffix)", "value": "denied value"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "deny-target-\(suffix)", "value": "denied value"}
                 }
               ]
             }
@@ -634,7 +623,7 @@ struct QSemanticTextEntryTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(field.stringValue == "untouched")
+        #expect(try await fixture.string(field, "stringValue") == "untouched")
     }
 
     // MARK: - 11. Allow -> writes exactly once, closed-loop verified
@@ -754,9 +743,10 @@ struct QSemanticTextEntryTests {
     func abandonedApprovalNeverExecutes() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "abandon-target-\(suffix)", initialValue: "untouched")
-        defer { window.close() }
-        guard await establishRealAXFocus(window: window, responder: field, identifier: "abandon-target-\(suffix)") else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "abandon-target-\(suffix)", initialValue: "untouched")
+        guard await establishRealAXFocus(in: fixture, window: window, responder: field, identifier: "abandon-target-\(suffix)") else { return }
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -768,7 +758,7 @@ struct QSemanticTextEntryTests {
                   "actionName": "ui.set_text_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified text field's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "abandon-target-\(suffix)", "value": "abandoned"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "abandon-target-\(suffix)", "value": "abandoned"}
                 }
               ]
             }
@@ -788,7 +778,7 @@ struct QSemanticTextEntryTests {
         }
         // Deliberately never call resolveApproval.
         #expect(QApprovalCoordinator.shared.consumeGrantIfPresent(fingerprint: identity.stepFingerprint) == false)
-        #expect(field.stringValue == "untouched")
+        #expect(try await fixture.string(field, "stringValue") == "untouched")
     }
 
     // MARK: - 15. Closed-loop verification fails (never fabricates success) when the value does not match

@@ -18,6 +18,9 @@
 //  Numeric metadata only (minValue, maxValue, currentValue, valueIncrement). Never clamps, never
 //  repairs, never substitutes a default for an invalid or inconsistent range.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -25,54 +28,49 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeSliderWindow(identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) -> (window: NSWindow, slider: NSSlider) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeSliderWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeSliderWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100
+) async throws -> (window: String, slider: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementRangeReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "slider",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["minValue": minValue, "maxValue": maxValue, "doubleValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementRangeReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let slider = NSSlider(value: value, minValue: minValue, maxValue: maxValue, target: nil, action: nil)
-    slider.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    slider.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(slider)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, slider)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeStepperWindow(identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) -> (window: NSWindow, stepper: NSStepper) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeStepperWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeStepperWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100
+) async throws -> (window: String, stepper: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementRangeReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "stepper",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 40, height: 24),
+        properties: ["minValue": minValue, "maxValue": maxValue, "doubleValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementRangeReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let stepper = NSStepper(frame: NSRect(x: 20, y: 20, width: 40, height: 24))
-    stepper.minValue = minValue
-    stepper.maxValue = maxValue
-    stepper.doubleValue = value
-    stepper.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(stepper)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, stepper)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementRangeReadMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -152,12 +150,13 @@ struct QSemanticElementRangeReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "range-\(suffix)", value: 25, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "range-\(suffix)", value: 25, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let range = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "range-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "range-\(suffix)", title: nil
         )
         #expect(range.minValue == 0)
         #expect(range.maxValue == 100)
@@ -190,18 +189,19 @@ struct QSemanticElementRangeReadTests {
     func exactTargetResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "byid-\(suffix)", value: 40, minValue: 0, maxValue: 100)
-        slider.setAccessibilityLabel("ByTitleSlider-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "byid-\(suffix)", value: 40, minValue: 0, maxValue: 100)
+        try await fixture.setAccessibility(slider, "label", "ByTitleSlider-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let byIdentifier = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "byid-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "byid-\(suffix)", title: nil
         )
         #expect(byIdentifier.currentValue == 40)
 
         let byTitle = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: nil, title: "ByTitleSlider-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: nil, title: "ByTitleSlider-\(suffix)"
         )
         #expect(byTitle.currentValue == 40)
     }
@@ -213,13 +213,14 @@ struct QSemanticElementRangeReadTests {
     func zeroTargetMatchesFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "present-\(suffix)", value: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeSliderWindow(in: fixture, identifier: "present-\(suffix)", value: 1)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementRange(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -231,26 +232,17 @@ struct QSemanticElementRangeReadTests {
     func ambiguousTargetMatchesFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let sliderA = NSSlider(value: 10, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderA.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-        sliderA.setAccessibilityIdentifier("dup-range-\(suffix)")
-        let sliderB = NSSlider(value: 20, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderB.frame = NSRect(x: 20, y: 60, width: 240, height: 24)
-        sliderB.setAccessibilityIdentifier("dup-range-\(suffix)")
-        contentView.addSubview(sliderA)
-        contentView.addSubview(sliderB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "slider", identifier: "inline-sliderA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 10.0, "accessibilityIdentifier": "dup-range-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "slider", identifier: "inline-sliderB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 20.0, "accessibilityIdentifier": "dup-range-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementRange(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "dup-range-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "dup-range-\(suffix)", title: nil
             )
         }
     }
@@ -272,14 +264,15 @@ struct QSemanticElementRangeReadTests {
 
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeStepperWindow(identifier: "incrementor-\(suffix)", value: 5, minValue: 0, maxValue: 20)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeStepperWindow(in: fixture, identifier: "incrementor-\(suffix)", value: 5, minValue: 0, maxValue: 20)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // A real NSStepper's own AX role is "AXIncrementor", not "AXStepper" — proven by
         // resolving it successfully under the correct, SDK-verified role string.
         let range = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXIncrementor", identifier: "incrementor-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXIncrementor", identifier: "incrementor-\(suffix)", title: nil
         )
         #expect(range.minValue == 0)
         #expect(range.maxValue == 20)
@@ -297,10 +290,12 @@ struct QSemanticElementRangeReadTests {
 
     @Test("10. Disallowed roles are rejected before any AX search is even attempted")
     func unsupportedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXButton", "AXTextField", "AXCheckBox", "AXWindow", "AXProgressIndicator", "AXLevelIndicator"] {
             await #expect(throws: QAXInteractionError.disallowedRangeReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementRange(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -313,12 +308,13 @@ struct QSemanticElementRangeReadTests {
     func minMaxCurrentValueReadCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "mmc-\(suffix)", value: 33, minValue: 10, maxValue: 90)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "mmc-\(suffix)", value: 33, minValue: 10, maxValue: 90)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let range = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "mmc-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "mmc-\(suffix)", title: nil
         )
         #expect(range.minValue == 10)
         #expect(range.maxValue == 90)
@@ -333,12 +329,13 @@ struct QSemanticElementRangeReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         // A plain NSSlider does not set kAXValueIncrementAttribute — a real, honest absence.
-        let (window, _) = makeSliderWindow(identifier: "noincrement-\(suffix)", value: 5, minValue: 0, maxValue: 10)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "noincrement-\(suffix)", value: 5, minValue: 0, maxValue: 10)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let range = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "noincrement-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "noincrement-\(suffix)", title: nil
         )
         // Honestly nil, not a fabricated "1.0" or any other invented default.
         #expect(range.valueIncrement == nil)
@@ -389,8 +386,9 @@ struct QSemanticElementRangeReadTests {
     func currentValueOutsideRangeFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "outside-\(suffix)", value: 50, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "outside-\(suffix)", value: 50, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // Directly write an out-of-range value via AXUIElementSetAttributeValue is not exposed to
@@ -418,14 +416,15 @@ struct QSemanticElementRangeReadTests {
     func noMutationOccurs() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "nomutate-range-\(suffix)", value: 42, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "nomutate-range-\(suffix)", value: 42, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "nomutate-range-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "nomutate-range-\(suffix)", title: nil
         )
-        #expect(slider.doubleValue == 42)
+        #expect(try await fixture.double(slider, "doubleValue") == 42)
     }
 
     // MARK: - 21. No actions performed
@@ -596,8 +595,9 @@ struct QSemanticElementRangeReadTests {
     func noSensitiveDataPersisted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "safe-evidence-\(suffix)", value: 7, minValue: 0, maxValue: 10)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "safe-evidence-\(suffix)", value: 7, minValue: 0, maxValue: 10)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -610,7 +610,7 @@ struct QSemanticElementRangeReadTests {
                   "actionName": "ui.read_element_range",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's numeric range",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "safe-evidence-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "safe-evidence-\(suffix)"}
                 }
               ]
             }
@@ -652,18 +652,19 @@ struct QSemanticElementRangeReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "e2e-range-\(suffix)", value: 42, minValue: 0, maxValue: 200)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "e2e-range-\(suffix)", value: 42, minValue: 0, maxValue: 200)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let range = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "e2e-range-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "e2e-range-\(suffix)", title: nil
         )
 
         // Independent verification: re-resolve fresh and re-read, never trusting the first call's
         // own return value uncritically.
         let reread = try await QBridgeAccessibility.shared.readElementRange(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "e2e-range-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "e2e-range-\(suffix)", title: nil
         )
 
         #expect(range.minValue == 0)

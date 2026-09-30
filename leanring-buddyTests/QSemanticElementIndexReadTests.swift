@@ -28,6 +28,9 @@
 //  codebase already established. See docs/PHASE_2CI_SEMANTIC_ELEMENT_INDEX.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -35,87 +38,67 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXRow` and conforms to the real, declared `NSAccessibilityRow` protocol
-/// (`NSAccessibilityProtocols.h`) to implement its one `@required` method, `accessibilityIndex()` —
-/// the same real-accessor, not-a-mock discipline `ui.read_element_disclosure_level`'s own
-/// `setAccessibilityDisclosureLevel`/`accessibilityDisclosureLevel()` fixture already established,
-/// adapted for `accessibilityIndex`'s get-only (protocol-method, not settable-property) shape.
-@MainActor
-private final class QElementIndexRowFixtureButton: NSButton, NSAccessibilityRow {
-    var testIndex: Int = 0
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXRow` and conforms to the real, declared `NSAccessibilityRow` protocol
+// (`NSAccessibilityProtocols.h`) to implement its one `@required` method, `accessibilityIndex()` —
+// the same real-accessor, not-a-mock discipline `ui.read_element_disclosure_level`'s own
+// `setAccessibilityDisclosureLevel`/`accessibilityDisclosureLevel()` fixture already established,
+// adapted for `accessibilityIndex`'s get-only (protocol-method, not settable-property) shape.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QElementIndexRowFixtureButton".)
 
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
+// A plain `AXRow`-role fixture that does NOT conform to `NSAccessibilityRow` at all — used
+// exclusively to exercise genuine attribute absence, mirroring
+// `ui.read_element_disclosure_level`'s own "unset" fixture discipline.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QElementIndexAbsentRowFixtureButton".)
 
-    override func accessibilityIndex() -> Int {
-        testIndex
-    }
-}
-
-/// A plain `AXRow`-role fixture that does NOT conform to `NSAccessibilityRow` at all — used
-/// exclusively to exercise genuine attribute absence, mirroring
-/// `ui.read_element_disclosure_level`'s own "unset" fixture discipline.
-@MainActor
-private final class QElementIndexAbsentRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-}
-
-@MainActor
+/// Fixture-backed replacement for the in-process `makeElementIndexRowWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
 private func makeElementIndexRowWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     index: Int
-) -> (window: NSWindow, row: QElementIndexRowFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, row: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementIndexReadTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "custom:QElementIndexRowFixtureButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 160, height: 24),
+        properties: ["title": "Row", "testIndex": index, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementIndexReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let row = QElementIndexRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-    row.title = "Row"
-    row.setAccessibilityIdentifier(identifier)
-    row.testIndex = index
-    contentView.addSubview(row)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, row)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
+/// Fixture-backed replacement for the in-process `makeAbsentIndexRowWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
 private func makeAbsentIndexRowWindow(
+    in fixture: PaceAXFixture,
     identifier: String
-) -> (window: NSWindow, row: QElementIndexAbsentRowFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, row: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementIndexReadTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "custom:QElementIndexAbsentRowFixtureButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 160, height: 24),
+        properties: ["title": "Row", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementIndexReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let row = QElementIndexAbsentRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-    row.title = "Row"
-    row.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(row)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, row)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementIndexMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -197,12 +180,13 @@ struct QSemanticElementIndexReadTests {
     func nonZeroIndexReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeElementIndexRowWindow(identifier: "row2-\(suffix)", index: 2)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementIndexRowWindow(in: fixture, identifier: "row2-\(suffix)", index: 2)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "row2-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "row2-\(suffix)", title: nil
         )
         #expect(metadata.index == 2)
     }
@@ -214,12 +198,13 @@ struct QSemanticElementIndexReadTests {
     func zeroIndexReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeElementIndexRowWindow(identifier: "row0-\(suffix)", index: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementIndexRowWindow(in: fixture, identifier: "row0-\(suffix)", index: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "row0-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "row0-\(suffix)", title: nil
         )
         #expect(metadata.index == 0)
     }
@@ -231,17 +216,18 @@ struct QSemanticElementIndexReadTests {
     func genuineAbsenceDoesNotThrow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeAbsentIndexRowWindow(identifier: "unset-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeAbsentIndexRowWindow(in: fixture, identifier: "unset-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "unset-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "unset-\(suffix)", title: nil
         )
         // Whatever AppKit's real, honest answer is (nil absence, or a genuine value actually
         // reported by the OS) is accepted here — the CONTRACT under test is that no exception was
         // thrown merely because accessibilityIndex() was never implemented.
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     @Test("4/5. kAXErrorNoValue and kAXErrorAttributeUnsupported are both treated identically as genuine, expected absence — never an error, never converted to 0 (structural, by direct inspection of resolveElementIndex's single absence branch)")
@@ -285,13 +271,14 @@ struct QSemanticElementIndexReadTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeElementIndexRowWindow(identifier: "present-\(suffix)", index: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeElementIndexRowWindow(in: fixture, identifier: "present-\(suffix)", index: 1)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementIndex(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -303,24 +290,17 @@ struct QSemanticElementIndexReadTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let rowA = QElementIndexRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        rowA.setAccessibilityIdentifier("dup-index-\(suffix)")
-        let rowB = QElementIndexRowFixtureButton(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        rowB.setAccessibilityIdentifier("dup-index-\(suffix)")
-        contentView.addSubview(rowA)
-        contentView.addSubview(rowB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "custom:QElementIndexRowFixtureButton", identifier: "inline-rowA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-index-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "custom:QElementIndexRowFixtureButton", identifier: "inline-rowB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-index-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementIndex(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "dup-index-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "dup-index-\(suffix)", title: nil
             )
         }
     }
@@ -353,10 +333,12 @@ struct QSemanticElementIndexReadTests {
 
     @Test("14. Disallowed roles are rejected before any AX search is even attempted — QAXOutlineRowRolePolicy (the SAME dedicated AXRow policy ui.read_element_disclosure_level already uses) reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea", "AXButton", "AXTextField"] {
             await #expect(throws: QAXInteractionError.disallowedOutlineRowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementIndex(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -443,14 +425,15 @@ struct QSemanticElementIndexReadTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, row) = makeElementIndexRowWindow(identifier: "nomutate-\(suffix)", index: 3)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, row) = try await makeElementIndexRowWindow(in: fixture, identifier: "nomutate-\(suffix)", index: 3)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(row.accessibilityIndex() == 3)
+        #expect(try await fixture.int(row, "accessibility:index") == 3)
     }
 
     @Test("22. An uncertain in-flight index-read step fails closed to pending, and recovery never replays or persists any index value that could be treated as standing authorization")
@@ -503,8 +486,9 @@ struct QSemanticElementIndexReadTests {
     func evidenceOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeElementIndexRowWindow(identifier: "durable-\(suffix)", index: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementIndexRowWindow(in: fixture, identifier: "durable-\(suffix)", index: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -517,7 +501,7 @@ struct QSemanticElementIndexReadTests {
                   "actionName": "ui.read_element_index",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified row's ordinal position",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -543,7 +527,7 @@ struct QSemanticElementIndexReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_index" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability contain only permitted structural metadata — no arbitrary window/document content ever appears")
@@ -551,8 +535,9 @@ struct QSemanticElementIndexReadTests {
     func auditOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeElementIndexRowWindow(identifier: "audit-\(suffix)", index: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementIndexRowWindow(in: fixture, identifier: "audit-\(suffix)", index: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -565,7 +550,7 @@ struct QSemanticElementIndexReadTests {
                   "actionName": "ui.read_element_index",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified row's ordinal position",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -597,18 +582,19 @@ struct QSemanticElementIndexReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, row) = makeElementIndexRowWindow(identifier: identifier, index: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, row) = try await makeElementIndexRowWindow(in: fixture, identifier: identifier, index: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: identifier, title: nil
         )
         #expect(first.index == second.index)
-        #expect(row.accessibilityIndex() == 1)
+        #expect(try await fixture.int(row, "accessibility:index") == 1)
     }
 
     // MARK: - Verification
@@ -739,10 +725,12 @@ struct QSemanticElementIndexReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_index exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_index", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read element index", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-index"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -762,10 +750,12 @@ struct QSemanticElementIndexReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_index", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read element index",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-index"))
         #expect(result.success == false)
@@ -775,16 +765,18 @@ struct QSemanticElementIndexReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementIndex(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_index", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read element index",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-index"))
         #expect(result.success == false)
@@ -812,25 +804,25 @@ struct QSemanticElementIndexReadTests {
         }
         let suffix = UUID().uuidString
 
-        let (thirdWindow, thirdRow) = makeElementIndexRowWindow(identifier: "e2e-third-\(suffix)", index: 3)
-        defer { thirdWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (thirdWindow, thirdRow) = try await makeElementIndexRowWindow(in: fixture, identifier: "e2e-third-\(suffix)", index: 3)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let thirdMetadata = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-third-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-third-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        #expect(thirdMetadata.index == thirdRow.accessibilityIndex())
+        #expect(thirdMetadata.index == (try await fixture.int(thirdRow, "accessibility:index")))
         #expect(thirdMetadata.index == 3)
 
-        let (firstWindow, firstRow) = makeElementIndexRowWindow(identifier: "e2e-first-\(suffix)", index: 0)
-        defer { firstWindow.close() }
+        let (firstWindow, firstRow) = try await makeElementIndexRowWindow(in: fixture, identifier: "e2e-first-\(suffix)", index: 0)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let firstMetadata = try await QBridgeAccessibility.shared.readElementIndex(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-first-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-first-\(suffix)", title: nil
         )
-        #expect(firstMetadata.index == firstRow.accessibilityIndex())
+        #expect(firstMetadata.index == (try await fixture.int(firstRow, "accessibility:index")))
         #expect(firstMetadata.index == 0)
     }
 }

@@ -30,6 +30,9 @@
 //  codebase already established. See docs/PHASE_2CB_SEMANTIC_ROLE_DESCRIPTION.md for the full
 //  contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -37,9 +40,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -47,71 +47,71 @@ private var currentProcessAppName: String {
 /// role, already a real `AXButton`-role `AXUIElement` via default AppKit Accessibility bridging with
 /// no custom `NSAccessibility` override needed. AppKit automatically supplies a real, localized
 /// `kAXRoleDescriptionAttribute` for a standard push button — never forced.
-@MainActor
-private func makeButtonWindow(identifier: String, title: String = "Click Me") -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String = "Click Me"
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementRoleDescriptionReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 30),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementRoleDescriptionReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let button = NSButton(title: title, target: nil, action: nil)
-    button.frame = NSRect(x: 20, y: 20, width: 180, height: 30)
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 /// A genuine, real, live `NSTextField` (non-secure) — another `QAXElementReadRolePolicy` role,
 /// used to prove this capability's reach beyond a single role family.
-@MainActor
-private func makeTextFieldWindow(identifier: String) -> (window: NSWindow, textField: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String
+) async throws -> (window: String, textField: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementRoleDescriptionReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 24),
+        properties: ["stringValue": "Hello", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementRoleDescriptionReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let textField = NSTextField(string: "Hello")
-    textField.frame = NSRect(x: 20, y: 20, width: 180, height: 24)
-    textField.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(textField)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, textField)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 /// A genuine, real, live `NSButton` configured as a checkbox — proves role coverage extends to
 /// `AXCheckBox`.
-@MainActor
-private func makeCheckboxWindow(identifier: String) -> (window: NSWindow, checkbox: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeCheckboxWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeCheckboxWindow(
+    in fixture: PaceAXFixture,
+    identifier: String
+) async throws -> (window: String, checkbox: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementRoleDescriptionReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "checkbox",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 24),
+        properties: ["title": "Enable", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementRoleDescriptionReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let checkbox = NSButton(checkboxWithTitle: "Enable", target: nil, action: nil)
-    checkbox.frame = NSRect(x: 20, y: 20, width: 180, height: 24)
-    checkbox.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(checkbox)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, checkbox)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class RoleDescriptionMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -209,10 +209,12 @@ struct QSemanticElementRoleDescriptionReadTests {
 
     @Test("2. Missing role parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_role_description", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read role description",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-roledesc"))
         #expect(result.success == false)
@@ -221,16 +223,18 @@ struct QSemanticElementRoleDescriptionReadTests {
 
     @Test("3. Missing both identifier and title (malformed target criteria) fails closed with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_role_description", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read role description",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXButton"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXButton"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-roledesc"))
         #expect(result.success == false)
@@ -242,14 +246,15 @@ struct QSemanticElementRoleDescriptionReadTests {
     func validTargetCriteriaResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "valid-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "valid-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "valid-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "valid-\(suffix)", title: nil
         )
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         #expect(metadata.role == "AXButton")
         #expect(!metadata.roleDescription.isEmpty)
     }
@@ -274,9 +279,11 @@ struct QSemanticElementRoleDescriptionReadTests {
     @MainActor
     func secureFieldRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -286,12 +293,13 @@ struct QSemanticElementRoleDescriptionReadTests {
     func validNSButtonResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "button-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "button-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "button-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "button-\(suffix)", title: nil
         )
         #expect(!metadata.roleDescription.isEmpty)
     }
@@ -301,12 +309,13 @@ struct QSemanticElementRoleDescriptionReadTests {
     func validNSTextFieldResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "textfield-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "textfield-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "textfield-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "textfield-\(suffix)", title: nil
         )
         #expect(!metadata.roleDescription.isEmpty)
     }
@@ -316,12 +325,13 @@ struct QSemanticElementRoleDescriptionReadTests {
     func validNSCheckBoxResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeCheckboxWindow(identifier: "checkbox-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeCheckboxWindow(in: fixture, identifier: "checkbox-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "checkbox-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "checkbox-\(suffix)", title: nil
         )
         #expect(!metadata.roleDescription.isEmpty)
     }
@@ -331,13 +341,14 @@ struct QSemanticElementRoleDescriptionReadTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "wrongrole-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "wrongrole-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -357,13 +368,14 @@ struct QSemanticElementRoleDescriptionReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -374,26 +386,17 @@ struct QSemanticElementRoleDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupButton-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let buttonA = NSButton(title: "A", target: nil, action: nil)
-        buttonA.frame = NSRect(x: 10, y: 10, width: 150, height: 30)
-        buttonA.setAccessibilityIdentifier(sharedIdentifier)
-        let buttonB = NSButton(title: "B", target: nil, action: nil)
-        buttonB.frame = NSRect(x: 10, y: 100, width: 150, height: 30)
-        buttonB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(buttonA)
-        container.addSubview(buttonB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 150, height: 30), properties: ["title": "A", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 150, height: 30), properties: ["title": "B", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -504,14 +507,15 @@ struct QSemanticElementRoleDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelTitle = "Confidential Button Title \(suffix)"
-        let (window, button) = makeButtonWindow(identifier: "nomutate-\(suffix)", title: sentinelTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: "nomutate-\(suffix)", title: sentinelTitle)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(button.title == sentinelTitle)
+        #expect(try await fixture.string(button, "title") == sentinelTitle)
         #expect(!metadata.roleDescription.contains(sentinelTitle))
     }
 
@@ -529,10 +533,12 @@ struct QSemanticElementRoleDescriptionReadTests {
 
     @Test("34. QResourceGuard's generic per-step targetResources validation applies to ui.read_element_role_description exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_role_description", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read role description", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXButton", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXButton", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-roledesc"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -590,15 +596,16 @@ struct QSemanticElementRoleDescriptionReadTests {
     func neverMutatesButtonRealFixture() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, button) = makeButtonWindow(identifier: "nomutate2-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: "nomutate2-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "nomutate2-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "nomutate2-\(suffix)", title: nil
         )
-        #expect(button.state == .off)
-        #expect(button.isEnabled == true)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
+        #expect(try await fixture.bool(button, "isEnabled") == true)
     }
 
     // MARK: - I. Verification
@@ -754,18 +761,19 @@ struct QSemanticElementRoleDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
         #expect(first.roleDescription == second.roleDescription)
-        #expect(button.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
     }
 
     // MARK: - Real macOS AppKit E2E Fixture (TCC Guarded)
@@ -781,8 +789,9 @@ struct QSemanticElementRoleDescriptionReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-roledesc-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // AppKit naturally supplies a role description for a standard push button — never
@@ -790,19 +799,19 @@ struct QSemanticElementRoleDescriptionReadTests {
         // (accessibilityRoleDescription(), NSAccessibilityProtocols.h) is read independently and
         // compared against this capability's own AX-layer read as a genuine cross-validation,
         // rather than asserting a hardcoded, locale/OS-version-dependent literal string.
-        let appKitSideRoleDescription = button.accessibilityRoleDescription()
+        let appKitSideRoleDescription = try await fixture.optionalString(button, "accessibility:roleDescription")
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
 
         #expect(!metadata.roleDescription.isEmpty)
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         if let appKitSideRoleDescription {
             #expect(metadata.roleDescription == appKitSideRoleDescription)
         }
         // The read never mutated the fixture's own state.
-        #expect(button.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
     }
 
     @Test("51/E2E. Real macOS AppKit E2E — a real NSTextField's kAXRoleDescriptionAttribute is read via genuine AX retrieval, distinct from the button's own role description, proving this capability is not hardcoded to a single role (guarded by AXIsProcessTrusted)")
@@ -813,14 +822,15 @@ struct QSemanticElementRoleDescriptionReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-roledesc-tf-\(suffix)"
-        let (window, textField) = makeTextFieldWindow(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let appKitSideRoleDescription = textField.accessibilityRoleDescription()
+        let appKitSideRoleDescription = try await fixture.optionalString(textField, "accessibility:roleDescription")
 
         let metadata = try await QBridgeAccessibility.shared.readElementRoleDescription(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
 
         #expect(!metadata.roleDescription.isEmpty)

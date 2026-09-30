@@ -4,6 +4,9 @@
 //
 //  Q Security Architecture — Semantic Window Full-Screen State Tests (Phase 2AS).
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -13,31 +16,25 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
+/// A genuine NSWindow (styles titled/closable/miniaturizable/resizable, collection behavior
+/// .fullScreenPrimary — the only behavior any test here uses) built inside the out-of-process
+/// PaceAXFixtureHost, then made key and ordered front within the fixture app exactly as the
+/// in-process helper did. Returns the fixture's window token.
+@discardableResult
 private func makeFullScreenableWindow(
+    in fixture: PaceAXFixture,
     title: String,
-    identifier: String? = nil,
-    collectionBehavior: NSWindow.CollectionBehavior = [.fullScreenPrimary]
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 300, height: 200),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable],
-        backing: .buffered,
-        defer: false
+    identifier: String? = nil
+) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 300,
+        height: 200,
+        styles: ["titled", "closable", "miniaturizable", "resizable"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    window.collectionBehavior = collectionBehavior
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
-    return window
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
 @Suite("QSemanticWindowFullScreenStateTests")
@@ -94,16 +91,18 @@ struct QSemanticWindowFullScreenStateTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.setWindowFullScreenState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: nil, desiredFullScreen: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: nil, desiredFullScreen: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.set_window_full_screen", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Full screen window",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "desiredFullScreen": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "desiredFullScreen": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-window-fs"))
         #expect(result.success == false)
@@ -114,10 +113,12 @@ struct QSemanticWindowFullScreenStateTests {
 
     @Test("6/7. Missing/invalid desiredFullScreen fails closed with a deterministic error")
     func missingOrInvalidDesiredFullScreenFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.set_window_full_screen", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Full screen window",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-fs"))
         #expect(missingResult.success == false)
@@ -127,7 +128,7 @@ struct QSemanticWindowFullScreenStateTests {
             let request = QActionRequest(
                 toolName: "ui.set_window_full_screen", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Full screen window",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x", "desiredFullScreen": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x", "desiredFullScreen": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-fs"))
             #expect(result.success == false, "Invalid desiredFullScreen '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -144,10 +145,12 @@ struct QSemanticWindowFullScreenStateTests {
 
     @Test("9. Non-AXWindow roles are rejected for window full-screen state mutation at the role-policy gate")
     func nonWindowRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXApplication", "AXGroup", "AXButton", "AXSheet", "AXRow", "AXTable", "AXOutline", "AXMenuBar", "AXDrawer", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedWindowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.setWindowFullScreenState(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredFullScreen: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredFullScreen: true
                 )
             }
         }
@@ -158,11 +161,13 @@ struct QSemanticWindowFullScreenStateTests {
     @Test("10/11. A missing target and a wrong application both fail closed deterministically")
     func missingAndWrongApplicationTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
 
         let suffix = UUID().uuidString
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowFullScreenState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredFullScreen: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredFullScreen: true
             )
         }
 
@@ -180,17 +185,15 @@ struct QSemanticWindowFullScreenStateTests {
     func ambiguousDuplicateTitleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeFullScreenableWindow(title: "DupWindowFS-\(suffix)")
-        let windowB = makeFullScreenableWindow(title: "DupWindowFS-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeFullScreenableWindow(in: fixture, title: "DupWindowFS-\(suffix)")
+        try await makeFullScreenableWindow(in: fixture, title: "DupWindowFS-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setWindowFullScreenState(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DupWindowFS-\(suffix)", desiredFullScreen: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DupWindowFS-\(suffix)", desiredFullScreen: true
             )
         }
     }
@@ -236,13 +239,15 @@ struct QSemanticWindowFullScreenStateTests {
     // MARK: - 15. Closed-loop verification strategy evaluation
 
     @Test("15. QVerificationStrategy.axWindowFullScreenMatchesDesired verifies exact desired boolean and fails on mismatch/unreadable/unavailable")
-    func verificationStrategyEvaluation() async {
+    func verificationStrategyEvaluation() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axWindowFullScreenMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "vanished-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=vanished",
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=vanished",
             desiredFullScreen: true
         )
         let result = QActionResult(actionId: "verify-vanished-fs", success: true, summary: "n/a")
@@ -268,6 +273,8 @@ struct QSemanticWindowFullScreenStateTests {
 
     @Test("17. Execution through QPlanParser enforces Level 2 User Approval gating")
     func planExecutorApprovalGating() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let json = """
         {
           "taskPrompt": "Full screen window",
@@ -276,7 +283,7 @@ struct QSemanticWindowFullScreenStateTests {
               "actionName": "ui.set_window_full_screen",
               "toolFamily": "ui",
               "description": "Full screen the window",
-              "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "SomeWindow", "desiredFullScreen": "true"}
+              "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "SomeWindow", "desiredFullScreen": "true"}
             }
           ]
         }
@@ -442,12 +449,13 @@ struct QSemanticWindowFullScreenStateTests {
         }
 
         let suffix = UUID().uuidString
-        let window = makeFullScreenableWindow(title: "LiveFSWin-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeFullScreenableWindow(in: fixture, title: "LiveFSWin-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let evidence = await QBridgeAccessibility.shared.observeWindowFullScreenStateEvidence(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             identifier: nil,
             title: "LiveFSWin-\(suffix)"
@@ -463,12 +471,13 @@ struct QSemanticWindowFullScreenStateTests {
         guard AXIsProcessTrusted() else { return }
 
         let suffix = UUID().uuidString
-        let window = makeFullScreenableWindow(title: "IdempFSWin-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeFullScreenableWindow(in: fixture, title: "IdempFSWin-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowFullScreenState(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             identifier: nil,
             title: "IdempFSWin-\(suffix)",

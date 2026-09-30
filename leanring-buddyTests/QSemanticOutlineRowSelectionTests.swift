@@ -19,6 +19,9 @@
 //  fabricating a pass, mirroring the exact convention every prior semantic AX test suite in this
 //  codebase already established.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -28,119 +31,67 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-/// A container view that authentically self-reports Accessibility role `AXOutline` — the parent
-/// context `ui.select_outline_row` requires every genuine outline row to resolve to. A plain
-/// `NSView` override, not a real `NSOutlineView`: the production role/parent-context checks only
-/// ever inspect `kAXRoleAttribute`/`kAXParentAttribute`, never the concrete control class, so this
-/// is a genuinely real, live AXUIElement satisfying the exact contract, not a simulation.
-@MainActor
-private final class QOutlineContainerFixtureView: NSView {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXOutline")
-    }
-}
+// A container view that authentically self-reports Accessibility role `AXOutline` — the parent
+// context `ui.select_outline_row` requires every genuine outline row to resolve to. A plain
+// `NSView` override, not a real `NSOutlineView`: the production role/parent-context checks only
+// ever inspect `kAXRoleAttribute`/`kAXParentAttribute`, never the concrete control class, so this
+// is a genuinely real, live AXUIElement satisfying the exact contract, not a simulation.
+//
+// (Class moved to PaceAXFixtureHost/FixtureCustomKinds.swift, built there as kind
+// "custom:QOutlineContainerFixtureView", with one approved addition: isAccessibilityElement() == true.)
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXRow` with subrole `AXOutlineRow`, and a real, live, independently-readable
-/// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
-/// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
-/// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
-/// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
-/// reports as `isAccessibilitySelected()`. Its default AX parent (unoverridden — the standard
-/// AppKit subview-mirrors-AX-tree behavior every prior fixture in this codebase already relies
-/// on) is whatever view it is added as a subview of.
-@MainActor
-private final class QOutlineTreeRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXRow` with subrole `AXOutlineRow`, and a real, live, independently-readable
+// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
+// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
+// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
+// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
+// reports as `isAccessibilitySelected()`. Its default AX parent (unoverridden — the standard
+// AppKit subview-mirrors-AX-tree behavior every prior fixture in this codebase already relies
+// on) is whatever view it is added as a subview of.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QOutlineTreeRowFixtureButton".)
 
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        NSAccessibility.Subrole(rawValue: "AXOutlineRow")
-    }
+// A genuine `AXRow` WITHOUT the `AXOutlineRow` subrole — an unqualified row, used to prove
+// `ui.select_outline_row` correctly refuses to treat it as an outline row.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QUnqualifiedOutlineRowFixtureButton".)
 
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-/// A genuine `AXRow` WITHOUT the `AXOutlineRow` subrole — an unqualified row, used to prove
-/// `ui.select_outline_row` correctly refuses to treat it as an outline row.
-@MainActor
-private final class QUnqualifiedOutlineRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-/// A genuine `AXRow` carrying the real, SDK-confirmed `AXTableRow` subrole — the sibling subrole
-/// `ui.select_table_row` already owns. Used to prove `ui.select_outline_row` explicitly and
-/// distinctly refuses it, never silently folding table-row selection into outline-row handling —
-/// the exact reciprocal of `ui.select_table_row`'s own `AXOutlineRow` refusal (Phase 2S).
-@MainActor
-private final class QTableRowSubroleOnOutlineFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        NSAccessibility.Subrole(rawValue: "AXTableRow")
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
+// A genuine `AXRow` carrying the real, SDK-confirmed `AXTableRow` subrole — the sibling subrole
+// `ui.select_table_row` already owns. Used to prove `ui.select_outline_row` explicitly and
+// distinctly refuses it, never silently folding table-row selection into outline-row handling —
+// the exact reciprocal of `ui.select_table_row`'s own `AXOutlineRow` refusal (Phase 2S).
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QTableRowSubroleOnOutlineFixtureButton".)
 
 /// A properly-qualified outline row (`AXRow` + `AXOutlineRow`), correctly nested inside an
 /// `AXOutline`-role container — the "everything is correct" fixture most tests build on.
-@MainActor
+/// Builds the same window, `QOutlineContainerFixtureView` and `QOutlineTreeRowFixtureButton` the
+/// in-process helper built — geometry, .pushOnPushOff button type, initial state, "Node" title,
+/// identifier — inside the out-of-process fixture. Returns the fixture window token, the
+/// container's fixture handle, and the row's fixture handle (also its AX identifier).
 private func makeOutlineRowWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     initiallySelected: Bool
-) -> (window: NSWindow, container: QOutlineContainerFixtureView, row: QOutlineTreeRowFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, container: String, row: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticOutlineRowSelectionTestFixture", width: 200, height: 80, styles: ["titled"])
+    let containerHandle = "container-\(identifier)"
+    try await fixture.addControl(kind: "custom:QOutlineContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+    try await fixture.addControl(
+        kind: "custom:QOutlineTreeRowFixtureButton",
+        identifier: identifier,
+        parentIdentifier: containerHandle,
+        frame: NSRect(x: 20, y: 20, width: 160, height: 24),
+        properties: ["buttonType": "pushOnPushOff", "state": (initiallySelected ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue, "title": "Node"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticOutlineRowSelectionTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let container = QOutlineContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let row = QOutlineTreeRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-    row.setButtonType(.pushOnPushOff)
-    row.state = initiallySelected ? .on : .off
-    row.title = "Node"
-    row.setAccessibilityIdentifier(identifier)
-    container.addSubview(row)
-    contentView.addSubview(container)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, container, row)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, containerHandle, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticOutlineRowSelectionTests")
 struct QSemanticOutlineRowSelectionTests {
@@ -196,16 +147,18 @@ struct QSemanticOutlineRowSelectionTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: nil, title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: nil, title: nil, desiredSelected: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.select_outline_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select outline row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "desiredSelected": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "desiredSelected": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-outline-row"))
         #expect(result.success == false)
@@ -216,10 +169,12 @@ struct QSemanticOutlineRowSelectionTests {
 
     @Test("6/7. Missing/invalid desiredSelected fails closed with a deterministic error")
     func missingOrInvalidDesiredSelectedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.select_outline_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select outline row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-selected-outline-row"))
         #expect(missingResult.success == false)
@@ -229,7 +184,7 @@ struct QSemanticOutlineRowSelectionTests {
             let request = QActionRequest(
                 toolName: "ui.select_outline_row", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Select outline row",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x", "desiredSelected": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x", "desiredSelected": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-selected-outline-row"))
             #expect(result.success == false, "Invalid desiredSelected '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -246,10 +201,12 @@ struct QSemanticOutlineRowSelectionTests {
 
     @Test("9-18. AXRadioButton, AXCheckBox, AXPopUpButton, AXDisclosureTriangle, AXButton, AXTextField, AXTable, AXOutline, AXOutlineCell, and an unrecognized role are all rejected for outline-row selection at the role-policy gate")
     func nonRowRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXRadioButton", "AXCheckBox", "AXPopUpButton", "AXDisclosureTriangle", "AXButton", "AXTextField", "AXTable", "AXOutline", "AXOutlineCell", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedOutlineRowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
                 )
             }
         }
@@ -262,28 +219,22 @@ struct QSemanticOutlineRowSelectionTests {
     func unqualifiedRowWithoutSubroleRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let container = QOutlineContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let unqualifiedRow = QUnqualifiedOutlineRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        unqualifiedRow.setButtonType(.pushOnPushOff)
-        unqualifiedRow.title = "Node"
-        unqualifiedRow.setAccessibilityIdentifier("unqualified-\(suffix)")
-        container.addSubview(unqualifiedRow)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QOutlineContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+        let unqualifiedRow = "unqualified-\(suffix)"
+        try await fixture.addControl(kind: "custom:QUnqualifiedOutlineRowFixtureButton", identifier: unqualifiedRow, parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Node", "accessibilityIdentifier": "unqualified-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.targetNotAnOutlineRow("none")) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(unqualifiedRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(unqualifiedRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 20. AXTableRow is a real, recognized, but distinctly-unsupported subrole (reciprocal of Phase 2S)
@@ -293,28 +244,22 @@ struct QSemanticOutlineRowSelectionTests {
     func tableRowSubroleRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let container = QOutlineContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let tableRow = QTableRowSubroleOnOutlineFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        tableRow.setButtonType(.pushOnPushOff)
-        tableRow.title = "Node"
-        tableRow.setAccessibilityIdentifier("tablerow-\(suffix)")
-        container.addSubview(tableRow)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QOutlineContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+        let tableRow = "tablerow-\(suffix)"
+        try await fixture.addControl(kind: "custom:QTableRowSubroleOnOutlineFixtureButton", identifier: tableRow, parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Node", "accessibilityIdentifier": "tablerow-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.tableRowUnsupportedForOutline("AXTableRow")) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "tablerow-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "tablerow-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(tableRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tableRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 21. A qualified row lacking an AXOutline parent context is refused
@@ -323,30 +268,27 @@ struct QSemanticOutlineRowSelectionTests {
     @MainActor
     func missingOutlineContextRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        // Deliberately NOT nested inside a QOutlineContainerFixtureView — added directly to
-        // contentView (an ordinary, non-AXOutline-role view), so its parent context cannot be
-        // established.
-        let orphanRow = QOutlineTreeRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        orphanRow.setButtonType(.pushOnPushOff)
-        orphanRow.title = "Node"
-        orphanRow.setAccessibilityIdentifier("orphan-\(suffix)")
-        contentView.addSubview(orphanRow)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        // Deliberately NOT nested inside a QOutlineContainerFixtureView — added directly to the
+        // window's content view (an ordinary, non-AXOutline-role view), so its parent context
+        // cannot be established.
+        let orphanRow = "orphan-\(suffix)"
+        try await fixture.addControl(
+            kind: "custom:QOutlineTreeRowFixtureButton", identifier: orphanRow, windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Node"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.outlineContextUnavailable("parent role is not AXOutline")) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "orphan-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "orphan-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(orphanRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(orphanRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 22. A fully-qualified row (role + subrole + outline context) is accepted
@@ -356,12 +298,13 @@ struct QSemanticOutlineRowSelectionTests {
     func fullyQualifiedRowAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "qualified-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeOutlineRowWindow(in: fixture, identifier: "qualified-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "qualified-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "qualified-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
     }
@@ -373,18 +316,19 @@ struct QSemanticOutlineRowSelectionTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "present-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeOutlineRowWindow(in: fixture, identifier: "present-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "present-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "present-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
             )
         }
 
@@ -402,30 +346,19 @@ struct QSemanticOutlineRowSelectionTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let container = QOutlineContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let rowA = QOutlineTreeRowFixtureButton(frame: NSRect(x: 20, y: 70, width: 160, height: 24))
-        rowA.setButtonType(.pushOnPushOff)
-        rowA.title = "Node"
-        rowA.setAccessibilityIdentifier("dup-node-\(suffix)")
-        let rowB = QOutlineTreeRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        rowB.setButtonType(.pushOnPushOff)
-        rowB.title = "Node"
-        rowB.setAccessibilityIdentifier("dup-node-\(suffix)")
-        container.addSubview(rowA)
-        container.addSubview(rowB)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 120, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QOutlineContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 120), properties: ["accessibilityIdentifier": ""])
+        try await fixture.addControl(kind: "custom:QOutlineTreeRowFixtureButton", identifier: "dup-node-\(suffix)-rowA", parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 70, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Node", "accessibilityIdentifier": "dup-node-\(suffix)"])
+        try await fixture.addControl(kind: "custom:QOutlineTreeRowFixtureButton", identifier: "dup-node-\(suffix)-rowB", parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Node", "accessibilityIdentifier": "dup-node-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "dup-node-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "dup-node-\(suffix)", title: nil, desiredSelected: true
             )
         }
     }
@@ -453,18 +386,19 @@ struct QSemanticOutlineRowSelectionTests {
     func nonExactIdentifierVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "exact-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeOutlineRowWindow(in: fixture, identifier: "exact-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "exact-", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "exact-", title: nil, desiredSelected: true
             )
         }
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectOutlineRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
             )
         }
         // No index/position-based parameter exists in the schema at all (only
@@ -496,12 +430,13 @@ struct QSemanticOutlineRowSelectionTests {
     func alreadySelectedIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "noop-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "noop-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
         )
         // .alreadyDesired is the ONLY branch in selectOutlineRow's implementation that returns
         // without an intervening AXUIElementPerformAction press — structurally proving no
@@ -510,7 +445,7 @@ struct QSemanticOutlineRowSelectionTests {
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(outcome.previousSelected == true)
         #expect(outcome.currentSelected == true)
-        #expect(row.state == .on) // unchanged — proves no press occurred
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on) // unchanged — proves no press occurred
     }
 
     // MARK: - 32/33. Deselection is categorically out of scope — refused before any AX call
@@ -534,19 +469,20 @@ struct QSemanticOutlineRowSelectionTests {
     func executionServiceLevelDeselectionRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "deselect-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "deselect-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let request = QActionRequest(
             toolName: "ui.select_outline_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Deselect outline row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "deselect-\(suffix)", "desiredSelected": "false"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "deselect-\(suffix)", "desiredSelected": "false"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-outline-row-deselect"))
         #expect(result.success == false)
         #expect(result.error == "AX_OUTLINE_ROW_DESELECTION_UNSUPPORTED")
-        #expect(row.state == .on) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on) // unchanged — proves no press was attempted
     }
 
     // MARK: - 34/35. Mutation: not-selected -> selected
@@ -556,17 +492,18 @@ struct QSemanticOutlineRowSelectionTests {
     func notSelectedToSelectedMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "select-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "select-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "select-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "select-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousSelected == false)
         #expect(outcome.currentSelected == true)
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
     }
 
     // MARK: - 36. Approval required, never dispatches silently
@@ -614,8 +551,9 @@ struct QSemanticOutlineRowSelectionTests {
     func denyBlocksSelectOutlineRow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "deny-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "deny-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -628,7 +566,7 @@ struct QSemanticOutlineRowSelectionTests {
                   "actionName": "ui.select_outline_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified outline row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -651,7 +589,7 @@ struct QSemanticOutlineRowSelectionTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
     }
 
     // MARK: - 38. Persisted / expiry-equivalent approval never self-authorizes
@@ -762,8 +700,9 @@ struct QSemanticOutlineRowSelectionTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "predispatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "predispatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -776,7 +715,7 @@ struct QSemanticOutlineRowSelectionTests {
                   "actionName": "ui.select_outline_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified outline row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -789,7 +728,7 @@ struct QSemanticOutlineRowSelectionTests {
             endpointName: "semantic-outline-row-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Select the outline node")
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
     }
 
     @Test("42. Approving the request selects the outline row exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -797,8 +736,9 @@ struct QSemanticOutlineRowSelectionTests {
     func allowSelectsOutlineRowAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "allow-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "allow-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -811,7 +751,7 @@ struct QSemanticOutlineRowSelectionTests {
                   "actionName": "ui.select_outline_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified outline row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -838,7 +778,7 @@ struct QSemanticOutlineRowSelectionTests {
         // Execution happens entirely inside executeSelectOutlineRow, invoked only after the
         // approval grant is consumed — resolution (collectMatches) is therefore always fresh,
         // never a reference held from before approval. Real, observed outcome:
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
     }
 
     // MARK: - 43. Selection-state drift between the two internal reads surrounding dispatch fails closed (documented)
@@ -864,17 +804,18 @@ struct QSemanticOutlineRowSelectionTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "verify-match-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeOutlineRowWindow(in: fixture, identifier: "verify-match-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axOutlineRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "verify-match-\(suffix)",
             matchTitle: nil,
@@ -892,17 +833,18 @@ struct QSemanticOutlineRowSelectionTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeOutlineRowWindow(in: fixture, identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectOutlineRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axOutlineRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "verify-mismatch-\(suffix)",
             matchTitle: nil,
@@ -917,12 +859,14 @@ struct QSemanticOutlineRowSelectionTests {
 
     @Test("46. An unresolvable/ambiguous/outline-context-unqualified target after the selection fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axOutlineRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRow subrole=AXOutlineRow identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRow subrole=AXOutlineRow identifier=vanished label=none",
             desiredSelected: true
         )
         let result = QActionResult(actionId: "verify-vanished-outline-row", success: true, summary: "n/a")
@@ -933,12 +877,14 @@ struct QSemanticOutlineRowSelectionTests {
 
     @Test("47. A successful AX press alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axOutlineRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRow subrole=AXOutlineRow identifier=insufficient label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRow subrole=AXOutlineRow identifier=insufficient label=none",
             desiredSelected: true
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-outline-row", success: true, summary: "Outline row selection attempted. Independent closed-loop verification pending.")
@@ -954,8 +900,9 @@ struct QSemanticOutlineRowSelectionTests {
     func recoveryRecognizesAlreadySelectedAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "recovered-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeOutlineRowWindow(in: fixture, identifier: "recovered-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -969,7 +916,7 @@ struct QSemanticOutlineRowSelectionTests {
             stepId: "step-uncertain-outline-row", index: 0, actionName: "ui.select_outline_row", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Select outline node",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -1099,8 +1046,9 @@ struct QSemanticOutlineRowSelectionTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeOutlineRowWindow(identifier: "safe-evidence-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeOutlineRowWindow(in: fixture, identifier: "safe-evidence-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -1113,7 +1061,7 @@ struct QSemanticOutlineRowSelectionTests {
                   "actionName": "ui.select_outline_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified outline row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1215,11 +1163,12 @@ struct QSemanticOutlineRowSelectionTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeOutlineRowWindow(identifier: "e2e-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeOutlineRowWindow(in: fixture, identifier: "e2e-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -1231,7 +1180,7 @@ struct QSemanticOutlineRowSelectionTests {
                   "actionName": "ui.select_outline_row",
                   "toolFamily": "ui",
                   "description": "Select the outline node",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1257,9 +1206,9 @@ struct QSemanticOutlineRowSelectionTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
         let evidence = await QBridgeAccessibility.shared.observeOutlineRowSelectionEvidence(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-\(suffix)", title: nil
         )
         guard case .resolved(let currentSelected) = evidence else {
             #expect(Bool(false), "Expected the outline row to remain resolvable with a readable selection state, got: \(evidence)")

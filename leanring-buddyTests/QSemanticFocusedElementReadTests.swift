@@ -16,6 +16,9 @@
 //  mirroring the exact convention every prior semantic AX test suite in this codebase already
 //  established. See docs/PHASE_2BG_SEMANTIC_FOCUSED_ELEMENT_READ.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -25,73 +28,69 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeTextFieldWindow(identifier: String, value: String) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: String
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticFocusedElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticFocusedElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = value
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeSecureFieldWindow(identifier: String) -> (window: NSWindow, field: NSSecureTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeSecureFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeSecureFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticFocusedElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "secureTextField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": "super-secret-password", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticFocusedElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSSecureTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = "super-secret-password"
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeButtonWindow(identifier: String, title: String) -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticFocusedElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 32),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticFocusedElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let button = NSButton(frame: NSRect(x: 20, y: 20, width: 240, height: 32))
-    button.title = title
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticFocusedElementReadTests")
 struct QSemanticFocusedElementReadTests {
@@ -226,13 +225,17 @@ struct QSemanticFocusedElementReadTests {
     func focusedTextFieldResolvesWithFullIdentity() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "focused-field-\(suffix)", value: "hello focus")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "focused-field-\(suffix)", value: "hello focus")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         #expect(snapshot.role == "AXTextField")
         #expect(snapshot.identifier == "focused-field-\(suffix)")
@@ -246,13 +249,17 @@ struct QSemanticFocusedElementReadTests {
     func focusedButtonTitleReturned() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, button) = makeButtonWindow(identifier: "focused-button-\(suffix)", title: "Submit")
-        defer { window.close() }
-        window.makeFirstResponder(button)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: "focused-button-\(suffix)", title: "Submit")
+        try await fixture.perform(button, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         #expect(snapshot.role == "AXButton")
         #expect(snapshot.title == "Submit")
@@ -265,13 +272,17 @@ struct QSemanticFocusedElementReadTests {
     func selectedStateIsHonestlyNilWhenNotApplicable() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "selected-nil-\(suffix)", value: "x")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "selected-nil-\(suffix)", value: "x")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         // AXTextField never reports kAXSelectedAttribute — nil is the correct, honest result, a
         // structurally distinct state from "false" (never selected) or "true" (selected).
@@ -284,26 +295,26 @@ struct QSemanticFocusedElementReadTests {
     @MainActor
     func noFocusedElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // Resign first responder on every window this test process owns so there is genuinely no
         // focused element inside THIS process to discover — a real, honest condition, not a
         // simulated one. The systemwide focused element may then be nil (nothing at all is
         // focused) OR belong to some other running process entirely (e.g. the host running the
         // test suite) — both are legitimate fail-closed outcomes this capability must never
         // fabricate a value for, so either is accepted as evidence of the same contract.
-        for window in NSApp.windows {
-            _ = window.makeFirstResponder(nil)
-        }
+        try await fixture.applicationOperation("clearFirstResponderInAllWindows")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.readFocusedElement(
-                applicationName: currentProcessAppName, windowTitle: nil
+                applicationName: fixture.applicationName, windowTitle: nil
             )
             // Best-effort: some other window in this shared test process still holds focus after
             // resignation — skip rather than flake; the fail-closed contract is proven whenever
             // the environment allows it.
         } catch let error as QAXInteractionError {
-            #expect(error == .noFocusedElement || error == .focusedElementApplicationMismatch(currentProcessAppName))
+            #expect(error == .noFocusedElement || error == .focusedElementApplicationMismatch(fixture.applicationName))
         }
     }
 
@@ -314,13 +325,17 @@ struct QSemanticFocusedElementReadTests {
     func secureFieldValueWithheldIdentityReturned() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeSecureFieldWindow(identifier: "secure-focused-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeSecureFieldWindow(in: fixture, identifier: "secure-focused-\(suffix)")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         // A real NSSecureTextField reports role AXTextField with subrole AXSecureTextField
         // (kAXSecureTextFieldSubrole; observed cross-process for AppKit, SwiftUI and WebKit
@@ -380,9 +395,10 @@ struct QSemanticFocusedElementReadTests {
     func applicationMismatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "mismatch-focus-\(suffix)", value: "x")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "mismatch-focus-\(suffix)", value: "x")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // Finder is virtually always running under macOS and is (barring an extraordinary
@@ -402,14 +418,18 @@ struct QSemanticFocusedElementReadTests {
     func windowTitleMismatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "windowscope-\(suffix)", value: "x")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "windowscope-\(suffix)", value: "x")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         await #expect(throws: QAXInteractionError.focusedElementWindowMismatch("SomeOtherWindowTitle")) {
             _ = try await QBridgeAccessibility.shared.readFocusedElement(
-                applicationName: currentProcessAppName, windowTitle: "SomeOtherWindowTitle"
+                applicationName: fixture.applicationName, windowTitle: "SomeOtherWindowTitle"
             )
         }
     }
@@ -419,14 +439,18 @@ struct QSemanticFocusedElementReadTests {
     func windowTitleMatchSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "windowscope-match-\(suffix)", value: "x")
-        window.title = "QSemanticFocusedElementReadTestFixture-\(suffix)"
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "windowscope-match-\(suffix)", value: "x")
+        try await fixture.set(window, "title", "QSemanticFocusedElementReadTestFixture-\(suffix)")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: "QSemanticFocusedElementReadTestFixture-\(suffix)"
+            applicationName: fixture.applicationName, windowTitle: "QSemanticFocusedElementReadTestFixture-\(suffix)"
         )
         #expect(snapshot.identifier == "windowscope-match-\(suffix)")
     }
@@ -465,12 +489,13 @@ struct QSemanticFocusedElementReadTests {
     func secureFieldRunLeavesNoSensitiveContentInDurableState() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeSecureFieldWindow(identifier: "safe-durable-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeSecureFieldWindow(in: fixture, identifier: "safe-durable-\(suffix)")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
         // The focused element is resolved system-wide; without this, a headless test run leaves
         // another app frontmost, the cross-app check fails closed, and the read never happens.
-        NSApp.activate(ignoringOtherApps: true)
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -483,7 +508,7 @@ struct QSemanticFocusedElementReadTests {
                   "actionName": "ui.read_focused_element",
                   "toolFamily": "perception",
                   "description": "Read the currently focused element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -582,16 +607,20 @@ struct QSemanticFocusedElementReadTests {
     func maximumOneFocusedElement() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "singleton-\(suffix)", value: "x")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "singleton-\(suffix)", value: "x")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // readFocusedElement's return type is a single QAXFocusedElementSnapshot, never an array —
         // the type system itself enforces "at most one" structurally; this test additionally
         // confirms a real call resolves to exactly the one, correct element.
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         #expect(snapshot.identifier == "singleton-\(suffix)")
     }
@@ -616,17 +645,21 @@ struct QSemanticFocusedElementReadTests {
     func noMutationEverPerformed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "no-mutation-\(suffix)", value: "unchanged")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "no-mutation-\(suffix)", value: "unchanged")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         // The field's value and enabled state are provably unchanged by the read.
-        #expect(field.stringValue == "unchanged")
-        #expect(field.isEnabled == true)
+        #expect(try await fixture.string(field, "stringValue") == "unchanged")
+        #expect(try await fixture.bool(field, "isEnabled") == true)
     }
 
     // MARK: - 24. No forbidden automation API usage (structural)
@@ -647,9 +680,13 @@ struct QSemanticFocusedElementReadTests {
     func normalPipelineIsUsedEndToEnd() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "pipeline-\(suffix)", value: "piped")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "pipeline-\(suffix)", value: "piped")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -662,7 +699,7 @@ struct QSemanticFocusedElementReadTests {
                   "actionName": "ui.read_focused_element",
                   "toolFamily": "perception",
                   "description": "Read the currently focused element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -726,9 +763,13 @@ struct QSemanticFocusedElementReadTests {
         // the sanitize-before-persist boundary activates for THIS capability's toolFamily
         // ("perception"), exactly like ui.read_element_value already establishes.
         let secretLikeValue = "sk-test-abcdef1234567890abcdef1234567890"
-        let (window, field) = makeTextFieldWindow(identifier: "redact-\(suffix)", value: secretLikeValue)
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "redact-\(suffix)", value: secretLikeValue)
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -741,7 +782,7 @@ struct QSemanticFocusedElementReadTests {
                   "actionName": "ui.read_focused_element",
                   "toolFamily": "perception",
                   "description": "Read the currently focused element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -778,20 +819,24 @@ struct QSemanticFocusedElementReadTests {
     func repeatedReadsAreIdempotent() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "idempotent-focus-\(suffix)", value: "stable")
-        defer { window.close() }
-        window.makeFirstResponder(field)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "idempotent-focus-\(suffix)", value: "stable")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let first = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         let second = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         #expect(first.value == "stable")
         #expect(second.value == "stable")
-        #expect(field.stringValue == "stable")
+        #expect(try await fixture.string(field, "stringValue") == "stable")
     }
 
     // MARK: - 29. Uncertain in-flight step fails closed to pending (recovery, read has no side effects)
@@ -837,26 +882,20 @@ struct QSemanticFocusedElementReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let window = NSWindow(
-            contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-            styleMask: [.titled], backing: .buffered, defer: false
-        )
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        window.title = "QSemanticFocusedElementReadE2EFixture"
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-        let textField = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        textField.stringValue = "e2e value"
-        textField.setAccessibilityIdentifier("e2e-focused-\(suffix)")
-        contentView.addSubview(textField)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
-        window.makeFirstResponder(textField)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "QSemanticFocusedElementReadE2EFixture", width: 300, height: 80, styles: ["titled"])
+        let textField = "inline-textField"
+        try await fixture.addControl(kind: "textField", identifier: textField, windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["stringValue": "e2e value", "accessibilityIdentifier": "e2e-focused-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+        try await fixture.perform(textField, "attemptMakeFirstResponder")
+        // Approved setup (as for ElementFocus): readFocusedElement reads the SYSTEM-WIDE focused
+        // element, which only the active app owns, so the fixture app is made active.
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 250_000_000)
 
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
-            applicationName: currentProcessAppName, windowTitle: nil
+            applicationName: fixture.applicationName, windowTitle: nil
         )
         #expect(snapshot.role == "AXTextField")
         #expect(snapshot.identifier == "e2e-focused-\(suffix)")

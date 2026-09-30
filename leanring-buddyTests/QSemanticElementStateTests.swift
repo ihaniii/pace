@@ -13,6 +13,9 @@
 //  convention QSemanticClickTests/QSemanticTextEntryTests/QSemanticElementReadTests already
 //  established. See docs/PHASE_2K_SEMANTIC_ELEMENT_STATE.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses and reads against AppKit's own controls crash or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -22,52 +25,36 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeCheckboxWindow(identifier: String, isChecked: Bool) -> (window: NSWindow, checkbox: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real NSButton checkbox in a titled window, built inside the out-of-process
+/// PaceAXFixtureHost (never in this XCTest host) with the same geometry, title and initial state
+/// the in-process helper used. Returns the fixture window token and the checkbox's fixture handle
+/// (which is also its AX identifier).
+private func makeCheckboxWindow(in fixture: PaceAXFixture, identifier: String, isChecked: Bool) async throws -> (window: String, checkbox: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementStateTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "checkbox",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["title": "Enabled", "state": (isChecked ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementStateTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let checkbox = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
-    checkbox.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    checkbox.state = isChecked ? .on : .off
-    checkbox.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(checkbox)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, checkbox)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeRadioButtonWindow(identifier: String, isSelected: Bool) -> (window: NSWindow, radio: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real NSButton radio button in a titled window, built inside the out-of-process
+/// PaceAXFixtureHost exactly like `makeCheckboxWindow`.
+private func makeRadioButtonWindow(in fixture: PaceAXFixture, identifier: String, isSelected: Bool) async throws -> (window: String, radio: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementStateTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "radio",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["title": "Option A", "state": (isSelected ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementStateTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let radio = NSButton(radioButtonWithTitle: "Option A", target: nil, action: nil)
-    radio.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    radio.state = isSelected ? .on : .off
-    radio.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(radio)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, radio)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @Suite("QSemanticElementStateTests")
@@ -122,16 +109,18 @@ struct QSemanticElementStateTests {
 
     @Test("3. Missing or invalid required parameters fail closed with deterministic errors")
     func invalidSchemaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXCheckBox", identifier: nil, title: nil, desiredState: .on
+                applicationName: fixture.applicationName, role: "AXCheckBox", identifier: nil, title: nil, desiredState: .on
             )
         }
         // Malformed desiredState at the QExecutionService layer (not just the bridge).
         let request = QActionRequest(
             toolName: "ui.set_element_state", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Set state",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXCheckBox", "identifier": "x", "desiredState": "maybe"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXCheckBox", "identifier": "x", "desiredState": "maybe"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-schema"))
         #expect(result.success == false)
@@ -145,17 +134,18 @@ struct QSemanticElementStateTests {
     func checkboxOffToOn() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "cb-offon-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "cb-offon-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "cb-offon-\(suffix)", title: nil, desiredState: .on
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "cb-offon-\(suffix)", title: nil, desiredState: .on
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousState == .off)
         #expect(outcome.currentState == .on)
-        #expect(checkbox.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .on)
     }
 
     // MARK: - 22. Valid AXCheckBox: true → false (direct bridge call)
@@ -165,17 +155,18 @@ struct QSemanticElementStateTests {
     func checkboxOnToOff() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "cb-onoff-\(suffix)", isChecked: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "cb-onoff-\(suffix)", isChecked: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "cb-onoff-\(suffix)", title: nil, desiredState: .off
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "cb-onoff-\(suffix)", title: nil, desiredState: .off
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousState == .on)
         #expect(outcome.currentState == .off)
-        #expect(checkbox.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .off)
     }
 
     // MARK: - 5. Valid AXRadioButton: off → on (direct bridge call)
@@ -185,16 +176,17 @@ struct QSemanticElementStateTests {
     func radioButtonOffToOn() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, radio) = makeRadioButtonWindow(identifier: "radio-offon-\(suffix)", isSelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, radio) = try await makeRadioButtonWindow(in: fixture, identifier: "radio-offon-\(suffix)", isSelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "radio-offon-\(suffix)", title: nil, desiredState: .on
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "radio-offon-\(suffix)", title: nil, desiredState: .on
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.currentState == .on)
-        #expect(radio.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(radio, "state")) == .on)
     }
 
     // MARK: - 5b. AXRadioButton deselection is refused, never attempted blind
@@ -204,29 +196,32 @@ struct QSemanticElementStateTests {
     func radioButtonDeselectionRefused() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, radio) = makeRadioButtonWindow(identifier: "radio-noundo-\(suffix)", isSelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, radio) = try await makeRadioButtonWindow(in: fixture, identifier: "radio-noundo-\(suffix)", isSelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "radio-noundo-\(suffix)", title: nil, desiredState: .off
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "radio-noundo-\(suffix)", title: nil, desiredState: .off
             )
             Issue.record("Expected AXRadioButton deselection to be refused")
         } catch let axError as QAXInteractionError {
             #expect(axError.errorCode == "AX_STATE_CHANGE_NOT_GUARANTEED")
         }
         // The control must remain untouched — refused, not attempted-and-failed.
-        #expect(radio.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(radio, "state")) == .on)
     }
 
     // MARK: - 6. Unsupported role rejected (a role fine for click, not for state-change)
 
     @Test("6. AXButton — a role ui.click_element accepts — is rejected for state-change (not on the narrow allowlist)")
     func unsupportedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedStateRole("AXButton")) {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "whatever", title: nil, desiredState: .on
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "whatever", title: nil, desiredState: .on
             )
         }
     }
@@ -235,15 +230,17 @@ struct QSemanticElementStateTests {
 
     @Test("7. A wholly unrecognized role is rejected by the same fail-closed allowlist check")
     func unknownRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedStateRole("AXMadeUpRole99")) {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, desiredState: .on
+                applicationName: fixture.applicationName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, desiredState: .on
             )
         }
         // AXSecureTextField specifically, mirroring the write/read capabilities' explicit checks.
         await #expect(throws: QAXInteractionError.disallowedStateRole("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil, desiredState: .on
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil, desiredState: .on
             )
         }
     }
@@ -255,26 +252,26 @@ struct QSemanticElementStateTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let boxA = NSButton(checkboxWithTitle: "A", target: nil, action: nil)
-        boxA.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-        boxA.setAccessibilityIdentifier("dup-state-\(suffix)")
-        let boxB = NSButton(checkboxWithTitle: "B", target: nil, action: nil)
-        boxB.frame = NSRect(x: 20, y: 60, width: 240, height: 24)
-        boxB.setAccessibilityIdentifier("dup-state-\(suffix)")
-        contentView.addSubview(boxA)
-        contentView.addSubview(boxB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real checkboxes that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "checkbox", identifier: "dup-state-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+            properties: ["title": "A", "accessibilityIdentifier": "dup-state-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "checkbox", identifier: "dup-state-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 60, width: 240, height: 24),
+            properties: ["title": "B", "accessibilityIdentifier": "dup-state-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setElementState(
-                applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "dup-state-\(suffix)", title: nil, desiredState: .on
+                applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "dup-state-\(suffix)", title: nil, desiredState: .on
             )
         }
     }
@@ -323,15 +320,16 @@ struct QSemanticElementStateTests {
         // docs/PHASE_2H_SEMANTIC_CLICK.md). This test instead proves the mechanism exists and is
         // correctly wired by confirming it does NOT spuriously reject a normal, unraced call.
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "novaldrift-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "novaldrift-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "novaldrift-\(suffix)", title: nil, desiredState: .on
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "novaldrift-\(suffix)", title: nil, desiredState: .on
         )
         #expect(outcome.changeKind == .changed)
-        #expect(checkbox.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .on)
     }
 
     // MARK: - 12/13. Idempotency: already-desired state is a no-op, no mutation
@@ -341,17 +339,18 @@ struct QSemanticElementStateTests {
     func alreadyDesiredStateIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "noop-state-\(suffix)", isChecked: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "noop-state-\(suffix)", isChecked: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "noop-state-\(suffix)", title: nil, desiredState: .on
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "noop-state-\(suffix)", title: nil, desiredState: .on
         )
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(outcome.previousState == .on)
         #expect(outcome.currentState == .on)
-        #expect(checkbox.state == .on) // unchanged — proves no press occurred
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .on) // unchanged — proves no press occurred
     }
 
     // MARK: - 14. Approval required, never dispatches silently
@@ -399,8 +398,9 @@ struct QSemanticElementStateTests {
     func denyBlocksSetElementState() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "deny-state-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "deny-state-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -413,7 +413,7 @@ struct QSemanticElementStateTests {
                   "actionName": "ui.set_element_state",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified checkbox's state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXCheckBox", "identifier": "deny-state-\(suffix)", "desiredState": "on"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXCheckBox", "identifier": "deny-state-\(suffix)", "desiredState": "on"}
                 }
               ]
             }
@@ -436,7 +436,7 @@ struct QSemanticElementStateTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(checkbox.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .off)
     }
 
     // MARK: - 16. Persisted / expired approval never self-authorizes (recovery-time rubber-stamping)
@@ -561,8 +561,9 @@ struct QSemanticElementStateTests {
     func allowChecksCheckboxAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "allow-state-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "allow-state-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -575,7 +576,7 @@ struct QSemanticElementStateTests {
                   "actionName": "ui.set_element_state",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified checkbox's state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXCheckBox", "identifier": "allow-state-\(suffix)", "desiredState": "on"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXCheckBox", "identifier": "allow-state-\(suffix)", "desiredState": "on"}
                 }
               ]
             }
@@ -599,7 +600,7 @@ struct QSemanticElementStateTests {
             return
         }
         #expect(!summary.isEmpty)
-        #expect(checkbox.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .on)
     }
 
     // MARK: - 24. Radio button verified after mutation (full autonomous path)
@@ -609,8 +610,9 @@ struct QSemanticElementStateTests {
     func allowSelectsRadioButtonAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, radio) = makeRadioButtonWindow(identifier: "allow-radio-\(suffix)", isSelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, radio) = try await makeRadioButtonWindow(in: fixture, identifier: "allow-radio-\(suffix)", isSelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -623,7 +625,7 @@ struct QSemanticElementStateTests {
                   "actionName": "ui.set_element_state",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified radio button's state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "allow-radio-\(suffix)", "desiredState": "on"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "allow-radio-\(suffix)", "desiredState": "on"}
                 }
               ]
             }
@@ -646,7 +648,7 @@ struct QSemanticElementStateTests {
             #expect(Bool(false), "Expected task to complete after approval, got: \(resolved.state)")
             return
         }
-        #expect(radio.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(radio, "state")) == .on)
     }
 
     // MARK: - 25. Verification failure is never fabricated as success
@@ -656,12 +658,13 @@ struct QSemanticElementStateTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeCheckboxWindow(identifier: "mismatch-state-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeCheckboxWindow(in: fixture, identifier: "mismatch-state-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setElementState(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "mismatch-state-\(suffix)", title: nil, desiredState: .on
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "mismatch-state-\(suffix)", title: nil, desiredState: .on
         )
         #expect(outcome.changeKind == .changed)
 
@@ -669,7 +672,7 @@ struct QSemanticElementStateTests {
         // hash — must fail, not fabricate.
         let wrongDesiredHash = "0000000000000000000000000000000000000000000000000000000000000000"
         let strategy = QVerificationStrategy.axElementStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXCheckBox",
             matchIdentifier: "mismatch-state-\(suffix)",
             matchTitle: nil,
@@ -687,14 +690,16 @@ struct QSemanticElementStateTests {
 
     @Test("26. An unresolvable target after the state change fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // Directly exercises the verification strategy against a target identifier that was
         // never created — simulating a target that vanished between dispatch and verification.
         let strategy = QVerificationStrategy.axElementStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXCheckBox",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXCheckBox identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXCheckBox identifier=vanished label=none",
             previousStateHash: "irrelevant",
             desiredStateHash: "irrelevant"
         )
@@ -713,8 +718,9 @@ struct QSemanticElementStateTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "predispatch-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "predispatch-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -727,7 +733,7 @@ struct QSemanticElementStateTests {
                   "actionName": "ui.set_element_state",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified checkbox's state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXCheckBox", "identifier": "predispatch-\(suffix)", "desiredState": "on"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXCheckBox", "identifier": "predispatch-\(suffix)", "desiredState": "on"}
                 }
               ]
             }
@@ -742,7 +748,7 @@ struct QSemanticElementStateTests {
         _ = try await runtime.submitIntent(prompt: "Check the box")
         // The task halted for approval (proven by every other approval test); here we assert the
         // real-world side effect directly: the checkbox was never touched before approval.
-        #expect(checkbox.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .off)
     }
 
     @Test("28/29/30. An uncertain in-flight state-change step is never blindly marked complete — it fails closed to pending for observation-first re-execution, and idempotency prevents a duplicate press on retry")
@@ -847,8 +853,9 @@ struct QSemanticElementStateTests {
     func realRunLeavesOnlySafeEvidenceInAuditAndMemory() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, checkbox) = makeCheckboxWindow(identifier: "safe-evidence-\(suffix)", isChecked: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, checkbox) = try await makeCheckboxWindow(in: fixture, identifier: "safe-evidence-\(suffix)", isChecked: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -861,7 +868,7 @@ struct QSemanticElementStateTests {
                   "actionName": "ui.set_element_state",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified checkbox's state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXCheckBox", "identifier": "safe-evidence-\(suffix)", "desiredState": "on"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXCheckBox", "identifier": "safe-evidence-\(suffix)", "desiredState": "on"}
                 }
               ]
             }
@@ -887,7 +894,7 @@ struct QSemanticElementStateTests {
             #expect(Bool(false), "Expected completion, got: \(resolved.state)")
             return
         }
-        #expect(checkbox.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(checkbox, "state")) == .on)
 
         // Audit: records exist for this task and their evidence is the small, safe shape only.
         let auditRecords = QAuditLogger.shared.getRecentRecords(limit: 500).filter { $0.taskId == task.taskId }

@@ -24,6 +24,9 @@
 //  codebase already established. See docs/PHASE_2BN_SEMANTIC_ELEMENT_TITLE_REFERENCE.md for the
 //  full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -31,9 +34,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -41,46 +41,33 @@ private var currentProcessAppName: String {
 /// wired via the real, public `setAccessibilityTitleUIElement(_:)` AppKit API, no custom
 /// `NSAccessibility` override needed. This is the exact fixture design identified in Phase 2BN's
 /// discovery as the strongest native E2E story of any phase to date.
-@MainActor
+/// Fixture-backed replacement for the in-process `makeLabeledTextField`: the same window, input
+/// field, optional label (with an AX identifier only when one is given) and optional
+/// kAXTitleUIElement reference, built inside the out-of-process PaceAXFixtureHost. Returns the
+/// window token, the input's handle, and the label's handle (nil when no label was created).
 private func makeLabeledTextField(
+    in fixture: PaceAXFixture,
     inputIdentifier: String,
     labelTitle: String? = "Name:",
     labelIdentifier: String? = nil,
     attachTitleReference: Bool = true
-) -> (window: NSWindow, inputField: NSTextField, labelField: NSTextField?) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTitleReferenceTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 150))
-
-    let inputField = NSTextField(frame: NSRect(x: 120, y: 60, width: 220, height: 24))
-    inputField.stringValue = ""
-    inputField.setAccessibilityIdentifier(inputIdentifier)
-    contentView.addSubview(inputField)
-
-    var labelField: NSTextField?
+) async throws -> (window: String, inputField: String, labelField: String?) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTitleReferenceTestFixture", width: 400, height: 150, styles: ["titled", "closable"])
+    try await fixture.addControl(kind: "textField", identifier: inputIdentifier, windowToken: windowToken,
+                                 frame: NSRect(x: 120, y: 60, width: 220, height: 24), properties: ["stringValue": "", "detachAction": true])
+    var labelField: String?
     if let labelTitle {
-        let label = NSTextField(labelWithString: labelTitle)
-        label.frame = NSRect(x: 20, y: 60, width: 90, height: 24)
-        if let labelIdentifier {
-            label.setAccessibilityIdentifier(labelIdentifier)
-        }
-        contentView.addSubview(label)
-        labelField = label
+        let labelHandle = labelIdentifier ?? "label-for-\(inputIdentifier)"
+        try await fixture.addControl(kind: "label", identifier: labelHandle, windowToken: windowToken,
+                                     frame: NSRect(x: 20, y: 60, width: 90, height: 24),
+                                     properties: ["title": labelTitle, "accessibilityIdentifier": labelIdentifier ?? "", "detachAction": true])
+        labelField = labelHandle
         if attachTitleReference {
-            inputField.setAccessibilityTitleUIElement(label)
+            try await fixture.setAccessibility(inputIdentifier, "titleUIElement", labelHandle)
         }
     }
-
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, inputField, labelField)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, inputIdentifier, labelField)
 }
 
 private final class TitleReferenceMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -161,12 +148,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "name-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "name-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "name-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "name-\(suffix)", title: nil
         )
         #expect(reference?.title == "Name:")
     }
@@ -197,12 +185,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func exactTargetMatchSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "byid-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "byid-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let byIdentifier = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "byid-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "byid-\(suffix)", title: nil
         )
         #expect(byIdentifier?.title == "Name:")
     }
@@ -214,13 +203,14 @@ struct QSemanticElementTitleReferenceReadTests {
     func zeroTargetMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeLabeledTextField(in: fixture, inputIdentifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementTitleReference(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -232,26 +222,17 @@ struct QSemanticElementTitleReferenceReadTests {
     func ambiguousTargetMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        window.title = "DupFieldWindow-\(suffix)"
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 60, width: 100, height: 24))
-        fieldA.setAccessibilityIdentifier("") // never used to match
-        fieldA.stringValue = "Dup"
-        let fieldB = NSTextField(frame: NSRect(x: 140, y: 60, width: 100, height: 24))
-        fieldB.stringValue = "Dup"
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "DupFieldWindow-\(suffix)", width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 100, height: 24), properties: ["accessibilityIdentifier": "", "stringValue": "Dup", "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 140, y: 60, width: 100, height: 24), properties: ["stringValue": "Dup", "accessibilityIdentifier": "", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementTitleReference(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: nil, title: "Dup"
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: nil, title: "Dup"
             )
         }
     }
@@ -261,9 +242,11 @@ struct QSemanticElementTitleReferenceReadTests {
     @Test("7. A disallowed source role fails closed with AX_READ_ROLE_NOT_ALLOWED — no new allowlist is introduced")
     func disallowedSourceRoleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXWindow")) {
             _ = try await QBridgeAccessibility.shared.readElementTitleReference(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: "whatever", title: nil
             )
         }
     }
@@ -271,9 +254,11 @@ struct QSemanticElementTitleReferenceReadTests {
     @Test("8. A secure-field source role fails closed with a dedicated diagnostic (AX_SECURE_FIELD_READ_DENIED), never silently falling through to the generic disallowed-role case")
     func secureFieldSourceRoleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementTitleReference(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -285,12 +270,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func titleReferenceExistsResolvesCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "exists-\(suffix)", labelTitle: "Email:")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "exists-\(suffix)", labelTitle: "Email:")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "exists-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "exists-\(suffix)", title: nil
         )
         #expect(reference != nil)
         #expect(reference?.title == "Email:")
@@ -301,12 +287,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func titleReferenceAbsentReportsNilNeverError() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "unlabeled-\(suffix)", labelTitle: nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "unlabeled-\(suffix)", labelTitle: nil)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "unlabeled-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "unlabeled-\(suffix)", title: nil
         )
         #expect(reference == nil) // genuinely absent, not an error
     }
@@ -341,12 +328,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func validTitleElementRoleAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "validrole-\(suffix)", labelTitle: "Phone:")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "validrole-\(suffix)", labelTitle: "Phone:")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "validrole-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "validrole-\(suffix)", title: nil
         )
         #expect(reference?.role == "AXStaticText")
         #expect(reference?.title == "Phone:")
@@ -381,12 +369,13 @@ struct QSemanticElementTitleReferenceReadTests {
     func referenceTitleExtractedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(inputIdentifier: "titleextract-\(suffix)", labelTitle: "Address:")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabeledTextField(in: fixture, inputIdentifier: "titleextract-\(suffix)", labelTitle: "Address:")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "titleextract-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "titleextract-\(suffix)", title: nil
         )
         #expect(reference?.title == "Address:")
     }
@@ -395,15 +384,17 @@ struct QSemanticElementTitleReferenceReadTests {
     @MainActor
     func referenceIdentifierExtractedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(
+        let (window, _, _) = try await makeLabeledTextField(
+            in: fixture,
             inputIdentifier: "idextract-\(suffix)", labelTitle: "City:", labelIdentifier: "city-label-\(suffix)"
         )
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "idextract-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "idextract-\(suffix)", title: nil
         )
         #expect(reference?.identifier == "city-label-\(suffix)")
     }
@@ -444,15 +435,16 @@ struct QSemanticElementTitleReferenceReadTests {
     func neverInteractsWithElements() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, inputField, labelField) = makeLabeledTextField(inputIdentifier: "nomutate-\(suffix)", labelTitle: "Untouched:")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, inputField, labelField) = try await makeLabeledTextField(in: fixture, inputIdentifier: "nomutate-\(suffix)", labelTitle: "Untouched:")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(inputField.stringValue == "")
-        #expect(labelField?.stringValue == "Untouched:")
+        #expect(try await fixture.string(inputField, "stringValue") == "")
+        #expect(try await fixture.stringIfPresent(labelField, "stringValue") == "Untouched:")
     }
 
     @Test("25. QPermissionGate.evaluate returns .allow (never .requireApproval) for ui.read_element_title_reference — routed through the real gate, not bypassed")
@@ -501,11 +493,13 @@ struct QSemanticElementTitleReferenceReadTests {
     @MainActor
     func rawReferenceMetadataNotPersistedDurably() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(
+        let (window, _, _) = try await makeLabeledTextField(
+            in: fixture,
             inputIdentifier: "durableprivacy-\(suffix)", labelTitle: "ConfidentialLabelForAudit"
         )
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -518,7 +512,7 @@ struct QSemanticElementTitleReferenceReadTests {
                   "actionName": "ui.read_element_title_reference",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's title-UI-element reference",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "durableprivacy-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "durableprivacy-\(suffix)"}
                 }
               ]
             }
@@ -551,11 +545,13 @@ struct QSemanticElementTitleReferenceReadTests {
     @MainActor
     func rawReferenceMetadataNotInAuditRecords() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabeledTextField(
+        let (window, _, _) = try await makeLabeledTextField(
+            in: fixture,
             inputIdentifier: "auditprivacy-\(suffix)", labelTitle: "SecretLabelForAudit"
         )
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -568,7 +564,7 @@ struct QSemanticElementTitleReferenceReadTests {
                   "actionName": "ui.read_element_title_reference",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's title-UI-element reference",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "auditprivacy-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "auditprivacy-\(suffix)"}
                 }
               ]
             }
@@ -705,6 +701,8 @@ struct QSemanticElementTitleReferenceReadTests {
     @Test("37/E2E. Real macOS AppKit E2E — an NSTextField wired to a real label via setAccessibilityTitleUIElement(_:) resolves via kAXTitleUIElementAttribute; an unlabeled field correctly reports genuine absence; neither field is ever mutated (guarded by AXIsProcessTrusted)")
     @MainActor
     func realAppKitTitleReferenceRead() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         guard AXIsProcessTrusted() else {
             // BLOCKED — TCC / Accessibility permission. This isolated/unsigned XCTest host is not
             // expected to hold Accessibility trust; never fabricated as a PASS, exactly as every
@@ -712,29 +710,29 @@ struct QSemanticElementTitleReferenceReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let (labeledWindow, labeledInput, _) = makeLabeledTextField(
+        let (labeledWindow, labeledInput, _) = try await makeLabeledTextField(
+            in: fixture,
             inputIdentifier: "e2e-labeled-\(suffix)", labelTitle: "Username:"
         )
-        defer { labeledWindow.close() }
-        let (unlabeledWindow, unlabeledInput, _) = makeLabeledTextField(
+        let (unlabeledWindow, unlabeledInput, _) = try await makeLabeledTextField(
+            in: fixture,
             inputIdentifier: "e2e-unlabeled-\(suffix)", labelTitle: nil
         )
-        defer { unlabeledWindow.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let labeledReference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-labeled-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-labeled-\(suffix)", title: nil
         )
         #expect(labeledReference?.title == "Username:")
         #expect(labeledReference?.role == "AXStaticText")
 
         let unlabeledReference = try await QBridgeAccessibility.shared.readElementTitleReference(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-unlabeled-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-unlabeled-\(suffix)", title: nil
         )
         #expect(unlabeledReference == nil) // genuine, honest absence
 
         // Neither field's own content was mutated by the read.
-        #expect(labeledInput.stringValue == "")
-        #expect(unlabeledInput.stringValue == "")
+        #expect(try await fixture.string(labeledInput, "stringValue") == "")
+        #expect(try await fixture.string(unlabeledInput, "stringValue") == "")
     }
 }

@@ -24,6 +24,9 @@
 //  codebase already established. See docs/PHASE_2BQ_SEMANTIC_ELEMENT_REQUIRED_STATE.md for the
 //  full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -31,35 +34,31 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeTextFieldWindow(identifier: String, value: String, required: Bool? = nil) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: String, required: Bool? = nil
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticRequiredStateTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticRequiredStateTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = value
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
     if let required {
-        field.setAccessibilityRequired(required)
+        try await fixture.setAccessibility(identifier, "required", required)
     }
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementRequiredStateMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -138,12 +137,13 @@ struct QSemanticElementRequiredStateTests {
     func requiredTrueReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "required-\(suffix)", value: "", required: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "required-\(suffix)", value: "", required: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "required-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "required-\(suffix)", title: nil
         )
         #expect(metadata.isRequired == true)
     }
@@ -155,12 +155,13 @@ struct QSemanticElementRequiredStateTests {
     func requiredFalseReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "notrequired-\(suffix)", value: "", required: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "notrequired-\(suffix)", value: "", required: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "notrequired-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "notrequired-\(suffix)", title: nil
         )
         #expect(metadata.isRequired == false)
     }
@@ -172,17 +173,18 @@ struct QSemanticElementRequiredStateTests {
     func genuineAbsenceReportsNilNeverFalse() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "unset-\(suffix)", value: "", required: nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "unset-\(suffix)", value: "", required: nil)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "unset-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "unset-\(suffix)", title: nil
         )
         // Whatever AppKit's real, honest answer is (nil absence, or a default false actually
         // reported by the OS) is accepted here — the CONTRACT under test is that no exception was
         // thrown merely because the attribute was never explicitly set.
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     @Test("4/5. kAXErrorNoValue and kAXErrorAttributeUnsupported are both treated identically as genuine, expected absence — never an error, never converted to false (structural, by direct inspection of resolveElementRequiredState's single absence branch)")
@@ -226,13 +228,14 @@ struct QSemanticElementRequiredStateTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "present-\(suffix)", value: "x")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "present-\(suffix)", value: "x")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementRequiredState(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -244,28 +247,17 @@ struct QSemanticElementRequiredStateTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldA.stringValue = "Dup"
-        fieldA.isEditable = true
-        fieldA.setAccessibilityIdentifier("dup-required-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        fieldB.stringValue = "Dup"
-        fieldB.isEditable = true
-        fieldB.setAccessibilityIdentifier("dup-required-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["stringValue": "Dup", "accessibilityIdentifier": "dup-required-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["stringValue": "Dup", "accessibilityIdentifier": "dup-required-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementRequiredState(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-required-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-required-\(suffix)", title: nil
             )
         }
     }
@@ -298,10 +290,12 @@ struct QSemanticElementRequiredStateTests {
 
     @Test("14. Disallowed roles are rejected before any AX search is even attempted — QAXElementReadRolePolicy reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea"] {
             await #expect(throws: QAXInteractionError.disallowedReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementRequiredState(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -309,9 +303,11 @@ struct QSemanticElementRequiredStateTests {
 
     @Test("14b. AXSecureTextField is rejected before any AX search, mirroring every prior read capability's identical secure-field precedent")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementRequiredState(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -384,14 +380,15 @@ struct QSemanticElementRequiredStateTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "nomutate-\(suffix)", value: "unchanged", required: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "nomutate-\(suffix)", value: "unchanged", required: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(field.stringValue == "unchanged")
+        #expect(try await fixture.string(field, "stringValue") == "unchanged")
     }
 
     @Test("22. An uncertain in-flight required-state-read step fails closed to pending, and recovery never replays or persists any required-state value that could be treated as standing authorization")
@@ -444,8 +441,9 @@ struct QSemanticElementRequiredStateTests {
     func evidenceOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "durable-\(suffix)", value: "Message", required: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "durable-\(suffix)", value: "Message", required: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -458,7 +456,7 @@ struct QSemanticElementRequiredStateTests {
                   "actionName": "ui.read_element_required_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's required-field state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -484,7 +482,7 @@ struct QSemanticElementRequiredStateTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_required_state" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability contain only permitted structural metadata — no arbitrary window/document content ever appears")
@@ -492,8 +490,9 @@ struct QSemanticElementRequiredStateTests {
     func auditOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "audit-\(suffix)", value: "Message", required: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "audit-\(suffix)", value: "Message", required: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -506,7 +505,7 @@ struct QSemanticElementRequiredStateTests {
                   "actionName": "ui.read_element_required_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's required-field state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -646,22 +645,22 @@ struct QSemanticElementRequiredStateTests {
         }
         let suffix = UUID().uuidString
 
-        let (requiredWindow, requiredField) = makeTextFieldWindow(identifier: "e2e-required-\(suffix)", value: "unchanged-required", required: true)
-        defer { requiredWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (requiredWindow, requiredField) = try await makeTextFieldWindow(in: fixture, identifier: "e2e-required-\(suffix)", value: "unchanged-required", required: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let requiredMetadata = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-required-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-required-\(suffix)", title: nil
         )
         #expect(requiredMetadata.isRequired == true)
-        #expect(requiredField.stringValue == "unchanged-required") // provably unchanged — no mutation
+        #expect(try await fixture.string(requiredField, "stringValue") == "unchanged-required") // provably unchanged — no mutation
 
-        let (notRequiredWindow, notRequiredField) = makeTextFieldWindow(identifier: "e2e-notrequired-\(suffix)", value: "unchanged-optional", required: false)
-        defer { notRequiredWindow.close() }
+        let (notRequiredWindow, notRequiredField) = try await makeTextFieldWindow(in: fixture, identifier: "e2e-notrequired-\(suffix)", value: "unchanged-optional", required: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let notRequiredMetadata = try await QBridgeAccessibility.shared.readElementRequiredState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-notrequired-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-notrequired-\(suffix)", title: nil
         )
         #expect(notRequiredMetadata.isRequired == false)
-        #expect(notRequiredField.stringValue == "unchanged-optional") // provably unchanged — no mutation
+        #expect(try await fixture.string(notRequiredField, "stringValue") == "unchanged-optional") // provably unchanged — no mutation
     }
 }

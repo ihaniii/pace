@@ -15,6 +15,9 @@
 //  docs/PHASE_2M_SEMANTIC_SLIDER_VALUE.md for the full contract, including the exact numeric
 //  tolerance rule.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX value writes against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -24,52 +27,35 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeSliderWindow(identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) -> (window: NSWindow, slider: NSSlider) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real NSSlider in a titled window, built inside the out-of-process PaceAXFixtureHost (never in
+/// this XCTest host) with the same geometry, range and initial value the in-process helper used.
+/// Returns the fixture window token and the slider's fixture handle (also its AX identifier).
+private func makeSliderWindow(in fixture: PaceAXFixture, identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) async throws -> (window: String, slider: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticSliderValueTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "slider",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["minValue": minValue, "maxValue": maxValue, "doubleValue": value]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticSliderValueTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let slider = NSSlider(value: value, minValue: minValue, maxValue: maxValue, target: nil, action: nil)
-    slider.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    slider.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(slider)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, slider)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeStepperWindow(identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) -> (window: NSWindow, stepper: NSStepper) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// A real NSStepper in a titled window, built inside the out-of-process PaceAXFixtureHost exactly
+/// like `makeSliderWindow`.
+private func makeStepperWindow(in fixture: PaceAXFixture, identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) async throws -> (window: String, stepper: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticSliderValueTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "stepper",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 40, height: 24),
+        properties: ["minValue": minValue, "maxValue": maxValue, "doubleValue": value]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticSliderValueTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let stepper = NSStepper(frame: NSRect(x: 20, y: 20, width: 40, height: 24))
-    stepper.minValue = minValue
-    stepper.maxValue = maxValue
-    stepper.doubleValue = value
-    stepper.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(stepper)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, stepper)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @Suite("QSemanticSliderValueTests")
@@ -124,15 +110,17 @@ struct QSemanticSliderValueTests {
 
     @Test("4/5. Missing, malformed, NaN, or infinite desiredValue fails closed with deterministic errors")
     func invalidSchemaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: nil, title: nil, desiredValue: 50
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: nil, title: nil, desiredValue: 50
             )
         }
         for invalidValue in [Double.nan, Double.infinity, -Double.infinity] {
             await #expect(throws: QAXInteractionError.self) {
                 _ = try await QBridgeAccessibility.shared.setSliderValue(
-                    applicationName: currentProcessAppName, role: "AXSlider", identifier: "x", title: nil, desiredValue: invalidValue
+                    applicationName: fixture.applicationName, role: "AXSlider", identifier: "x", title: nil, desiredValue: invalidValue
                 )
             }
         }
@@ -140,7 +128,7 @@ struct QSemanticSliderValueTests {
             let request = QActionRequest(
                 toolName: "ui.set_slider_value", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Set slider value",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXSlider", "identifier": "x", "desiredValue": malformed]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXSlider", "identifier": "x", "desiredValue": malformed]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-schema-slider"))
             #expect(result.success == false)
@@ -155,23 +143,24 @@ struct QSemanticSliderValueTests {
     func sliderIncreaseAndDecrease() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "slider-\(suffix)", value: 25, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "slider-\(suffix)", value: 25, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let increased = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "slider-\(suffix)", title: nil, desiredValue: 75
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "slider-\(suffix)", title: nil, desiredValue: 75
         )
         #expect(increased.changeKind == .changed)
         #expect(abs(increased.currentValue - 75) < 0.01)
-        #expect(abs(slider.doubleValue - 75) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 75) < 0.01)
 
         let decreased = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "slider-\(suffix)", title: nil, desiredValue: 10
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "slider-\(suffix)", title: nil, desiredValue: 10
         )
         #expect(decreased.changeKind == .changed)
         #expect(abs(decreased.currentValue - 10) < 0.01)
-        #expect(abs(slider.doubleValue - 10) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 10) < 0.01)
     }
 
     @Test("7/36/37. A valid, in-range AXStepper is set to a higher and then a lower value via AXUIElementSetAttributeValue only")
@@ -179,47 +168,50 @@ struct QSemanticSliderValueTests {
     func stepperIncreaseAndDecrease() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, stepper) = makeStepperWindow(identifier: "stepper-\(suffix)", value: 5, minValue: 0, maxValue: 20)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, stepper) = try await makeStepperWindow(in: fixture, identifier: "stepper-\(suffix)", value: 5, minValue: 0, maxValue: 20)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let increased = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXStepper", identifier: "stepper-\(suffix)", title: nil, desiredValue: 15
+            applicationName: fixture.applicationName, role: "AXStepper", identifier: "stepper-\(suffix)", title: nil, desiredValue: 15
         )
         #expect(increased.changeKind == .changed)
         #expect(abs(increased.currentValue - 15) < 0.01)
-        #expect(abs(stepper.doubleValue - 15) < 0.01)
+        #expect(abs(try await fixture.double(stepper, "doubleValue") - 15) < 0.01)
 
         let decreased = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXStepper", identifier: "stepper-\(suffix)", title: nil, desiredValue: 2
+            applicationName: fixture.applicationName, role: "AXStepper", identifier: "stepper-\(suffix)", title: nil, desiredValue: 2
         )
         #expect(decreased.changeKind == .changed)
         #expect(abs(decreased.currentValue - 2) < 0.01)
-        #expect(abs(stepper.doubleValue - 2) < 0.01)
+        #expect(abs(try await fixture.double(stepper, "doubleValue") - 2) < 0.01)
     }
 
     // MARK: - 8/9. Unsupported/unknown role rejected
 
     @Test("8/9. AXButton (a role ui.click_element accepts) and a wholly unrecognized role are both rejected for slider value-setting")
     func unsupportedAndUnknownRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedSliderRole("AXButton")) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "whatever", title: nil, desiredValue: 50
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "whatever", title: nil, desiredValue: 50
             )
         }
         await #expect(throws: QAXInteractionError.disallowedSliderRole("AXCheckBox")) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "whatever", title: nil, desiredValue: 50
+                applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "whatever", title: nil, desiredValue: 50
             )
         }
         await #expect(throws: QAXInteractionError.disallowedSliderRole("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil, desiredValue: 50
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil, desiredValue: 50
             )
         }
         await #expect(throws: QAXInteractionError.disallowedSliderRole("AXMadeUpRole99")) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, desiredValue: 50
+                applicationName: fixture.applicationName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, desiredValue: 50
             )
         }
     }
@@ -231,18 +223,19 @@ struct QSemanticSliderValueTests {
     func validAndMissingTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "present-\(suffix)", value: 10)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeSliderWindow(in: fixture, identifier: "present-\(suffix)", value: 10)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "present-\(suffix)", title: nil, desiredValue: 20
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "present-\(suffix)", title: nil, desiredValue: 20
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "absent-\(suffix)", title: nil, desiredValue: 20
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "absent-\(suffix)", title: nil, desiredValue: 20
             )
         }
     }
@@ -254,26 +247,26 @@ struct QSemanticSliderValueTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let sliderA = NSSlider(value: 10, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderA.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-        sliderA.setAccessibilityIdentifier("dup-slider-\(suffix)")
-        let sliderB = NSSlider(value: 10, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderB.frame = NSRect(x: 20, y: 60, width: 240, height: 24)
-        sliderB.setAccessibilityIdentifier("dup-slider-\(suffix)")
-        contentView.addSubview(sliderA)
-        contentView.addSubview(sliderB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real sliders that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "slider", identifier: "dup-slider-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+            properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 10.0, "accessibilityIdentifier": "dup-slider-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "slider", identifier: "dup-slider-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 60, width: 240, height: 24),
+            properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 10.0, "accessibilityIdentifier": "dup-slider-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "dup-slider-\(suffix)", title: nil, desiredValue: 20
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "dup-slider-\(suffix)", title: nil, desiredValue: 20
             )
         }
     }
@@ -318,18 +311,19 @@ struct QSemanticSliderValueTests {
     func exactBoundaryValuesAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "boundary-\(suffix)", value: 50, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "boundary-\(suffix)", value: 50, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let atMin = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "boundary-\(suffix)", title: nil, desiredValue: 0
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "boundary-\(suffix)", title: nil, desiredValue: 0
         )
         #expect(atMin.changeKind == .changed)
         #expect(abs(atMin.currentValue - 0) < 0.01)
 
         let atMax = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "boundary-\(suffix)", title: nil, desiredValue: 100
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "boundary-\(suffix)", title: nil, desiredValue: 100
         )
         #expect(atMax.changeKind == .changed)
         #expect(abs(atMax.currentValue - 100) < 0.01)
@@ -342,18 +336,19 @@ struct QSemanticSliderValueTests {
     func belowMinimumRejectedBeforeMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "belowmin-\(suffix)", value: 50, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "belowmin-\(suffix)", value: 50, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.self) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "belowmin-\(suffix)", title: nil, desiredValue: -0.001
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "belowmin-\(suffix)", title: nil, desiredValue: -0.001
             )
         }
         // The slider's value must be completely untouched — proving rejection happened before
         // any AXUIElementSetAttributeValue call, not after a failed/reverted mutation.
-        #expect(abs(slider.doubleValue - 50) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 50) < 0.01)
     }
 
     // MARK: - 19/65. Above maximum rejected BEFORE any mutation
@@ -363,16 +358,17 @@ struct QSemanticSliderValueTests {
     func aboveMaximumRejectedBeforeMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "abovemax-\(suffix)", value: 50, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "abovemax-\(suffix)", value: 50, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.self) {
             _ = try await QBridgeAccessibility.shared.setSliderValue(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "abovemax-\(suffix)", title: nil, desiredValue: 100.001
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "abovemax-\(suffix)", title: nil, desiredValue: 100.001
             )
         }
-        #expect(abs(slider.doubleValue - 50) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 50) < 0.01)
     }
 
     // MARK: - 20. Invalid min/max rejected
@@ -390,11 +386,12 @@ struct QSemanticSliderValueTests {
         // QBridgeAccessibility.setSliderValue is exercised on every successful real-fixture test
         // in this file (each of which could not pass unless that check passed for a real,
         // internally-consistent AX range).
-        let (window, _) = makeSliderWindow(identifier: "rangecheck-\(suffix)", value: 50, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "rangecheck-\(suffix)", value: 50, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "rangecheck-\(suffix)", title: nil, desiredValue: 60
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "rangecheck-\(suffix)", title: nil, desiredValue: 60
         )
         #expect(abs(outcome.minValue - 0) < 0.01)
         #expect(abs(outcome.maxValue - 100) < 0.01)
@@ -407,17 +404,18 @@ struct QSemanticSliderValueTests {
     func alreadyDesiredValueIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "noop-slider-\(suffix)", value: 42, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "noop-slider-\(suffix)", value: 42, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "noop-slider-\(suffix)", title: nil, desiredValue: 42
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "noop-slider-\(suffix)", title: nil, desiredValue: 42
         )
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(abs(outcome.previousValue - 42) < 0.01)
         #expect(abs(outcome.currentValue - 42) < 0.01)
-        #expect(abs(slider.doubleValue - 42) < 0.01) // unchanged — proves no press/set occurred
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 42) < 0.01) // unchanged — proves no press/set occurred
     }
 
     // MARK: - 23/24. State/range drift rejected under normal (non-racing) conditions
@@ -432,12 +430,13 @@ struct QSemanticSliderValueTests {
         // binding re-verify. This test instead proves the mechanism exists and is correctly wired
         // by confirming it does NOT spuriously reject a normal, unraced call.
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "nodrift-\(suffix)", value: 30, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "nodrift-\(suffix)", value: 30, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "nodrift-\(suffix)", title: nil, desiredValue: 80
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "nodrift-\(suffix)", title: nil, desiredValue: 80
         )
         #expect(outcome.changeKind == .changed)
     }
@@ -487,8 +486,9 @@ struct QSemanticSliderValueTests {
     func denyBlocksSetSliderValue() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "deny-slider-\(suffix)", value: 20, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "deny-slider-\(suffix)", value: 20, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -501,7 +501,7 @@ struct QSemanticSliderValueTests {
                   "actionName": "ui.set_slider_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified slider's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "deny-slider-\(suffix)", "desiredValue": "90"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "deny-slider-\(suffix)", "desiredValue": "90"}
                 }
               ]
             }
@@ -524,7 +524,7 @@ struct QSemanticSliderValueTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(abs(slider.doubleValue - 20) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 20) < 0.01)
     }
 
     // MARK: - 28. Persisted / expiry-equivalent approval never self-authorizes
@@ -637,8 +637,9 @@ struct QSemanticSliderValueTests {
     func allowSetsSliderAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "allow-slider-\(suffix)", value: 10, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "allow-slider-\(suffix)", value: 10, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -651,7 +652,7 @@ struct QSemanticSliderValueTests {
                   "actionName": "ui.set_slider_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified slider's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "allow-slider-\(suffix)", "desiredValue": "65"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "allow-slider-\(suffix)", "desiredValue": "65"}
                 }
               ]
             }
@@ -675,7 +676,7 @@ struct QSemanticSliderValueTests {
             return
         }
         #expect(!summary.isEmpty)
-        #expect(abs(slider.doubleValue - 65) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 65) < 0.01)
     }
 
     // MARK: - 44. Tolerance behavior — near-equal values are idempotent, distinguishable values are not
@@ -697,17 +698,18 @@ struct QSemanticSliderValueTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "mismatch-slider-\(suffix)", value: 10, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "mismatch-slider-\(suffix)", value: 10, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "mismatch-slider-\(suffix)", title: nil, desiredValue: 40
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "mismatch-slider-\(suffix)", title: nil, desiredValue: 40
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axSliderValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSlider",
             matchIdentifier: "mismatch-slider-\(suffix)",
             matchTitle: nil,
@@ -722,12 +724,14 @@ struct QSemanticSliderValueTests {
 
     @Test("46. An unresolvable target after the value change fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axSliderValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSlider",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXSlider identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXSlider identifier=vanished label=none",
             desiredValue: 50
         )
         let result = QActionResult(actionId: "verify-vanished-slider", success: true, summary: "n/a")
@@ -743,8 +747,9 @@ struct QSemanticSliderValueTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "predispatch-slider-\(suffix)", value: 15, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "predispatch-slider-\(suffix)", value: 15, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -757,7 +762,7 @@ struct QSemanticSliderValueTests {
                   "actionName": "ui.set_slider_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified slider's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "predispatch-slider-\(suffix)", "desiredValue": "88"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "predispatch-slider-\(suffix)", "desiredValue": "88"}
                 }
               ]
             }
@@ -770,7 +775,7 @@ struct QSemanticSliderValueTests {
             endpointName: "semantic-slider-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Set the slider")
-        #expect(abs(slider.doubleValue - 15) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 15) < 0.01)
     }
 
     @Test("48/49/50/52. An uncertain in-flight slider step is never blindly marked complete — it fails closed to pending for observation-first re-execution, and idempotency prevents a duplicate write on retry")
@@ -819,12 +824,13 @@ struct QSemanticSliderValueTests {
         // current value — proven by the outcome's own minValue/maxValue fields reflecting a
         // real, freshly-read range rather than a stale one captured only at initial resolution.
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "rangedrift-\(suffix)", value: 20, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSliderWindow(in: fixture, identifier: "rangedrift-\(suffix)", value: 20, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setSliderValue(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: "rangedrift-\(suffix)", title: nil, desiredValue: 55
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: "rangedrift-\(suffix)", title: nil, desiredValue: 55
         )
         #expect(abs(outcome.minValue - 0) < 0.01)
         #expect(abs(outcome.maxValue - 100) < 0.01)
@@ -894,8 +900,9 @@ struct QSemanticSliderValueTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, slider) = makeSliderWindow(identifier: "safe-evidence-slider-\(suffix)", value: 5, minValue: 0, maxValue: 100)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: "safe-evidence-slider-\(suffix)", value: 5, minValue: 0, maxValue: 100)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -908,7 +915,7 @@ struct QSemanticSliderValueTests {
                   "actionName": "ui.set_slider_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified slider's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "safe-evidence-slider-\(suffix)", "desiredValue": "77"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "safe-evidence-slider-\(suffix)", "desiredValue": "77"}
                 }
               ]
             }
@@ -936,7 +943,7 @@ struct QSemanticSliderValueTests {
             #expect(Bool(false), "Expected completion, got: \(resolved.state)")
             return
         }
-        #expect(abs(slider.doubleValue - 77) < 0.01)
+        #expect(abs(try await fixture.double(slider, "doubleValue") - 77) < 0.01)
 
         let auditRecords = QAuditLogger.shared.getRecentRecords(limit: 500).filter { $0.taskId == task.taskId }
         #expect(!auditRecords.isEmpty)

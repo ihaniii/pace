@@ -23,6 +23,10 @@
 //  fabricating a pass, mirroring the exact convention every prior semantic AX test suite in this
 //  codebase already establishes.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: a same-process kAXMainAttribute write deadlocks AppKit (test 29 hung
+//  the full suite before this migration).
+//
 
 import Testing
 import AppKit
@@ -35,29 +39,25 @@ import ApplicationServices
 /// A genuine, real, live `NSWindow` — already a real `AXWindow`-role AXUIElement via default
 /// AppKit Accessibility bridging, with no custom `NSAccessibility` override needed. Its
 /// `kAXMainAttribute` is wired to the window's own real main-designation state.
-@MainActor
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host, where a
+/// same-process kAXMainAttribute write deadlocks AppKit), then made key and ordered front within
+/// the fixture app exactly as the in-process helper did. Returns the fixture's window token.
+@discardableResult
 private func makeMainDesignableWindow(
+    in fixture: PaceAXFixture,
     title: String,
     identifier: String? = nil
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 120, y: 120, width: 220, height: 90),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable],
-        backing: .buffered,
-        defer: false
+) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 220,
+        height: 90,
+        styles: ["titled", "closable", "miniaturizable", "resizable"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
-    return window
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
 @Suite("QSemanticWindowMainDesignationTests")
@@ -152,16 +152,18 @@ struct QSemanticWindowMainDesignationTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.setWindowMain(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: nil, desiredMain: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: nil, desiredMain: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Make window main",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "desiredMain": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "desiredMain": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-window-main"))
         #expect(result.success == false)
@@ -172,10 +174,12 @@ struct QSemanticWindowMainDesignationTests {
 
     @Test("6/7. Missing/invalid desiredMain fails closed with a deterministic error")
     func missingOrInvalidDesiredMainFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Make window main",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-main"))
         #expect(missingResult.success == false)
@@ -185,7 +189,7 @@ struct QSemanticWindowMainDesignationTests {
             let request = QActionRequest(
                 toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Make window main",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "x", "desiredMain": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "x", "desiredMain": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-main"))
             #expect(result.success == false, "Invalid desiredMain '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -202,10 +206,12 @@ struct QSemanticWindowMainDesignationTests {
 
     @Test("9-18. AXApplication, AXGroup, AXButton, AXSheet, AXRow, AXTable, AXOutline, AXMenuBar, AXDrawer, and an unrecognized role are all rejected for window-main-designation mutation at the role-policy gate")
     func nonWindowRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXApplication", "AXGroup", "AXButton", "AXSheet", "AXRow", "AXTable", "AXOutline", "AXMenuBar", "AXDrawer", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedWindowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.setWindowMain(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredMain: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredMain: true
                 )
             }
         }
@@ -218,18 +224,19 @@ struct QSemanticWindowMainDesignationTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "PresentWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "PresentWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)", desiredMain: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMain(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredMain: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AbsentWindow-\(suffix)", desiredMain: true
             )
         }
 
@@ -247,12 +254,13 @@ struct QSemanticWindowMainDesignationTests {
     func identifierPreferredOverTitle() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "SharedTitle-\(suffix)", identifier: "unique-window-main-id-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "SharedTitle-\(suffix)", identifier: "unique-window-main-id-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: "unique-window-main-id-\(suffix)", title: nil, desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: "unique-window-main-id-\(suffix)", title: nil, desiredMain: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
     }
@@ -264,17 +272,15 @@ struct QSemanticWindowMainDesignationTests {
     func ambiguousDuplicateTitleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeMainDesignableWindow(title: "DupWindowMain-\(suffix)")
-        let windowB = makeMainDesignableWindow(title: "DupWindowMain-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "DupWindowMain-\(suffix)")
+        try await makeMainDesignableWindow(in: fixture, title: "DupWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.setWindowMain(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DupWindowMain-\(suffix)", desiredMain: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DupWindowMain-\(suffix)", desiredMain: true
             )
         }
     }
@@ -302,18 +308,19 @@ struct QSemanticWindowMainDesignationTests {
     func nonExactTitleVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "ExactWindowMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "ExactWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMain(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExactWindowMain-", desiredMain: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExactWindowMain-", desiredMain: true
             )
         }
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.setWindowMain(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "EXACTWINDOWMAIN-\(suffix)".uppercased(), desiredMain: true
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "EXACTWINDOWMAIN-\(suffix)".uppercased(), desiredMain: true
             )
         }
         // No index/position-based parameter exists in the schema at all (only
@@ -345,20 +352,21 @@ struct QSemanticWindowMainDesignationTests {
     func alreadyMainStateIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "AlreadyMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "AlreadyMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // A freshly key-and-ordered-front single window is, in practice, already main — the
         // first call below is expected to observe that and no-op; asserting on changeKind rather
         // than a specific pre-condition keeps this test honest either way.
         let firstOutcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AlreadyMain-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AlreadyMain-\(suffix)", desiredMain: true
         )
         // Calling it again immediately MUST now be a no-op regardless of the first call's
         // changeKind, since the window is main by this point either way.
         let secondOutcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AlreadyMain-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AlreadyMain-\(suffix)", desiredMain: true
         )
         #expect(secondOutcome.changeKind == .alreadyDesired)
         #expect(secondOutcome.previousMain == true)
@@ -379,21 +387,19 @@ struct QSemanticWindowMainDesignationTests {
         // genuine .changed transition, though this test only requires currentMain==true
         // afterward regardless of which changeKind occurred, since window-manager main
         // assignment on creation is not itself part of this capability's contract.
-        let windowA = makeMainDesignableWindow(title: "MutateA-\(suffix)")
-        let windowB = makeMainDesignableWindow(title: "MutateB-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "MutateA-\(suffix)")
+        try await makeMainDesignableWindow(in: fixture, title: "MutateB-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "MutateA-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "MutateA-\(suffix)", desiredMain: true
         )
         #expect(outcome.currentMain == true)
 
         let freshEvidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "MutateA-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "MutateA-\(suffix)"
         )
         guard case .resolved(let freshMain) = freshEvidence else {
             #expect(Bool(false), "Expected the window to remain resolvable with a readable main state, got: \(freshEvidence)")
@@ -462,12 +468,13 @@ struct QSemanticWindowMainDesignationTests {
     func denyBlocksSetWindowMain() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "DenyWindowMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "DenyWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let beforeEvidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DenyWindowMain-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DenyWindowMain-\(suffix)"
         )
 
         let mockModel = MockAutonomousModelProvider()
@@ -480,7 +487,7 @@ struct QSemanticWindowMainDesignationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Designate a semantically-identified window as main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "DenyWindowMain-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "DenyWindowMain-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -504,7 +511,7 @@ struct QSemanticWindowMainDesignationTests {
             return
         }
         let afterEvidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DenyWindowMain-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DenyWindowMain-\(suffix)"
         )
         #expect(beforeEvidence == afterEvidence, "Denial must leave the window's main state completely untouched.")
     }
@@ -617,12 +624,13 @@ struct QSemanticWindowMainDesignationTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "PredispatchWindowMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "PredispatchWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let beforeEvidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PredispatchWindowMain-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PredispatchWindowMain-\(suffix)"
         )
 
         let mockModel = MockAutonomousModelProvider()
@@ -635,7 +643,7 @@ struct QSemanticWindowMainDesignationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Designate a semantically-identified window as main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "PredispatchWindowMain-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "PredispatchWindowMain-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -649,7 +657,7 @@ struct QSemanticWindowMainDesignationTests {
         )
         _ = try await runtime.submitIntent(prompt: "Make the window main")
         let afterEvidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PredispatchWindowMain-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PredispatchWindowMain-\(suffix)"
         )
         #expect(beforeEvidence == afterEvidence, "Submitting the intent (before approval) must leave the window's main state completely untouched.")
     }
@@ -659,8 +667,9 @@ struct QSemanticWindowMainDesignationTests {
     func allowDesignatesWindowMainAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "AllowWindowMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "AllowWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -673,7 +682,7 @@ struct QSemanticWindowMainDesignationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Designate a semantically-identified window as main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "AllowWindowMain-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "AllowWindowMain-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -701,7 +710,7 @@ struct QSemanticWindowMainDesignationTests {
         // grant is consumed — resolution (collectMatches) is therefore always fresh, never a
         // reference held from before approval. Real, independently-observed outcome:
         let evidenceAfterAllow = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AllowWindowMain-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AllowWindowMain-\(suffix)"
         )
         guard case .resolved(let currentMainAfterAllow) = evidenceAfterAllow else {
             #expect(Bool(false), "Expected the window to remain resolvable with a readable main state, got: \(evidenceAfterAllow)")
@@ -717,17 +726,18 @@ struct QSemanticWindowMainDesignationTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "VerifyMatch-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "VerifyMatch-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "VerifyMatch-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "VerifyMatch-\(suffix)", desiredMain: true
         )
         #expect(outcome.currentMain == true)
 
         let strategy = QVerificationStrategy.windowMainStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "VerifyMatch-\(suffix)",
@@ -751,12 +761,13 @@ struct QSemanticWindowMainDesignationTests {
         // which resolves to .failed via .targetUnavailable — see test 41 for that exact path.
         // This test instead directly targets a real window that was intentionally never made
         // main and independently confirms its observed state before asserting non-verification.
-        let window = makeMainDesignableWindow(title: "VerifyMismatch-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "VerifyMismatch-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let evidence = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "VerifyMismatch-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "VerifyMismatch-\(suffix)"
         )
         guard case .resolved(let currentMain) = evidence, currentMain == false else {
             // This window happened to already be main (window-manager-dependent on creation) —
@@ -766,11 +777,11 @@ struct QSemanticWindowMainDesignationTests {
         }
 
         let strategy = QVerificationStrategy.windowMainStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "VerifyMismatch-\(suffix)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=VerifyMismatch-\(suffix)"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=VerifyMismatch-\(suffix)"
         )
         let result = QActionResult(actionId: "verify-mismatch-window-main", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -780,12 +791,14 @@ struct QSemanticWindowMainDesignationTests {
 
     @Test("40. An unresolvable/ambiguous target after the mutation fails verification rather than assuming success — a window's disappearance is never automatically interpreted as success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.windowMainStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "vanished-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=vanished"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=vanished"
         )
         let result = QActionResult(actionId: "verify-vanished-window-main", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -795,12 +808,14 @@ struct QSemanticWindowMainDesignationTests {
 
     @Test("41. A successful attribute-set alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.windowMainStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "insufficient-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=insufficient"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=insufficient"
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-window-main", success: true, summary: "Window main-designation mutation attempted. Independent closed-loop verification pending.")
         let request = QActionRequest(toolName: "ui.set_window_main", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -815,13 +830,14 @@ struct QSemanticWindowMainDesignationTests {
     func recoveryRecognizesAlreadyMainAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "RecoveredWindowMain-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "RecoveredWindowMain-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
         // Ensure the window is genuinely main before exercising recovery, independent of
         // window-manager creation-time behavior.
         _ = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "RecoveredWindowMain-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "RecoveredWindowMain-\(suffix)", desiredMain: true
         )
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -835,7 +851,7 @@ struct QSemanticWindowMainDesignationTests {
             stepId: "step-uncertain-window-main", index: 0, actionName: "ui.set_window_main", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Make window main",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "RecoveredWindowMain-\(suffix)", "desiredMain": "true"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "RecoveredWindowMain-\(suffix)", "desiredMain": "true"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -965,8 +981,9 @@ struct QSemanticWindowMainDesignationTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeMainDesignableWindow(title: "SafeEvidence-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "SafeEvidence-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -979,7 +996,7 @@ struct QSemanticWindowMainDesignationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Designate a semantically-identified window as main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "SafeEvidence-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "SafeEvidence-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -1119,12 +1136,10 @@ struct QSemanticWindowMainDesignationTests {
             return
         }
         let suffix = UUID().uuidString
-        let windowA = makeMainDesignableWindow(title: "E2EWindowA-\(suffix)")
-        let windowB = makeMainDesignableWindow(title: "E2EWindowB-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "E2EWindowA-\(suffix)")
+        try await makeMainDesignableWindow(in: fixture, title: "E2EWindowB-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -1137,7 +1152,7 @@ struct QSemanticWindowMainDesignationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Make window A main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "E2EWindowA-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "E2EWindowA-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -1165,7 +1180,7 @@ struct QSemanticWindowMainDesignationTests {
         // itself observed, and independent of window frontmost-ness or key status — this
         // capability makes no claim about either.
         let evidenceAfter = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2EWindowA-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2EWindowA-\(suffix)"
         )
         guard case .resolved(let currentMainAfter) = evidenceAfter else {
             #expect(Bool(false), "Expected the window to remain resolvable with a readable main state, got: \(evidenceAfter)")
@@ -1187,21 +1202,19 @@ struct QSemanticWindowMainDesignationTests {
             return
         }
         let suffix = UUID().uuidString
-        let windowA = makeMainDesignableWindow(title: "ExclusivityA-\(suffix)")
-        let windowB = makeMainDesignableWindow(title: "ExclusivityB-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainDesignableWindow(in: fixture, title: "ExclusivityA-\(suffix)")
+        try await makeMainDesignableWindow(in: fixture, title: "ExclusivityB-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // Make windowB main first via this capability itself (never by manually forcing AX
         // state), so there is a known, capability-produced "previously main" window to observe.
         _ = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)", desiredMain: true
         )
         let windowBMainBefore = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)"
         )
         guard case .resolved(true) = windowBMainBefore else {
             Issue.record("Setup precondition failed: windowB was expected to be main before the exclusivity observation begins, got \(windowBMainBefore)")
@@ -1211,7 +1224,7 @@ struct QSemanticWindowMainDesignationTests {
         // The single mutation under observation: designate windowA main. This capability never
         // touches windowB in any way — no enumeration, no second AX call, no explicit clearing.
         let outcomeA = try await QBridgeAccessibility.shared.setWindowMain(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExclusivityA-\(suffix)", desiredMain: true
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExclusivityA-\(suffix)", desiredMain: true
         )
         #expect(outcomeA.currentMain == true)
 
@@ -1221,10 +1234,10 @@ struct QSemanticWindowMainDesignationTests {
         // direction, since kAXMainAttribute exclusivity semantics are owned entirely by the
         // OS/application, not by this capability.
         let windowAMainAfter = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExclusivityA-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExclusivityA-\(suffix)"
         )
         let windowBMainAfter = await QBridgeAccessibility.shared.observeWindowMainEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExclusivityB-\(suffix)"
         )
         guard case .resolved(let currentMainA) = windowAMainAfter else {
             #expect(Bool(false), "Expected windowA to remain resolvable with a readable main state, got: \(windowAMainAfter)")

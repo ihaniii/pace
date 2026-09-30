@@ -31,6 +31,9 @@
 //  codebase already established. See docs/PHASE_2CC_SEMANTIC_HELP_TEXT.md for the full contract,
 //  including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -38,34 +41,31 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSButton` — the exact same fixture shape
 /// `ui.read_element_role_description`'s own real E2E tests already established as proven-working
 /// for resolving a real `AXButton` by identifier.
-@MainActor
-private func makeButtonWindow(identifier: String, title: String = "Click Me") -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String = "Click Me"
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementHelpTextReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 30),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementHelpTextReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let button = NSButton(title: title, target: nil, action: nil)
-    button.frame = NSRect(x: 20, y: 20, width: 180, height: 30)
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class HelpTextMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -190,9 +190,11 @@ struct QSemanticElementHelpTextReadTests {
     @MainActor
     func secureFieldRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementHelpText(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -204,13 +206,14 @@ struct QSemanticElementHelpTextReadTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "wrongrole-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "wrongrole-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.readElementHelpText(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -218,16 +221,18 @@ struct QSemanticElementHelpTextReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementHelpText(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_help_text", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read help text",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXButton"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXButton"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-helptext"))
         #expect(result.success == false)
@@ -248,10 +253,12 @@ struct QSemanticElementHelpTextReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_help_text", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read help text",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-helptext"))
         #expect(result.success == false)
@@ -275,13 +282,14 @@ struct QSemanticElementHelpTextReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementHelpText(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -294,26 +302,17 @@ struct QSemanticElementHelpTextReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupButton-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let buttonA = NSButton(title: "A", target: nil, action: nil)
-        buttonA.frame = NSRect(x: 10, y: 10, width: 150, height: 30)
-        buttonA.setAccessibilityIdentifier(sharedIdentifier)
-        let buttonB = NSButton(title: "B", target: nil, action: nil)
-        buttonB.frame = NSRect(x: 10, y: 100, width: 150, height: 30)
-        buttonB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(buttonA)
-        container.addSubview(buttonB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 150, height: 30), properties: ["title": "A", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 150, height: 30), properties: ["title": "B", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementHelpText(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -413,16 +412,17 @@ struct QSemanticElementHelpTextReadTests {
     func neverMutatesButtonNeverReadsRawValue() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, button) = makeButtonWindow(identifier: "nomutate-\(suffix)")
-        button.setAccessibilityHelp("Click to save your changes")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: "nomutate-\(suffix)")
+        try await fixture.setAccessibility(button, "help", "Click to save your changes")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementHelpText(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(button.state == .off)
-        #expect(button.isEnabled == true)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
+        #expect(try await fixture.bool(button, "isEnabled") == true)
     }
 
     // MARK: - 18. No traversal / 19. No polling / 20. No retries / 21. Bounded resource accounting
@@ -434,10 +434,12 @@ struct QSemanticElementHelpTextReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_help_text exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_help_text", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read help text", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXButton", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXButton", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-helptext"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -602,9 +604,10 @@ struct QSemanticElementHelpTextReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "DurableButton-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: sentinelIdentifier)
-        button.setAccessibilityHelp("Click to save your changes")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: sentinelIdentifier)
+        try await fixture.setAccessibility(button, "help", "Click to save your changes")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -617,7 +620,7 @@ struct QSemanticElementHelpTextReadTests {
                   "actionName": "ui.read_element_help_text",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's help text",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -643,7 +646,7 @@ struct QSemanticElementHelpTextReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_help_text" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("Audit records for this capability never contain anything beyond bounded semantic UI metadata")
@@ -652,9 +655,10 @@ struct QSemanticElementHelpTextReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "AuditButton-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: sentinelIdentifier)
-        button.setAccessibilityHelp("Click to save your changes")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: sentinelIdentifier)
+        try await fixture.setAccessibility(button, "help", "Click to save your changes")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -667,7 +671,7 @@ struct QSemanticElementHelpTextReadTests {
                   "actionName": "ui.read_element_help_text",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's help text",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -699,19 +703,20 @@ struct QSemanticElementHelpTextReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: identifier)
-        button.setAccessibilityHelp("Click to save your changes")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: identifier)
+        try await fixture.setAccessibility(button, "help", "Click to save your changes")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementHelpText(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementHelpText(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
         #expect(first?.helpText == second?.helpText)
-        #expect(button.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
     }
 
     // MARK: - 25. Capability-count integrity
@@ -765,30 +770,31 @@ struct QSemanticElementHelpTextReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-helptext-\(suffix)"
-        let (window, button) = makeButtonWindow(identifier: identifier)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, button) = try await makeButtonWindow(in: fixture, identifier: identifier)
 
         // Force a deterministic, known help string via the real, declared AppKit accessor
         // (setAccessibilityHelp/accessibilityHelp, NSAccessibilityProtocols.h) — the same genuine
         // forced-value round-trip pattern ui.read_element_value_description's own E2E test
         // established for setAccessibilityValueDescription.
-        button.setAccessibilityHelp("Click to save your changes")
-        #expect(button.accessibilityHelp() == "Click to save your changes")
+        try await fixture.setAccessibility(button, "help", "Click to save your changes")
+        #expect((try await fixture.optionalString(button, "accessibility:help")) == "Click to save your changes")
 
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementHelpText(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
 
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
         #expect(metadata?.helpText == "Click to save your changes")
-        #expect(metadata?.helpText == button.accessibilityHelp())
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.helpText == (try await fixture.optionalString(button, "accessibility:help")))
+        #expect(metadata?.applicationName == fixture.applicationName)
         // The read never mutated the fixture's own state.
-        #expect(button.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
     }
 
     @Test("E2E. Real macOS AppKit E2E — a genuine NSButton with no help text set correctly reports honest absence via the optional-reference contract (guarded by AXIsProcessTrusted)")
@@ -799,12 +805,13 @@ struct QSemanticElementHelpTextReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-nohelptext-\(suffix)"
-        let (window, _) = makeButtonWindow(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementHelpText(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: identifier, title: nil
         )
 
         // An ordinary NSButton with no help text ever set is the common, expected case — genuine

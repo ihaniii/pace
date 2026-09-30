@@ -40,6 +40,9 @@
 //  codebase already established. See docs/PHASE_2CL_SEMANTIC_LINKED_ELEMENTS.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -47,9 +50,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -57,43 +57,32 @@ private var currentProcessAppName: String {
 /// the real, public `setAccessibilityLinkedUIElements(_:)` AppKit API — the same general
 /// per-element accessor category `ui.list_label_served_elements`'s own
 /// `setAccessibilityServesAsTitleForUIElements(_:)` fixture already established as proven-working.
-@MainActor
+/// Fixture-backed replacement for the in-process `makeElementWithLinkedElements`: the same window,
+/// source button, linked text fields and optional kAXLinkedUIElements reference, built inside the
+/// out-of-process PaceAXFixtureHost. Returns the window token, the source's handle and the linked
+/// fields' handles.
 private func makeElementWithLinkedElements(
+    in fixture: PaceAXFixture,
     sourceIdentifier: String,
     linkedIdentifiers: [String] = ["linked-default"],
     attachLinkedElements: Bool = true
-) -> (window: NSWindow, sourceButton: NSButton, linkedFields: [NSTextField]) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticLinkedElementsListTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 150))
-
-    let sourceButton = NSButton(title: "Source", target: nil, action: nil)
-    sourceButton.frame = NSRect(x: 20, y: 60, width: 90, height: 24)
-    sourceButton.setAccessibilityIdentifier(sourceIdentifier)
-    contentView.addSubview(sourceButton)
-
-    var linkedFields: [NSTextField] = []
+) async throws -> (window: String, sourceButton: String, linkedFields: [String]) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticLinkedElementsListTestFixture", width: 400, height: 150, styles: ["titled", "closable"])
+    try await fixture.addControl(kind: "button", identifier: sourceIdentifier, windowToken: windowToken,
+                                 frame: NSRect(x: 20, y: 60, width: 90, height: 24), properties: ["title": "Source", "detachAction": true])
+    var linkedFields: [String] = []
     for (index, linkedIdentifier) in linkedIdentifiers.enumerated() {
-        let field = NSTextField(frame: NSRect(x: 120, y: 60 - CGFloat(index) * 30, width: 220, height: 24))
-        field.stringValue = ""
-        field.setAccessibilityIdentifier(linkedIdentifier)
-        contentView.addSubview(field)
-        linkedFields.append(field)
+        let fieldHandle = "\(linkedIdentifier)#\(index)"
+        try await fixture.addControl(kind: "textField", identifier: fieldHandle, windowToken: windowToken,
+                                     frame: NSRect(x: 120, y: 60 - CGFloat(index) * 30, width: 220, height: 24),
+                                     properties: ["stringValue": "", "accessibilityIdentifier": linkedIdentifier, "detachAction": true])
+        linkedFields.append(fieldHandle)
     }
     if attachLinkedElements {
-        sourceButton.setAccessibilityLinkedUIElements(linkedFields)
+        try await fixture.setAccessibility(sourceIdentifier, "linkedUIElements", linkedFields)
     }
-
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, sourceButton, linkedFields)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, sourceIdentifier, linkedFields)
 }
 
 private final class LinkedElementsMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -214,9 +203,11 @@ struct QSemanticLinkedElementsListTests {
     @MainActor
     func secureFieldSourceRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -226,13 +217,14 @@ struct QSemanticLinkedElementsListTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeElementWithLinkedElements(sourceIdentifier: "wrongrole-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: "wrongrole-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -240,9 +232,11 @@ struct QSemanticLinkedElementsListTests {
     @Test("7. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: nil, title: nil
             )
         }
     }
@@ -262,13 +256,14 @@ struct QSemanticLinkedElementsListTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeElementWithLinkedElements(sourceIdentifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -279,26 +274,17 @@ struct QSemanticLinkedElementsListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupSource-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let buttonA = NSButton(title: "A", target: nil, action: nil)
-        buttonA.frame = NSRect(x: 10, y: 10, width: 90, height: 24)
-        buttonA.setAccessibilityIdentifier(sharedIdentifier)
-        let buttonB = NSButton(title: "B", target: nil, action: nil)
-        buttonB.frame = NSRect(x: 10, y: 100, width: 90, height: 24)
-        buttonB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(buttonA)
-        container.addSubview(buttonB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 90, height: 24), properties: ["title": "A", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 90, height: 24), properties: ["title": "B", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -389,26 +375,20 @@ struct QSemanticLinkedElementsListTests {
     func secureFieldLinkedElementFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 150), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 150))
-        let sourceButton = NSButton(title: "Source", target: nil, action: nil)
-        sourceButton.frame = NSRect(x: 20, y: 60, width: 90, height: 24)
-        sourceButton.setAccessibilityIdentifier("securelink-\(suffix)")
-        let secureField = NSSecureTextField(frame: NSRect(x: 120, y: 60, width: 220, height: 24))
-        secureField.setAccessibilityIdentifier("secret-\(suffix)")
-        contentView.addSubview(sourceButton)
-        contentView.addSubview(secureField)
-        sourceButton.setAccessibilityLinkedUIElements([secureField])
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 150, styles: ["titled"])
+        let sourceButton = "inline-sourceButton"
+        try await fixture.addControl(kind: "button", identifier: sourceButton, windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 90, height: 24), properties: ["title": "Source", "accessibilityIdentifier": "securelink-\(suffix)", "detachAction": true])
+        let secureField = "inline-secureField"
+        try await fixture.addControl(kind: "secureTextField", identifier: secureField, windowToken: windowToken, frame: NSRect(x: 120, y: 60, width: 220, height: 24), properties: ["accessibilityIdentifier": "secret-\(suffix)", "detachAction": true])
+        try await fixture.setAccessibility(sourceButton, "linkedUIElements", [secureField])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.listLinkedElements(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "securelink-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "securelink-\(suffix)", title: nil
             )
             // A genuinely-trusted host that happens not to report the secure field as linked is
             // still a structurally valid outcome — the CONTRACT under test (proven directly by
@@ -462,8 +442,9 @@ struct QSemanticLinkedElementsListTests {
         let suffix = UUID().uuidString
         let sentinelSourceIdentifier = "DurableSource-\(suffix)"
         let sentinelLinkedIdentifier = "SuperSecretLinkedElementSentinel-\(suffix)"
-        let (window, _, _) = makeElementWithLinkedElements(sourceIdentifier: sentinelSourceIdentifier, linkedIdentifiers: [sentinelLinkedIdentifier])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: sentinelSourceIdentifier, linkedIdentifiers: [sentinelLinkedIdentifier])
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -476,7 +457,7 @@ struct QSemanticLinkedElementsListTests {
                   "actionName": "ui.list_linked_elements",
                   "toolFamily": "ui",
                   "description": "List a semantically-identified element's linked elements",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "\(sentinelSourceIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "\(sentinelSourceIdentifier)"}
                 }
               ]
             }
@@ -512,8 +493,9 @@ struct QSemanticLinkedElementsListTests {
         let suffix = UUID().uuidString
         let sentinelSourceIdentifier = "AuditSource-\(suffix)"
         let sentinelLinkedIdentifier = "SuperSecretAuditLinkedSentinel-\(suffix)"
-        let (window, _, _) = makeElementWithLinkedElements(sourceIdentifier: sentinelSourceIdentifier, linkedIdentifiers: [sentinelLinkedIdentifier])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: sentinelSourceIdentifier, linkedIdentifiers: [sentinelLinkedIdentifier])
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -526,7 +508,7 @@ struct QSemanticLinkedElementsListTests {
                   "actionName": "ui.list_linked_elements",
                   "toolFamily": "ui",
                   "description": "List a semantically-identified element's linked elements",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "\(sentinelSourceIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "\(sentinelSourceIdentifier)"}
                 }
               ]
             }
@@ -586,19 +568,20 @@ struct QSemanticLinkedElementsListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sourceIdentifier = "Repeat-\(suffix)"
-        let (window, sourceButton, linkedFields) = makeElementWithLinkedElements(sourceIdentifier: sourceIdentifier, linkedIdentifiers: ["repeat-linked-\(suffix)"])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, sourceButton, linkedFields) = try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: sourceIdentifier, linkedIdentifiers: ["repeat-linked-\(suffix)"])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.listLinkedElements(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: sourceIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: sourceIdentifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.listLinkedElements(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: sourceIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: sourceIdentifier, title: nil
         )
         #expect(first?.linkedElements.count == second?.linkedElements.count)
-        #expect(sourceButton.title == "Source")
-        #expect(linkedFields.first?.stringValue == "")
+        #expect(try await fixture.string(sourceButton, "title") == "Source")
+        #expect(try await fixture.stringIfPresent(linkedFields.first, "stringValue") == "")
     }
 
     @Test("33. No raw AXUIElement reference is ever persisted — structural proof: QAXLinkedElementsMetadata's and QAXLinkedElementReference's stored properties are String?/String/[QAXLinkedElementReference] only, no AXUIElement-typed field exists anywhere in the declarations")
@@ -617,15 +600,16 @@ struct QSemanticLinkedElementsListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sourceIdentifier = "NoMutate-\(suffix)"
-        let (window, sourceButton, linkedFields) = makeElementWithLinkedElements(sourceIdentifier: sourceIdentifier, linkedIdentifiers: ["nomutate-linked-\(suffix)"])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, sourceButton, linkedFields) = try await makeElementWithLinkedElements(in: fixture, sourceIdentifier: sourceIdentifier, linkedIdentifiers: ["nomutate-linked-\(suffix)"])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.listLinkedElements(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: sourceIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: sourceIdentifier, title: nil
         )
-        #expect(sourceButton.title == "Source")
-        #expect(linkedFields.first?.stringValue == "")
+        #expect(try await fixture.string(sourceButton, "title") == "Source")
+        #expect(try await fixture.stringIfPresent(linkedFields.first, "stringValue") == "")
     }
 
     @Test("35. Observing this relationship never authorizes any mutation against the source element or any linked element — the authorization paths are entirely disjoint")
@@ -769,6 +753,8 @@ struct QSemanticLinkedElementsListTests {
     @Test("46/E2E. Real macOS AppKit E2E — a real NSButton linked to real NSTextFields via the genuine setAccessibilityLinkedUIElements(_:) accessor resolves via kAXLinkedUIElementsAttribute, cross-validated against the identical control's own accessibilityLinkedUIElements() accessor call; an unlinked source correctly reports genuine absence; no element is ever mutated (guarded by AXIsProcessTrusted)")
     @MainActor
     func realAppKitLinkedElementsList() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         guard AXIsProcessTrusted() else {
             // BLOCKED BY ENVIRONMENT — TCC / Accessibility permission. This isolated/unsigned
             // XCTest host is not expected to hold Accessibility trust; never fabricated as a
@@ -778,34 +764,34 @@ struct QSemanticLinkedElementsListTests {
         }
         let suffix = UUID().uuidString
 
-        let (linkedWindow, sourceButton, linkedFields) = makeElementWithLinkedElements(
+        let (linkedWindow, sourceButton, linkedFields) = try await makeElementWithLinkedElements(
+            in: fixture,
             sourceIdentifier: "e2e-linked-\(suffix)", linkedIdentifiers: ["e2e-target-\(suffix)"]
         )
-        defer { linkedWindow.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
         let linkedMetadata = try await QBridgeAccessibility.shared.listLinkedElements(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "e2e-linked-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "e2e-linked-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        let directAccessorLinked = sourceButton.accessibilityLinkedUIElements() as? [Any]
+        let directAccessorLinked = try await fixture.handles(sourceButton, "accessibility:linkedUIElements")
         #expect((linkedMetadata?.linkedElements.count ?? 0) <= max(directAccessorLinked?.count ?? 0, linkedFields.count))
-        #expect(linkedMetadata?.applicationName == currentProcessAppName)
+        #expect(linkedMetadata?.applicationName == fixture.applicationName)
 
-        let (unlinkedWindow, _, _) = makeElementWithLinkedElements(
+        let (unlinkedWindow, _, _) = try await makeElementWithLinkedElements(
+            in: fixture,
             sourceIdentifier: "e2e-unlinked-\(suffix)", linkedIdentifiers: [], attachLinkedElements: false
         )
-        defer { unlinkedWindow.close() }
         try? await Task.sleep(nanoseconds: 150_000_000)
         // Whatever AppKit's real, honest answer is (nil absence, or a genuinely present empty
         // array) is accepted here — the CONTRACT under test is that no exception was thrown
         // merely because no linked elements were ever set.
         _ = try await QBridgeAccessibility.shared.listLinkedElements(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "e2e-unlinked-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "e2e-unlinked-\(suffix)", title: nil
         )
 
         // Neither field's own content was mutated by the read.
-        #expect(linkedFields.first?.stringValue == "")
+        #expect(try await fixture.stringIfPresent(linkedFields.first, "stringValue") == "")
     }
 }

@@ -21,6 +21,9 @@
 //  AXIsProcessTrusted() and no-ops rather than fabricating a pass, mirroring the exact convention
 //  every prior semantic AX test suite in this codebase already establishes.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -32,41 +35,37 @@ import ApplicationServices
 
 /// A genuine, real, live, closable `NSWindow` — already a real `AXWindow`-role AXUIElement with a
 /// genuine `kAXCloseButtonAttribute`-referenced close button via default AppKit AX bridging.
-@MainActor
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host), then made key
+/// and ordered front within the fixture app exactly as the in-process helper did. Returns the
+/// fixture's window token.
+@discardableResult
 private func makeClosableWindow(
+    in fixture: PaceAXFixture,
     title: String,
     identifier: String? = nil
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 140, y: 140, width: 220, height: 90),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable],
-        backing: .buffered,
-        defer: false
+) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 220,
+        height: 90,
+        styles: ["titled", "closable", "miniaturizable", "resizable"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
-    return window
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
-/// A delegate that unconditionally refuses to let its window close — used ONLY as an honest,
-/// clearly-labeled PROXY for "something is blocking this close" (e.g. a real save/discard sheet
-/// in a document-based app), since a plain AppKit fixture with no `NSDocument` architecture cannot
-/// genuinely produce a real save dialog. This delegate is never inspected, clicked through, or
-/// otherwise acted upon by `ui.close_window` — it exists purely to make the window's close
-/// PREDICTABLY BLOCKED so this suite can assert that verification correctly reports "not
-/// verified" (window still resolvable) in exactly the shape a real blocked close would produce.
-@MainActor
-private final class QBlockingWindowCloseDelegate: NSObject, NSWindowDelegate {
-    func windowShouldClose(_ sender: NSWindow) -> Bool { false }
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+/// Makes the fixture window refuse to close (its delegate's `windowShouldClose` returns false) —
+/// used ONLY as an honest, clearly-labeled PROXY for "something is blocking this close" (e.g. a
+/// real save/discard sheet in a document-based app), since a plain AppKit fixture with no
+/// `NSDocument` architecture cannot genuinely produce a real save dialog. The block is never
+/// inspected, clicked through, or otherwise acted upon by `ui.close_window` — it exists purely to
+/// make the window's close PREDICTABLY BLOCKED so this suite can assert that verification
+/// correctly reports "not verified" (window still resolvable) in exactly the shape a real blocked
+/// close would produce.
+private func blockCloseOfWindow(_ windowToken: String, in fixture: PaceAXFixture) async throws {
+    try await fixture.perform(windowToken, "blockClose")
 }
 
 @Suite("QSemanticWindowCloseTests")
@@ -125,16 +124,18 @@ struct QSemanticWindowCloseTests {
 
     @Test("2/3. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.closeWindow(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: nil
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk,
             literalAction: "Close window",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXWindow"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXWindow"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-close"))
         #expect(result.success == false)
@@ -161,11 +162,13 @@ struct QSemanticWindowCloseTests {
 
     @Test("5. AXWindow is accepted as a search criterion; AXApplication/AXGroup/AXButton/an unrecognized role are all rejected at the (Phase 2U-shared) role-policy gate")
     func roleValidation() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         #expect(QAXWindowRolePolicy.isAllowedWindowRole("AXWindow") == true)
         for disallowedRole in ["AXApplication", "AXGroup", "AXButton", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedWindowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.closeWindow(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -178,14 +181,15 @@ struct QSemanticWindowCloseTests {
     func validTargetResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "PresentWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "PresentWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // Resolve via a read-only observation first (never the mutating call) so this test
         // doesn't itself close the window it just asserted exists.
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PresentWindow-\(suffix)"
         )
         #expect(evidence == .windowStillPresent)
     }
@@ -194,10 +198,12 @@ struct QSemanticWindowCloseTests {
     @MainActor
     func missingTargetIsIdempotentAbsence() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         // No window with this title is ever created.
         let outcome = try await QBridgeAccessibility.shared.closeWindow(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "NeverExisted-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "NeverExisted-\(suffix)"
         )
         #expect(outcome.changeKind == .alreadyAbsent)
     }
@@ -207,22 +213,20 @@ struct QSemanticWindowCloseTests {
     func ambiguousDuplicateTitleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeClosableWindow(title: "DupCloseWindow-\(suffix)")
-        let windowB = makeClosableWindow(title: "DupCloseWindow-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "DupCloseWindow-\(suffix)")
+        try await makeClosableWindow(in: fixture, title: "DupCloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.closeWindow(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DupCloseWindow-\(suffix)"
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DupCloseWindow-\(suffix)"
             )
         }
         // Neither window was closed by the ambiguous, fail-closed attempt.
         let stillA = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DupCloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DupCloseWindow-\(suffix)"
         )
         #expect(stillA == .ambiguousTarget(count: 2))
     }
@@ -234,12 +238,13 @@ struct QSemanticWindowCloseTests {
     func identifierPreferredOverTitle() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "SharedTitle-\(suffix)", identifier: "unique-close-window-id-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "SharedTitle-\(suffix)", identifier: "unique-close-window-id-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: "unique-close-window-id-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: "unique-close-window-id-\(suffix)", title: nil
         )
         #expect(evidence == .windowStillPresent)
     }
@@ -251,8 +256,9 @@ struct QSemanticWindowCloseTests {
     func nonExactTitleVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "ExactCloseWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "ExactCloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // A non-exact variant must never resolve to the real window — from this capability's
@@ -260,11 +266,11 @@ struct QSemanticWindowCloseTests {
         // matching is categorically forbidden here: it could silently report false idempotent
         // success instead of actually closing anything.
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "ExactCloseWindow-"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "ExactCloseWindow-"
         )
         #expect(evidence == .windowAbsentApplicationRunning)
         let evidenceUppercased = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "EXACTCLOSEWINDOW-\(suffix)".uppercased()
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "EXACTCLOSEWINDOW-\(suffix)".uppercased()
         )
         #expect(evidenceUppercased == .windowAbsentApplicationRunning)
         // No index/position-based parameter exists in the schema at all (only
@@ -281,12 +287,13 @@ struct QSemanticWindowCloseTests {
     func closeButtonResolvesAndPressSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "CloseButtonValid-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "CloseButtonValid-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.closeWindow(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "CloseButtonValid-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "CloseButtonValid-\(suffix)"
         )
         #expect(outcome.changeKind == .closeRequested)
         #expect(!outcome.targetIdentity.isEmpty)
@@ -343,15 +350,17 @@ struct QSemanticWindowCloseTests {
     @MainActor
     func verificationSucceedsOnAbsenceWithApplicationRunning() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         // No window is ever created for this title — genuinely absent, with the current process
         // (this very test host) confirmed running by construction.
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "NeverExistedVerify-\(suffix)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=NeverExistedVerify-\(suffix)"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=NeverExistedVerify-\(suffix)"
         )
         let result = QActionResult(actionId: "verify-absent-close", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk, literalAction: "n/a")
@@ -364,16 +373,17 @@ struct QSemanticWindowCloseTests {
     func verificationFailsWhenWindowStillPresent() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "StillPresentVerify-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "StillPresentVerify-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "StillPresentVerify-\(suffix)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=StillPresentVerify-\(suffix)"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=StillPresentVerify-\(suffix)"
         )
         let result = QActionResult(actionId: "verify-still-present-close", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk, literalAction: "n/a")
@@ -386,20 +396,18 @@ struct QSemanticWindowCloseTests {
     func verificationFailsOnAmbiguousTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeClosableWindow(title: "AmbiguousVerify-\(suffix)")
-        let windowB = makeClosableWindow(title: "AmbiguousVerify-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "AmbiguousVerify-\(suffix)")
+        try await makeClosableWindow(in: fixture, title: "AmbiguousVerify-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "AmbiguousVerify-\(suffix)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=AmbiguousVerify-\(suffix)"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=AmbiguousVerify-\(suffix)"
         )
         let result = QActionResult(actionId: "verify-ambiguous-close", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk, literalAction: "n/a")
@@ -409,17 +417,19 @@ struct QSemanticWindowCloseTests {
 
     @Test("21. Closed-loop verification when Accessibility permission is unavailable fails closed — never assumed absent, never assumed present")
     func verificationFailsWhenUnobservable() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // AXIsProcessTrusted() is confirmed false throughout this session's isolated XCTest
         // runner (see docs/PHASE_2Y_SEMANTIC_WINDOW_CLOSE.md) — this test exercises the
         // .permissionUnavailable branch unconditionally rather than being gated behind a trust
         // check, since the untrusted state itself IS what's under test here.
         guard !AXIsProcessTrusted() else { return }
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "unobservable-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=unobservable"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=unobservable"
         )
         let result = QActionResult(actionId: "verify-unobservable-close", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk, literalAction: "n/a")
@@ -444,12 +454,14 @@ struct QSemanticWindowCloseTests {
 
     @Test("23. A successful close-button press alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "insufficient-\(UUID().uuidString)",
-            targetIdentity: "application=\(currentProcessAppName) role=AXWindow identifier=none label=insufficient"
+            targetIdentity: "application=\(fixture.applicationName) role=AXWindow identifier=none label=insufficient"
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-close", success: true, summary: "Window close mutation attempted. Independent closed-loop verification pending.")
         let request = QActionRequest(toolName: "ui.close_window", toolFamily: "ui", riskLevel: .level3HighRisk, literalAction: "n/a")
@@ -469,15 +481,19 @@ struct QSemanticWindowCloseTests {
     @MainActor
     func genuineAbsenceIsIdempotentSuccess() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         let outcome = try await QBridgeAccessibility.shared.closeWindow(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "GenuinelyAbsent-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "GenuinelyAbsent-\(suffix)"
         )
         #expect(outcome.changeKind == .alreadyAbsent)
     }
 
     @Test("25. An INACCESSIBLE application (unresolvable, or Accessibility Trust unavailable) is NEVER converted into idempotent absence — it fails closed instead")
     func inaccessibleIsNeverAbsence() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // Unresolvable application: throws .applicationNotAvailable, never returns
         // .alreadyAbsent. Accessibility Trust is checked BEFORE application resolution
         // (mirroring every prior capability's exact ordering), so this specific sub-case requires
@@ -496,7 +512,7 @@ struct QSemanticWindowCloseTests {
         guard !AXIsProcessTrusted() else { return }
         await #expect(throws: QAXInteractionError.accessibilityPermissionDenied) {
             _ = try await QBridgeAccessibility.shared.closeWindow(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "whatever"
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "whatever"
             )
         }
     }
@@ -506,17 +522,15 @@ struct QSemanticWindowCloseTests {
     func ambiguousIsNeverAbsence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeClosableWindow(title: "AmbiguousIdempotency-\(suffix)")
-        let windowB = makeClosableWindow(title: "AmbiguousIdempotency-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "AmbiguousIdempotency-\(suffix)")
+        try await makeClosableWindow(in: fixture, title: "AmbiguousIdempotency-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.closeWindow(
-                applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AmbiguousIdempotency-\(suffix)"
+                applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AmbiguousIdempotency-\(suffix)"
             )
         }
     }
@@ -551,19 +565,16 @@ struct QSemanticWindowCloseTests {
     func blockedCloseIsNotVerified() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "BlockedClose-\(suffix)")
-        let delegate = QBlockingWindowCloseDelegate()
-        window.delegate = delegate
-        defer {
-            window.delegate = nil
-            window.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "BlockedClose-\(suffix)")
+        try await blockCloseOfWindow(window, in: fixture)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // The mutation itself succeeds structurally (the press is dispatched) — this capability
         // has no way to know, and must never try to determine, WHY the window didn't close.
         let outcome = try await QBridgeAccessibility.shared.closeWindow(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "BlockedClose-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "BlockedClose-\(suffix)"
         )
         #expect(outcome.changeKind == .closeRequested)
 
@@ -571,12 +582,12 @@ struct QSemanticWindowCloseTests {
         // a real save/discard sheet blocking a close would look like from this capability's
         // point of view.
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "BlockedClose-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "BlockedClose-\(suffix)"
         )
         #expect(evidence == .windowStillPresent)
 
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "BlockedClose-\(suffix)",
@@ -676,8 +687,9 @@ struct QSemanticWindowCloseTests {
     func denyBlocksCloseWindow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "DenyCloseWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "DenyCloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -690,7 +702,7 @@ struct QSemanticWindowCloseTests {
                   "actionName": "ui.close_window",
                   "toolFamily": "ui",
                   "description": "Close a semantically-identified window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "DenyCloseWindow-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "DenyCloseWindow-\(suffix)"}
                 }
               ]
             }
@@ -714,7 +726,7 @@ struct QSemanticWindowCloseTests {
             return
         }
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "DenyCloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "DenyCloseWindow-\(suffix)"
         )
         #expect(evidence == .windowStillPresent)
     }
@@ -819,8 +831,9 @@ struct QSemanticWindowCloseTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "PredispatchCloseWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "PredispatchCloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -833,7 +846,7 @@ struct QSemanticWindowCloseTests {
                   "actionName": "ui.close_window",
                   "toolFamily": "ui",
                   "description": "Close a semantically-identified window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "PredispatchCloseWindow-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "PredispatchCloseWindow-\(suffix)"}
                 }
               ]
             }
@@ -847,7 +860,7 @@ struct QSemanticWindowCloseTests {
         )
         _ = try await runtime.submitIntent(prompt: "Close the window")
         let evidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "PredispatchCloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "PredispatchCloseWindow-\(suffix)"
         )
         #expect(evidence == .windowStillPresent)
     }
@@ -857,8 +870,9 @@ struct QSemanticWindowCloseTests {
     func allowClosesWindowAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "AllowCloseWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "AllowCloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -871,7 +885,7 @@ struct QSemanticWindowCloseTests {
                   "actionName": "ui.close_window",
                   "toolFamily": "ui",
                   "description": "Close a semantically-identified window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "AllowCloseWindow-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "AllowCloseWindow-\(suffix)"}
                 }
               ]
             }
@@ -898,7 +912,7 @@ struct QSemanticWindowCloseTests {
         // itself observed: the window's exact identity no longer resolves, and this very test
         // process is (trivially) still running.
         let evidenceAfter = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "AllowCloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "AllowCloseWindow-\(suffix)"
         )
         #expect(evidenceAfter == .windowAbsentApplicationRunning)
     }
@@ -909,6 +923,8 @@ struct QSemanticWindowCloseTests {
     @MainActor
     func recoveryRecognizesAlreadyAbsentAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         // No window is ever created for this title — genuinely absent by construction, with this
         // test process confirmed running.
@@ -924,7 +940,7 @@ struct QSemanticWindowCloseTests {
             stepId: "step-uncertain-close-window", index: 0, actionName: "ui.close_window", toolFamily: "ui",
             riskLevel: "level3HighRisk", literalAction: "Close window",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "AlreadyGoneRecovery-\(suffix)"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "AlreadyGoneRecovery-\(suffix)"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -947,8 +963,9 @@ struct QSemanticWindowCloseTests {
     func uncertainStepForStillPresentWindowFailsClosedToPending() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "StillThereRecovery-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "StillThereRecovery-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -962,7 +979,7 @@ struct QSemanticWindowCloseTests {
             stepId: "step-uncertain-close-window-2", index: 0, actionName: "ui.close_window", toolFamily: "ui",
             riskLevel: "level3HighRisk", literalAction: "Close window",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "StillThereRecovery-\(suffix)"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "StillThereRecovery-\(suffix)"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -981,7 +998,7 @@ struct QSemanticWindowCloseTests {
         #expect(isVerified == false)
         #expect(updatedPlan.steps[0].state == "pending")
         #expect(updatedTask.completedStepIds.isEmpty)
-        #expect(window.isVisible == true)
+        #expect(try await fixture.bool(window, "isVisible") == true)
     }
 
     @Test("44. An uncertain step whose target becomes ambiguous is NOT credited as complete — it fails closed to pending, exactly like a still-present window")
@@ -989,12 +1006,10 @@ struct QSemanticWindowCloseTests {
     func uncertainStepForAmbiguousTargetFailsClosedToPending() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeClosableWindow(title: "AmbiguousRecovery-\(suffix)")
-        let windowB = makeClosableWindow(title: "AmbiguousRecovery-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeClosableWindow(in: fixture, title: "AmbiguousRecovery-\(suffix)")
+        try await makeClosableWindow(in: fixture, title: "AmbiguousRecovery-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -1008,7 +1023,7 @@ struct QSemanticWindowCloseTests {
             stepId: "step-uncertain-close-window-3", index: 0, actionName: "ui.close_window", toolFamily: "ui",
             riskLevel: "level3HighRisk", literalAction: "Close window",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXWindow", "title": "AmbiguousRecovery-\(suffix)"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXWindow", "title": "AmbiguousRecovery-\(suffix)"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -1103,8 +1118,9 @@ struct QSemanticWindowCloseTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "SafeEvidenceClose-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "SafeEvidenceClose-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -1117,7 +1133,7 @@ struct QSemanticWindowCloseTests {
                   "actionName": "ui.close_window",
                   "toolFamily": "ui",
                   "description": "Close a semantically-identified window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "SafeEvidenceClose-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "SafeEvidenceClose-\(suffix)"}
                 }
               ]
             }
@@ -1185,11 +1201,13 @@ struct QSemanticWindowCloseTests {
             return
         }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "E2ECloseWindow-\(suffix)")
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "E2ECloseWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let preEvidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2ECloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2ECloseWindow-\(suffix)"
         )
         #expect(preEvidence == .windowStillPresent)
 
@@ -1203,7 +1221,7 @@ struct QSemanticWindowCloseTests {
                   "actionName": "ui.close_window",
                   "toolFamily": "ui",
                   "description": "Close the window",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "E2ECloseWindow-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "E2ECloseWindow-\(suffix)"}
                 }
               ]
             }
@@ -1230,7 +1248,7 @@ struct QSemanticWindowCloseTests {
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
         let postEvidence = await QBridgeAccessibility.shared.observeWindowCloseEvidence(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2ECloseWindow-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2ECloseWindow-\(suffix)"
         )
         #expect(postEvidence == .windowAbsentApplicationRunning)
         // This process (the owning application) is, trivially, still running — confirmed by the
@@ -1247,21 +1265,18 @@ struct QSemanticWindowCloseTests {
             return
         }
         let suffix = UUID().uuidString
-        let window = makeClosableWindow(title: "E2EBlockedClose-\(suffix)")
-        let delegate = QBlockingWindowCloseDelegate()
-        window.delegate = delegate
-        defer {
-            window.delegate = nil
-            window.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeClosableWindow(in: fixture, title: "E2EBlockedClose-\(suffix)")
+        try await blockCloseOfWindow(window, in: fixture)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // Original window state, recorded before any action.
-        let originalWindowPresent = window.isVisible
+        let originalWindowPresent = try await fixture.bool(window, "isVisible")
         #expect(originalWindowPresent == true)
 
         let outcome = try await QBridgeAccessibility.shared.closeWindow(
-            applicationName: currentProcessAppName, role: "AXWindow", identifier: nil, title: "E2EBlockedClose-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXWindow", identifier: nil, title: "E2EBlockedClose-\(suffix)"
         )
         #expect(outcome.changeKind == .closeRequested)
 
@@ -1269,12 +1284,12 @@ struct QSemanticWindowCloseTests {
         // is still resolvable, which is exactly how a real save/discard sheet blocking a close
         // would present to this capability. This capability does not, and must never, attempt to
         // resolve, inspect, or act on whatever is blocking it — it stops here.
-        let dialogProxyBlockingPresent = window.isVisible
+        let dialogProxyBlockingPresent = try await fixture.bool(window, "isVisible")
         #expect(dialogProxyBlockingPresent == true)
 
         // Verification result, recorded.
         let strategy = QVerificationStrategy.windowCloseVerified(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXWindow",
             matchIdentifier: nil,
             matchTitle: "E2EBlockedClose-\(suffix)",

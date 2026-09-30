@@ -28,6 +28,9 @@
 //  codebase already established. See docs/PHASE_2BS_SEMANTIC_TEXT_SELECTION_STATE.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -35,65 +38,56 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSTextField` made first responder with a real field-editor selection —
 /// the only reliable, standard AppKit way to establish a live `kAXSelectedTextRangeAttribute`
 /// without any custom `NSAccessibility` override.
-@MainActor
+/// Fixture-backed replacement for the in-process `makeTextFieldWithSelection`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
 private func makeTextFieldWithSelection(
+    in fixture: PaceAXFixture,
     identifier: String,
     text: String,
     selectionLocation: Int,
     selectionLength: Int
-) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTextSelectionStateTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": text, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTextSelectionStateTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = text
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    _ = window.makeFirstResponder(field)
-    if let editor = field.currentEditor() {
-        editor.selectedRange = NSRange(location: selectionLocation, length: selectionLength)
-    }
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    try await fixture.set(identifier, "fieldEditorSelectedRange", [selectionLocation, selectionLength])
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeButtonWindow(identifier: String, title: String) -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTextSelectionStateTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 32),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTextSelectionStateTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let button = NSButton(frame: NSRect(x: 20, y: 20, width: 240, height: 32))
-    button.title = title
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class TextSelectionStateMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -183,12 +177,13 @@ struct QSemanticTextSelectionStateReadTests {
     func caretAtBeginning() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "caret-begin-\(suffix)", text: "Hello World", selectionLocation: 0, selectionLength: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "caret-begin-\(suffix)", text: "Hello World", selectionLocation: 0, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "caret-begin-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "caret-begin-\(suffix)", title: nil
         )
         #expect(metadata?.selectionLocation == 0)
         #expect(metadata?.selectionLength == 0)
@@ -200,12 +195,13 @@ struct QSemanticTextSelectionStateReadTests {
     func caretInMiddle() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "caret-middle-\(suffix)", text: "Hello World", selectionLocation: 5, selectionLength: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "caret-middle-\(suffix)", text: "Hello World", selectionLocation: 5, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "caret-middle-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "caret-middle-\(suffix)", title: nil
         )
         #expect(metadata?.selectionLocation == 5)
         #expect(metadata?.selectionLength == 0)
@@ -216,12 +212,13 @@ struct QSemanticTextSelectionStateReadTests {
     func caretAtEnd() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "caret-end-\(suffix)", text: "Hello World", selectionLocation: 11, selectionLength: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "caret-end-\(suffix)", text: "Hello World", selectionLocation: 11, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "caret-end-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "caret-end-\(suffix)", title: nil
         )
         #expect(metadata?.selectionLocation == 11)
         #expect(metadata?.selectionLength == 0)
@@ -233,12 +230,13 @@ struct QSemanticTextSelectionStateReadTests {
     func nonEmptySelection() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "nonempty-\(suffix)", text: "Hello World", selectionLocation: 2, selectionLength: 4)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "nonempty-\(suffix)", text: "Hello World", selectionLocation: 2, selectionLength: 4)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nonempty-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nonempty-\(suffix)", title: nil
         )
         #expect(metadata?.selectionLocation == 2)
         #expect(metadata?.selectionLength == 4)
@@ -249,12 +247,13 @@ struct QSemanticTextSelectionStateReadTests {
     func fullTextSelection() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "fulltext-\(suffix)", text: "Hello World", selectionLocation: 0, selectionLength: 11)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "fulltext-\(suffix)", text: "Hello World", selectionLocation: 0, selectionLength: 11)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "fulltext-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "fulltext-\(suffix)", title: nil
         )
         #expect(metadata?.selectionLocation == 0)
         #expect(metadata?.selectionLength == 11)
@@ -286,12 +285,13 @@ struct QSemanticTextSelectionStateReadTests {
     func totalZeroAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "empty-\(suffix)", text: "", selectionLocation: 0, selectionLength: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "empty-\(suffix)", text: "", selectionLocation: 0, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "empty-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "empty-\(suffix)", title: nil
         )
         #expect(metadata?.totalCharacterCount == 0)
         #expect(metadata?.selectionLocation == 0)
@@ -351,12 +351,13 @@ struct QSemanticTextSelectionStateReadTests {
     func nonTextElementReportsGenuineAbsence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "notext-\(suffix)", title: "Standard")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "notext-\(suffix)", title: "Standard")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "notext-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "notext-\(suffix)", title: nil
         )
         // A plain button has no text-selection concept — genuine, honest absence, never an error,
         // never fabricated as a zero-length selection.
@@ -430,14 +431,15 @@ struct QSemanticTextSelectionStateReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "app-\(suffix)", text: "Hello", selectionLocation: 1, selectionLength: 2)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "app-\(suffix)", text: "Hello", selectionLocation: 1, selectionLength: 2)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "app-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "app-\(suffix)", title: nil
         )
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.applicationName == fixture.applicationName)
     }
 
     @Test("27. Missing/non-existent application fails closed with AX_APPLICATION_NOT_AVAILABLE")
@@ -460,13 +462,14 @@ struct QSemanticTextSelectionStateReadTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWithSelection(identifier: "present-\(suffix)", text: "x", selectionLocation: 0, selectionLength: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWithSelection(in: fixture, identifier: "present-\(suffix)", text: "x", selectionLocation: 0, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readTextSelectionState(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -476,28 +479,17 @@ struct QSemanticTextSelectionStateReadTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldA.stringValue = "Dup"
-        fieldA.isEditable = true
-        fieldA.setAccessibilityIdentifier("dup-selection-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        fieldB.stringValue = "Dup"
-        fieldB.isEditable = true
-        fieldB.setAccessibilityIdentifier("dup-selection-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["stringValue": "Dup", "accessibilityIdentifier": "dup-selection-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["stringValue": "Dup", "accessibilityIdentifier": "dup-selection-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readTextSelectionState(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-selection-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-selection-\(suffix)", title: nil
             )
         }
     }
@@ -531,10 +523,12 @@ struct QSemanticTextSelectionStateReadTests {
 
     @Test("35. Disallowed roles are rejected before any AX search is even attempted — QAXElementReadRolePolicy reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea"] {
             await #expect(throws: QAXInteractionError.disallowedReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readTextSelectionState(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -542,9 +536,11 @@ struct QSemanticTextSelectionStateReadTests {
 
     @Test("35b. AXSecureTextField is rejected before any AX search as the TARGET role — this capability never broadens secure-field access and never reads secure text content")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readTextSelectionState(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -603,14 +599,15 @@ struct QSemanticTextSelectionStateReadTests {
     func neverWritesSelectionRange() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWithSelection(identifier: "nowrite-\(suffix)", text: "Hello World", selectionLocation: 3, selectionLength: 2)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWithSelection(in: fixture, identifier: "nowrite-\(suffix)", text: "Hello World", selectionLocation: 3, selectionLength: 2)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nowrite-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nowrite-\(suffix)", title: nil
         )
-        let rangeAfter = field.currentEditor()?.selectedRange
+        let rangeAfter = try await fixture.fieldEditorSelectedRange(field)
         #expect(rangeAfter?.location == 3)
         #expect(rangeAfter?.length == 2)
     }
@@ -623,8 +620,9 @@ struct QSemanticTextSelectionStateReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinel = "SuperSecretSelectedTextSentinel789"
-        let (window, _) = makeTextFieldWithSelection(identifier: "durable-\(suffix)", text: sentinel, selectionLocation: 0, selectionLength: sentinel.count)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "durable-\(suffix)", text: sentinel, selectionLocation: 0, selectionLength: sentinel.count)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -637,7 +635,7 @@ struct QSemanticTextSelectionStateReadTests {
                   "actionName": "ui.read_text_selection_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's text selection state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -672,8 +670,9 @@ struct QSemanticTextSelectionStateReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinel = "AnotherSecretSelectedTextSentinel456"
-        let (window, _) = makeTextFieldWithSelection(identifier: "audit-\(suffix)", text: sentinel, selectionLocation: 0, selectionLength: sentinel.count)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "audit-\(suffix)", text: sentinel, selectionLocation: 0, selectionLength: sentinel.count)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -686,7 +685,7 @@ struct QSemanticTextSelectionStateReadTests {
                   "actionName": "ui.read_text_selection_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's text selection state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -876,19 +875,20 @@ struct QSemanticTextSelectionStateReadTests {
     func repeatedInvocationHasNoSideEffects() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWithSelection(identifier: "repeat-\(suffix)", text: "Hello World", selectionLocation: 2, selectionLength: 3)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWithSelection(in: fixture, identifier: "repeat-\(suffix)", text: "Hello World", selectionLocation: 2, selectionLength: 3)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "repeat-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "repeat-\(suffix)", title: nil
         )
         let second = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "repeat-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "repeat-\(suffix)", title: nil
         )
         #expect(first?.selectionLocation == second?.selectionLocation)
         #expect(first?.selectionLength == second?.selectionLength)
-        let rangeAfter = field.currentEditor()?.selectedRange
+        let rangeAfter = try await fixture.fieldEditorSelectedRange(field)
         #expect(rangeAfter?.location == 2)
         #expect(rangeAfter?.length == 3)
     }
@@ -907,33 +907,32 @@ struct QSemanticTextSelectionStateReadTests {
         let suffix = UUID().uuidString
         let text = "Hello World"
 
-        let (beginWindow, _) = makeTextFieldWithSelection(identifier: "e2e-begin-\(suffix)", text: text, selectionLocation: 0, selectionLength: 0)
-        defer { beginWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (beginWindow, _) = try await makeTextFieldWithSelection(in: fixture, identifier: "e2e-begin-\(suffix)", text: text, selectionLocation: 0, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let beginMetadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-begin-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-begin-\(suffix)", title: nil
         )
         #expect(beginMetadata?.selectionLocation == 0)
         #expect(beginMetadata?.selectionLength == 0)
         #expect(beginMetadata?.totalCharacterCount == text.count)
 
-        let (nonEmptyWindow, field) = makeTextFieldWithSelection(identifier: "e2e-nonempty-\(suffix)", text: text, selectionLocation: 6, selectionLength: 5)
-        defer { nonEmptyWindow.close() }
+        let (nonEmptyWindow, field) = try await makeTextFieldWithSelection(in: fixture, identifier: "e2e-nonempty-\(suffix)", text: text, selectionLocation: 6, selectionLength: 5)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let nonEmptyMetadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-nonempty-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-nonempty-\(suffix)", title: nil
         )
         #expect(nonEmptyMetadata?.selectionLocation == 6)
         #expect(nonEmptyMetadata?.selectionLength == 5)
         // The read never mutated the fixture's own live selection.
-        #expect(field.currentEditor()?.selectedRange.location == 6)
-        #expect(field.currentEditor()?.selectedRange.length == 5)
+        #expect((try await fixture.fieldEditorSelectedRange(field))?.location == 6)
+        #expect((try await fixture.fieldEditorSelectedRange(field))?.length == 5)
 
-        let (endWindow, _) = makeTextFieldWithSelection(identifier: "e2e-end-\(suffix)", text: text, selectionLocation: text.count, selectionLength: 0)
-        defer { endWindow.close() }
+        try await makeTextFieldWithSelection(in: fixture, identifier: "e2e-end-\(suffix)", text: text, selectionLocation: text.count, selectionLength: 0)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let endMetadata = try await QBridgeAccessibility.shared.readTextSelectionState(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-end-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-end-\(suffix)", title: nil
         )
         #expect(endMetadata?.selectionLocation == text.count)
         #expect(endMetadata?.selectionLength == 0)

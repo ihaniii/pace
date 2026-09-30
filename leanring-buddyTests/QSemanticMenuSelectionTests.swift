@@ -15,6 +15,9 @@
 //  QSemanticElementReadTests/QSemanticElementStateTests already established. See
 //  docs/PHASE_2L_SEMANTIC_MENU_SELECTION.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own menus crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -24,59 +27,44 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixture: a real top-level menu bar item + one direct item
 
-@MainActor
-private final class QMenuSelectionTestHarness: NSObject {
-    var selectCount = 0
-    @objc func recordSelect(_ sender: NSMenuItem) {
-        selectCount += 1
+/// Counts selections of the menu items it was attached to. The menus themselves are real AppKit
+/// menus in the out-of-process PaceAXFixtureHost's menu bar; `selectCount()` reads the count the
+/// fixture's own NSMenuItem action recorded — never through Accessibility.
+private final class QMenuSelectionTestHarness: @unchecked Sendable {
+    fileprivate var fixture: PaceAXFixture?
+    fileprivate var countedMenuBarTitles: [String] = []
+
+    func selectCount() async throws -> Int {
+        guard let fixture else { return 0 }
+        var totalSelections = 0
+        for menuBarTitle in countedMenuBarTitles {
+            totalSelections += try await fixture.menuSelectionCount(menuBarTitle: menuBarTitle)
+        }
+        return totalSelections
     }
 }
 
-/// Installs a real, disposable top-level menu bar item (with one direct child item) onto the
-/// current test host app's own `NSApp.mainMenu`. Guarantees the installed menu bar item is never
-/// at index 0 (which `ui.select_menu_item` deliberately refuses as the application's own root
-/// menu) by inserting a placeholder root item first if the main menu is otherwise empty. Returns
-/// a teardown closure that restores the main menu to what it looked like before this call.
-@MainActor
+/// Installs a real top-level menu-bar item with one direct item into the out-of-process fixture's
+/// main menu — the fixture runs the exact AppKit steps the in-process helper ran (create the main
+/// menu if needed, add a placeholder root item if the menu bar is empty, then the menu and item).
+/// When a harness is given, the item's selections are counted for it. Returns the menu-bar title
+/// and item title. Stopping the fixture tears the whole menu bar down.
+@discardableResult
 private func installTestMenu(
+    in fixture: PaceAXFixture,
     menuBarTitle: String,
     itemTitle: String,
     itemEnabled: Bool = true,
     harness: QMenuSelectionTestHarness? = nil
-) -> (menuBarItem: NSMenuItem, item: NSMenuItem, teardown: () -> Void) {
-    if NSApp.mainMenu == nil {
-        NSApp.mainMenu = NSMenu()
+) async throws -> (menuBarItem: String, item: String) {
+    try await fixture.installMenu(menuBarTitle: menuBarTitle, itemTitle: itemTitle, itemEnabled: itemEnabled, countsSelections: harness != nil)
+    if let harness {
+        harness.fixture = fixture
+        harness.countedMenuBarTitles.append(menuBarTitle)
     }
-    let mainMenu = NSApp.mainMenu!
-    var insertedPlaceholder: NSMenuItem?
-    if mainMenu.items.isEmpty {
-        let placeholder = NSMenuItem(title: "TestAppRoot", action: nil, keyEquivalent: "")
-        placeholder.submenu = NSMenu(title: "TestAppRoot")
-        mainMenu.addItem(placeholder)
-        insertedPlaceholder = placeholder
-    }
-
-    let menuBarItem = NSMenuItem(title: menuBarTitle, action: nil, keyEquivalent: "")
-    let submenu = NSMenu(title: menuBarTitle)
-    let item = NSMenuItem(title: itemTitle, action: harness != nil ? #selector(QMenuSelectionTestHarness.recordSelect(_:)) : nil, keyEquivalent: "")
-    item.target = harness
-    item.isEnabled = itemEnabled
-    submenu.addItem(item)
-    menuBarItem.submenu = submenu
-    mainMenu.addItem(menuBarItem)
-
-    let teardown: () -> Void = {
-        mainMenu.removeItem(menuBarItem)
-        if let insertedPlaceholder {
-            mainMenu.removeItem(insertedPlaceholder)
-        }
-    }
-    return (menuBarItem, item, teardown)
+    return (menuBarTitle, itemTitle)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticMenuSelectionTests")
 struct QSemanticMenuSelectionTests {
@@ -128,20 +116,22 @@ struct QSemanticMenuSelectionTests {
 
     @Test("4. Missing required parameters fail closed with deterministic errors")
     func invalidSchemaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "", itemTitle: "Save"
+                applicationName: fixture.applicationName, menuBarTitle: "", itemTitle: "Save"
             )
         }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "File", itemTitle: ""
+                applicationName: fixture.applicationName, menuBarTitle: "File", itemTitle: ""
             )
         }
         let request = QActionRequest(
             toolName: "ui.select_menu_item", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select menu item",
-            parameters: ["applicationName": currentProcessAppName, "menuBarTitle": "File"]
+            parameters: ["applicationName": fixture.applicationName, "menuBarTitle": "File"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-schema-menu"))
         #expect(result.success == false)
@@ -156,12 +146,13 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, item, teardown) = installTestMenu(menuBarTitle: "TestMenu\(suffix)", itemTitle: "TestItem\(suffix)", harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, item) = try await installTestMenu(in: fixture, menuBarTitle: "TestMenu\(suffix)", itemTitle: "TestItem\(suffix)", harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectMenuItem(
-            applicationName: currentProcessAppName, menuBarTitle: "TestMenu\(suffix)", itemTitle: "TestItem\(suffix)"
+            applicationName: fixture.applicationName, menuBarTitle: "TestMenu\(suffix)", itemTitle: "TestItem\(suffix)"
         )
         #expect(outcome.menuBarTitle == "TestMenu\(suffix)")
         #expect(outcome.itemTitle == "TestItem\(suffix)")
@@ -175,10 +166,12 @@ struct QSemanticMenuSelectionTests {
     @MainActor
     func menuNotFoundFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         await #expect(throws: QAXInteractionError.menuNotFound("NoSuchMenu\(suffix)")) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "NoSuchMenu\(suffix)", itemTitle: "Whatever"
+                applicationName: fixture.applicationName, menuBarTitle: "NoSuchMenu\(suffix)", itemTitle: "Whatever"
             )
         }
     }
@@ -190,14 +183,15 @@ struct QSemanticMenuSelectionTests {
     func itemNotFoundIsDeterministicallyBoundedTimeout() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "TimeoutMenu\(suffix)", itemTitle: "RealItem\(suffix)")
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "TimeoutMenu\(suffix)", itemTitle: "RealItem\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let start = Date()
         do {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "TimeoutMenu\(suffix)", itemTitle: "NoSuchItem\(suffix)"
+                applicationName: fixture.applicationName, menuBarTitle: "TimeoutMenu\(suffix)", itemTitle: "NoSuchItem\(suffix)"
             )
             Issue.record("Expected .menuItemNotFound")
         } catch let axError as QAXInteractionError {
@@ -220,19 +214,16 @@ struct QSemanticMenuSelectionTests {
     func ambiguousItemFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "DupMenu\(suffix)", itemTitle: "DupItem\(suffix)")
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "DupMenu\(suffix)", itemTitle: "DupItem\(suffix)")
         // Add a SECOND item with the identical title to the same submenu.
-        if let menuBarItem = NSApp.mainMenu?.items.first(where: { $0.title == "DupMenu\(suffix)" }),
-           let submenu = menuBarItem.submenu {
-            let duplicate = NSMenuItem(title: "DupItem\(suffix)", action: nil, keyEquivalent: "")
-            submenu.addItem(duplicate)
-        }
+        try await fixture.appendMenuItem(menuBarTitle: "DupMenu\(suffix)", itemTitle: "DupItem\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "DupMenu\(suffix)", itemTitle: "DupItem\(suffix)"
+                applicationName: fixture.applicationName, menuBarTitle: "DupMenu\(suffix)", itemTitle: "DupItem\(suffix)"
             )
         }
     }
@@ -245,16 +236,17 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "DisabledMenu\(suffix)", itemTitle: "DisabledItem\(suffix)", itemEnabled: false, harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "DisabledMenu\(suffix)", itemTitle: "DisabledItem\(suffix)", itemEnabled: false, harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.targetDisabled) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "DisabledMenu\(suffix)", itemTitle: "DisabledItem\(suffix)"
+                applicationName: fixture.applicationName, menuBarTitle: "DisabledMenu\(suffix)", itemTitle: "DisabledItem\(suffix)"
             )
         }
-        #expect(harness.selectCount == 0)
+        #expect(try await harness.selectCount() == 0)
     }
 
     // MARK: - 10. Wrong application rejected
@@ -292,16 +284,18 @@ struct QSemanticMenuSelectionTests {
 
     @Test("12/13. A path-shaped menuBarTitle or itemTitle is rejected before any AX call — nested submenu traversal is never attempted")
     func nestedMenuPathRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for separator in ["/", ">", "\\", "\u{2192}"] {
             await #expect(throws: QAXInteractionError.self) {
                 _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                    applicationName: currentProcessAppName, menuBarTitle: "File", itemTitle: "Export\(separator)PDF"
+                    applicationName: fixture.applicationName, menuBarTitle: "File", itemTitle: "Export\(separator)PDF"
                 )
             }
         }
         await #expect(throws: QAXInteractionError.self) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "File/Export", itemTitle: "PDF"
+                applicationName: fixture.applicationName, menuBarTitle: "File/Export", itemTitle: "PDF"
             )
         }
     }
@@ -314,20 +308,16 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         // Ensure the main menu has a real index-0 item we can address directly by its own title,
         // without disturbing any pre-existing menu structure.
-        if NSApp.mainMenu == nil { NSApp.mainMenu = NSMenu() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
         let rootTitle = "AppRoot\(suffix)"
-        let rootItem = NSMenuItem(title: rootTitle, action: nil, keyEquivalent: "")
-        let rootSubmenu = NSMenu(title: rootTitle)
-        rootSubmenu.addItem(NSMenuItem(title: "About", action: nil, keyEquivalent: ""))
-        rootItem.submenu = rootSubmenu
-        NSApp.mainMenu?.insertItem(rootItem, at: 0)
-        defer { NSApp.mainMenu?.removeItem(rootItem) }
+        try await fixture.insertRootMenu(title: rootTitle, itemTitle: "About")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.appRootMenuUnsupported(rootTitle)) {
             _ = try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: rootTitle, itemTitle: "About"
+                applicationName: fixture.applicationName, menuBarTitle: rootTitle, itemTitle: "About"
             )
         }
     }
@@ -339,13 +329,14 @@ struct QSemanticMenuSelectionTests {
     func cancellationStopsPolling() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "CancelMenu\(suffix)", itemTitle: "RealItem\(suffix)")
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "CancelMenu\(suffix)", itemTitle: "RealItem\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let task = Task {
             try await QBridgeAccessibility.shared.selectMenuItem(
-                applicationName: currentProcessAppName, menuBarTitle: "CancelMenu\(suffix)", itemTitle: "NeverAppears\(suffix)"
+                applicationName: fixture.applicationName, menuBarTitle: "CancelMenu\(suffix)", itemTitle: "NeverAppears\(suffix)"
             )
         }
         task.cancel()
@@ -407,8 +398,9 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "DenyMenu\(suffix)", itemTitle: "DenyItem\(suffix)", harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "DenyMenu\(suffix)", itemTitle: "DenyItem\(suffix)", harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -421,7 +413,7 @@ struct QSemanticMenuSelectionTests {
                   "actionName": "ui.select_menu_item",
                   "toolFamily": "ui",
                   "description": "Select a top-level menu item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "menuBarTitle": "DenyMenu\(suffix)", "itemTitle": "DenyItem\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "menuBarTitle": "DenyMenu\(suffix)", "itemTitle": "DenyItem\(suffix)"}
                 }
               ]
             }
@@ -444,7 +436,7 @@ struct QSemanticMenuSelectionTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(harness.selectCount == 0)
+        #expect(try await harness.selectCount() == 0)
     }
 
     // MARK: - 20. Persisted approval never self-authorizes (expiry-equivalent)
@@ -556,8 +548,9 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "AllowMenu\(suffix)", itemTitle: "AllowItem\(suffix)", harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "AllowMenu\(suffix)", itemTitle: "AllowItem\(suffix)", harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -570,7 +563,7 @@ struct QSemanticMenuSelectionTests {
                   "actionName": "ui.select_menu_item",
                   "toolFamily": "ui",
                   "description": "Select a top-level menu item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "menuBarTitle": "AllowMenu\(suffix)", "itemTitle": "AllowItem\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "menuBarTitle": "AllowMenu\(suffix)", "itemTitle": "AllowItem\(suffix)"}
                 }
               ]
             }
@@ -661,8 +654,9 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "PreDispatchMenu\(suffix)", itemTitle: "PreDispatchItem\(suffix)", harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "PreDispatchMenu\(suffix)", itemTitle: "PreDispatchItem\(suffix)", harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -675,7 +669,7 @@ struct QSemanticMenuSelectionTests {
                   "actionName": "ui.select_menu_item",
                   "toolFamily": "ui",
                   "description": "Select a top-level menu item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "menuBarTitle": "PreDispatchMenu\(suffix)", "itemTitle": "PreDispatchItem\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "menuBarTitle": "PreDispatchMenu\(suffix)", "itemTitle": "PreDispatchItem\(suffix)"}
                 }
               ]
             }
@@ -688,7 +682,7 @@ struct QSemanticMenuSelectionTests {
             endpointName: "semantic-menu-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Select the item")
-        #expect(harness.selectCount == 0)
+        #expect(try await harness.selectCount() == 0)
     }
 
     // MARK: - 36/37/39/40. Recovery: crash after dispatch, uncertain state, no blind replay, retry is a fresh execution
@@ -795,8 +789,9 @@ struct QSemanticMenuSelectionTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let harness = QMenuSelectionTestHarness()
-        let (_, _, teardown) = installTestMenu(menuBarTitle: "SafeEvidenceMenu\(suffix)", itemTitle: "SafeEvidenceItem\(suffix)", harness: harness)
-        defer { teardown() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _) = try await installTestMenu(in: fixture, menuBarTitle: "SafeEvidenceMenu\(suffix)", itemTitle: "SafeEvidenceItem\(suffix)", harness: harness)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -809,7 +804,7 @@ struct QSemanticMenuSelectionTests {
                   "actionName": "ui.select_menu_item",
                   "toolFamily": "ui",
                   "description": "Select a top-level menu item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "menuBarTitle": "SafeEvidenceMenu\(suffix)", "itemTitle": "SafeEvidenceItem\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "menuBarTitle": "SafeEvidenceMenu\(suffix)", "itemTitle": "SafeEvidenceItem\(suffix)"}
                 }
               ]
             }

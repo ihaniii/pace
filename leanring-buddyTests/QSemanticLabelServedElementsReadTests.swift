@@ -32,6 +32,9 @@
 //  codebase already established. See docs/PHASE_2BX_SEMANTIC_LABEL_SERVED_ELEMENTS.md for the full
 //  contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -39,9 +42,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -49,44 +49,31 @@ private var currentProcessAppName: String {
 /// wired via the real, public `setAccessibilityServesAsTitleForUIElements(_:)` AppKit API, the
 /// structural inverse of `ui.read_element_title_reference`'s own established
 /// `setAccessibilityTitleUIElement(_:)` fixture (Phase 2BN).
-@MainActor
+/// Fixture-backed replacement for the in-process `makeLabelWithServedElements`: the same window,
+/// label, optional input field and optional kAXServesAsTitleForUIElements reference, built inside
+/// the out-of-process PaceAXFixtureHost. Returns the window token, the label's handle, and the
+/// input's handle (nil when no input was created).
 private func makeLabelWithServedElements(
+    in fixture: PaceAXFixture,
     labelIdentifier: String,
     labelTitle: String = "Name:",
     inputIdentifier: String? = "input-field",
     attachServedElements: Bool = true
-) -> (window: NSWindow, labelField: NSTextField, inputField: NSTextField?) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticLabelServedElementsTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 150))
-
-    let label = NSTextField(labelWithString: labelTitle)
-    label.frame = NSRect(x: 20, y: 60, width: 90, height: 24)
-    label.setAccessibilityIdentifier(labelIdentifier)
-    contentView.addSubview(label)
-
-    var inputField: NSTextField?
+) async throws -> (window: String, labelField: String, inputField: String?) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticLabelServedElementsTestFixture", width: 400, height: 150, styles: ["titled", "closable"])
+    try await fixture.addControl(kind: "label", identifier: labelIdentifier, windowToken: windowToken,
+                                 frame: NSRect(x: 20, y: 60, width: 90, height: 24), properties: ["title": labelTitle, "detachAction": true])
+    var inputField: String?
     if let inputIdentifier {
-        let input = NSTextField(frame: NSRect(x: 120, y: 60, width: 220, height: 24))
-        input.stringValue = ""
-        input.setAccessibilityIdentifier(inputIdentifier)
-        contentView.addSubview(input)
-        inputField = input
+        try await fixture.addControl(kind: "textField", identifier: inputIdentifier, windowToken: windowToken,
+                                     frame: NSRect(x: 120, y: 60, width: 220, height: 24), properties: ["stringValue": "", "detachAction": true])
+        inputField = inputIdentifier
         if attachServedElements {
-            label.setAccessibilityServesAsTitleForUIElements([input])
+            try await fixture.setAccessibility(labelIdentifier, "servesAsTitleForUIElements", [inputIdentifier])
         }
     }
-
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, label, inputField)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, labelIdentifier, inputField)
 }
 
 private final class LabelServedElementsMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -211,9 +198,11 @@ struct QSemanticLabelServedElementsReadTests {
     @MainActor
     func secureFieldSourceRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -223,13 +212,14 @@ struct QSemanticLabelServedElementsReadTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabelWithServedElements(labelIdentifier: "wrongrole-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeLabelWithServedElements(in: fixture, labelIdentifier: "wrongrole-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -237,9 +227,11 @@ struct QSemanticLabelServedElementsReadTests {
     @Test("7. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-                applicationName: currentProcessAppName, role: "AXStaticText", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXStaticText", identifier: nil, title: nil
             )
         }
     }
@@ -259,13 +251,14 @@ struct QSemanticLabelServedElementsReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeLabelWithServedElements(labelIdentifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeLabelWithServedElements(in: fixture, labelIdentifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-                applicationName: currentProcessAppName, role: "AXStaticText", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXStaticText", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -276,26 +269,17 @@ struct QSemanticLabelServedElementsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupLabel-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let labelA = NSTextField(labelWithString: "A")
-        labelA.frame = NSRect(x: 10, y: 10, width: 90, height: 24)
-        labelA.setAccessibilityIdentifier(sharedIdentifier)
-        let labelB = NSTextField(labelWithString: "B")
-        labelB.frame = NSRect(x: 10, y: 100, width: 90, height: 24)
-        labelB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(labelA)
-        container.addSubview(labelB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "label", identifier: "inline-labelA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 90, height: 24), properties: ["title": "A", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "label", identifier: "inline-labelB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 90, height: 24), properties: ["title": "B", "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-                applicationName: currentProcessAppName, role: "AXStaticText", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXStaticText", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -424,8 +408,9 @@ struct QSemanticLabelServedElementsReadTests {
         let suffix = UUID().uuidString
         let sentinelLabelIdentifier = "DurableLabel-\(suffix)"
         let sentinelInputIdentifier = "SuperSecretServedFieldSentinel-\(suffix)"
-        let (window, _, _) = makeLabelWithServedElements(labelIdentifier: sentinelLabelIdentifier, inputIdentifier: sentinelInputIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabelWithServedElements(in: fixture, labelIdentifier: sentinelLabelIdentifier, inputIdentifier: sentinelInputIdentifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -438,7 +423,7 @@ struct QSemanticLabelServedElementsReadTests {
                   "actionName": "ui.list_label_served_elements",
                   "toolFamily": "ui",
                   "description": "Read the elements a semantically-identified label serves as the title for",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXStaticText", "identifier": "\(sentinelLabelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXStaticText", "identifier": "\(sentinelLabelIdentifier)"}
                 }
               ]
             }
@@ -474,8 +459,9 @@ struct QSemanticLabelServedElementsReadTests {
         let suffix = UUID().uuidString
         let sentinelLabelIdentifier = "AuditLabel-\(suffix)"
         let sentinelInputIdentifier = "SuperSecretAuditFieldSentinel-\(suffix)"
-        let (window, _, _) = makeLabelWithServedElements(labelIdentifier: sentinelLabelIdentifier, inputIdentifier: sentinelInputIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeLabelWithServedElements(in: fixture, labelIdentifier: sentinelLabelIdentifier, inputIdentifier: sentinelInputIdentifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -488,7 +474,7 @@ struct QSemanticLabelServedElementsReadTests {
                   "actionName": "ui.list_label_served_elements",
                   "toolFamily": "ui",
                   "description": "Read the elements a semantically-identified label serves as the title for",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXStaticText", "identifier": "\(sentinelLabelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXStaticText", "identifier": "\(sentinelLabelIdentifier)"}
                 }
               ]
             }
@@ -548,19 +534,20 @@ struct QSemanticLabelServedElementsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let labelIdentifier = "Repeat-\(suffix)"
-        let (window, label, inputField) = makeLabelWithServedElements(labelIdentifier: labelIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, label, inputField) = try await makeLabelWithServedElements(in: fixture, labelIdentifier: labelIdentifier)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.listLabelServedElements(
-            applicationName: currentProcessAppName, role: "AXStaticText", identifier: labelIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXStaticText", identifier: labelIdentifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.listLabelServedElements(
-            applicationName: currentProcessAppName, role: "AXStaticText", identifier: labelIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXStaticText", identifier: labelIdentifier, title: nil
         )
         #expect(first?.servedElements.count == second?.servedElements.count)
-        #expect(label.stringValue == "Name:")
-        #expect(inputField?.stringValue == "")
+        #expect(try await fixture.string(label, "stringValue") == "Name:")
+        #expect(try await fixture.stringIfPresent(inputField, "stringValue") == "")
     }
 
     @Test("33. No raw AXUIElement reference is ever persisted — structural proof: QAXLabelServedElementsMetadata's and QAXServedElementReference's stored properties are String?/String/[QAXServedElementReference] only, no AXUIElement-typed field exists anywhere in the declarations")
@@ -579,15 +566,16 @@ struct QSemanticLabelServedElementsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let labelIdentifier = "NoMutate-\(suffix)"
-        let (window, label, inputField) = makeLabelWithServedElements(labelIdentifier: labelIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, label, inputField) = try await makeLabelWithServedElements(in: fixture, labelIdentifier: labelIdentifier)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.listLabelServedElements(
-            applicationName: currentProcessAppName, role: "AXStaticText", identifier: labelIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXStaticText", identifier: labelIdentifier, title: nil
         )
-        #expect(label.stringValue == "Name:")
-        #expect(inputField?.stringValue == "")
+        #expect(try await fixture.string(label, "stringValue") == "Name:")
+        #expect(try await fixture.stringIfPresent(inputField, "stringValue") == "")
     }
 
     @Test("35. Observing this relationship never authorizes any mutation against the source label or any served element — the authorization paths are entirely disjoint")
@@ -724,6 +712,8 @@ struct QSemanticLabelServedElementsReadTests {
     @Test("45/E2E. Real macOS AppKit E2E — a real NSTextField label wired to a real NSTextField input via the genuine setAccessibilityServesAsTitleForUIElements(_:) accessor resolves via kAXServesAsTitleForUIElementsAttribute; a label with no served elements correctly reports genuine absence; neither field is ever mutated (guarded by AXIsProcessTrusted)")
     @MainActor
     func realAppKitLabelServedElementsRead() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         guard AXIsProcessTrusted() else {
             // BLOCKED — TCC / Accessibility permission. This isolated/unsigned XCTest host is not
             // expected to hold Accessibility trust; never fabricated as a PASS, exactly as every
@@ -733,35 +723,35 @@ struct QSemanticLabelServedElementsReadTests {
         let suffix = UUID().uuidString
         let labelIdentifier = "e2e-served-\(suffix)"
         let inputIdentifier = "e2e-served-input-\(suffix)"
-        let (window, label, inputField) = makeLabelWithServedElements(
+        let (window, label, inputField) = try await makeLabelWithServedElements(
+            in: fixture,
             labelIdentifier: labelIdentifier, inputIdentifier: inputIdentifier
         )
-        #expect((label.accessibilityServesAsTitleForUIElements() as? [NSTextField])?.first === inputField)
+        #expect(try await fixture.handles(label, "accessibility:servesAsTitleForUIElements")?.first == inputField)
 
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.listLabelServedElements(
-            applicationName: currentProcessAppName, role: "AXStaticText", identifier: labelIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXStaticText", identifier: labelIdentifier, title: nil
         )
 
         #expect(metadata?.servedElements.count == 1)
         #expect(metadata?.servedElements.first?.identifier == inputIdentifier)
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.applicationName == fixture.applicationName)
         // The read never mutated either field.
-        #expect(label.stringValue == "Name:")
-        #expect(inputField?.stringValue == "")
+        #expect(try await fixture.string(label, "stringValue") == "Name:")
+        #expect(try await fixture.stringIfPresent(inputField, "stringValue") == "")
 
         // A second, unlabeled/unattached fixture correctly reports genuine absence — never a
         // fabricated empty array conflated with "no relationship at all".
         let unattachedSuffix = UUID().uuidString
-        let (windowNoServed, _, _) = makeLabelWithServedElements(
+        let (windowNoServed, _, _) = try await makeLabelWithServedElements(
+            in: fixture,
             labelIdentifier: "e2e-noserved-\(unattachedSuffix)", inputIdentifier: nil, attachServedElements: false
         )
-        defer { windowNoServed.close() }
         try? await Task.sleep(nanoseconds: 150_000_000)
         let absentMetadata = try await QBridgeAccessibility.shared.listLabelServedElements(
-            applicationName: currentProcessAppName, role: "AXStaticText", identifier: "e2e-noserved-\(unattachedSuffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXStaticText", identifier: "e2e-noserved-\(unattachedSuffix)", title: nil
         )
         #expect(absentMetadata == nil)
     }

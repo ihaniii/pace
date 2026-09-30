@@ -22,6 +22,9 @@
 //    - Verified via closed-loop independent re-observation (axIncrementorValueMovedAsDesired)
 //    - Level 2 — requires explicit single-use user approval bound to execution identity
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX actions against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -31,38 +34,28 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit Fixtures
 
-@MainActor
+/// A real NSStepper in a titled window, built inside the out-of-process PaceAXFixtureHost (never in
+/// this XCTest host) with the same geometry, range, increment and initial value the in-process
+/// helper used. Returns the fixture window token and the stepper's fixture handle (also its AX
+/// identifier).
 private func makeStepperWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     minValue: Double,
     maxValue: Double,
     increment: Double,
     initialValue: Double
-) -> (window: NSWindow, stepper: NSStepper) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 90, y: 90, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, stepper: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticIncrementorStepTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "stepper",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 19, height: 27),
+        properties: ["minValue": minValue, "maxValue": maxValue, "increment": increment, "doubleValue": initialValue]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticIncrementorStepTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let stepper = NSStepper(frame: NSRect(x: 20, y: 20, width: 19, height: 27))
-    stepper.minValue = minValue
-    stepper.maxValue = maxValue
-    stepper.increment = increment
-    stepper.doubleValue = initialValue
-    stepper.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(stepper)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, stepper)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @Suite("QSemanticIncrementorStepTests")
@@ -217,13 +210,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("8. Missing match criteria (neither identifier nor title) fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "direction": "increment"
             ]
         )
@@ -234,13 +229,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("9. Missing direction parameter fails closed with AX_INVALID_STEP_DIRECTION")
     func missingDirectionFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom"
             ]
         )
@@ -251,13 +248,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("10. Invalid/malformed direction string fails closed")
     func malformedDirectionFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom",
                 "direction": "up"
             ]
@@ -269,13 +268,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("11. Invalid steps (zero) fails closed with AX_INVALID_STEP_COUNT")
     func zeroStepsFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom",
                 "direction": "increment",
                 "steps": "0"
@@ -288,13 +289,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("12. Invalid steps (exceeds bound of 20) fails closed with AX_INVALID_STEP_COUNT")
     func excessiveStepsFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom",
                 "direction": "increment",
                 "steps": "21"
@@ -307,13 +310,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("13. Invalid/malformed steps string fails closed with AX_INVALID_STEP_COUNT")
     func malformedStepsFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom",
                 "direction": "increment",
                 "steps": "notANumber"
@@ -326,13 +331,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("14. Disallowed role (AXSlider) fails closed with AX_DISALLOWED_ROLE")
     func disallowedRoleSliderFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSlider",
                 "identifier": "stepper.zoom",
                 "direction": "increment"
@@ -345,13 +352,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("15. Disallowed role (AXButton) fails closed with AX_DISALLOWED_ROLE")
     func disallowedRoleButtonFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXButton",
                 "identifier": "stepper.zoom",
                 "direction": "increment"
@@ -591,13 +600,15 @@ struct QSemanticIncrementorStepTests {
 
     @Test("25. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.step_incrementor",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Step incrementor",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "stepper.zoom",
                 "windowTitle": "DefinitelyNonExistentWindow_99999",
                 "direction": "increment"
@@ -639,12 +650,13 @@ struct QSemanticIncrementorStepTests {
     func liveAppKitStepperIncrement() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, stepper) = makeStepperWindow(identifier: "fixture-stepper-\(suffix)", minValue: 0.0, maxValue: 100.0, increment: 5.0, initialValue: 10.0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, stepper) = try await makeStepperWindow(in: fixture, identifier: "fixture-stepper-\(suffix)", minValue: 0.0, maxValue: 100.0, increment: 5.0, initialValue: 10.0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.stepIncrementor(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXIncrementor",
             identifier: "fixture-stepper-\(suffix)",
             title: nil,
@@ -655,7 +667,7 @@ struct QSemanticIncrementorStepTests {
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.currentValue > outcome.previousValue)
-        #expect(stepper.doubleValue == outcome.currentValue)
+        #expect(try await fixture.double(stepper, "doubleValue") == outcome.currentValue)
     }
 
     @Test("29. Live AppKit stepper decrement executes or guards AX permission")
@@ -663,12 +675,13 @@ struct QSemanticIncrementorStepTests {
     func liveAppKitStepperDecrement() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, stepper) = makeStepperWindow(identifier: "fixture-stepper-dec-\(suffix)", minValue: 0.0, maxValue: 100.0, increment: 5.0, initialValue: 50.0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, stepper) = try await makeStepperWindow(in: fixture, identifier: "fixture-stepper-dec-\(suffix)", minValue: 0.0, maxValue: 100.0, increment: 5.0, initialValue: 50.0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.stepIncrementor(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXIncrementor",
             identifier: "fixture-stepper-dec-\(suffix)",
             title: nil,
@@ -679,7 +692,7 @@ struct QSemanticIncrementorStepTests {
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.currentValue < outcome.previousValue)
-        #expect(stepper.doubleValue == outcome.currentValue)
+        #expect(try await fixture.double(stepper, "doubleValue") == outcome.currentValue)
     }
 
     @Test("30. Live AppKit stepper idempotent no-op when already at maximum bound")
@@ -687,12 +700,13 @@ struct QSemanticIncrementorStepTests {
     func liveAppKitStepperIdempotentAtMaxBound() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, stepper) = makeStepperWindow(identifier: "fixture-stepper-max-\(suffix)", minValue: 0.0, maxValue: 10.0, increment: 5.0, initialValue: 10.0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, stepper) = try await makeStepperWindow(in: fixture, identifier: "fixture-stepper-max-\(suffix)", minValue: 0.0, maxValue: 10.0, increment: 5.0, initialValue: 10.0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.stepIncrementor(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXIncrementor",
             identifier: "fixture-stepper-max-\(suffix)",
             title: nil,
@@ -704,7 +718,7 @@ struct QSemanticIncrementorStepTests {
         #expect(outcome.changeKind == .alreadyAtBound)
         #expect(outcome.performedSteps == 0)
         #expect(outcome.previousValue == outcome.currentValue)
-        #expect(stepper.doubleValue == 10.0)
+        #expect(try await fixture.double(stepper, "doubleValue") == 10.0)
     }
 
     @Test("31. Real macOS accessibility trust guard probe runs safely without crashing")
