@@ -26,7 +26,8 @@
 //     CharacterCount = 256`). Once the cap is hit the buffer is
 //     flushed immediately as a `typeText` step and a fresh buffer is
 //     started, so a runaway autocomplete loop can't OOM us.
-//   - Secure (`AXSecureTextField`) focus suppresses the live keystroke
+//   - Secure focus (subrole `AXSecureTextField`, classified by
+//     `QAXSecureTextElementPolicy`) suppresses the live keystroke
 //     buffer entirely. The buffer stays empty and the eventual flush
 //     emits a single `typeText(secure: true)` placeholder. The actual
 //     keystrokes never enter Pace's memory.
@@ -319,6 +320,15 @@ final class PaceFlowRecorder: ObservableObject {
         )
     }
 
+    /// Drive typed characters from a unit test through the same
+    /// buffering and secure-field classification the event tap uses,
+    /// with an explicit focused AX element instead of the live
+    /// system-wide focus (which a test cannot control).
+    func recordTypedCharactersForTesting(_ typedCharacters: String, focusedElement: AXUIElement?) {
+        guard isRecording else { return }
+        appendTypedCharacters(typedCharacters, focusedElement: focusedElement)
+    }
+
     /// Trigger the idle-timeout flow from a unit test. The production
     /// code path goes through `Timer.scheduledTimer`, which is hard to
     /// drive deterministically; this method directly fires the same
@@ -417,9 +427,12 @@ final class PaceFlowRecorder: ObservableObject {
             return
         }
 
-        // Regular character. Append to the active buffer, flushing
-        // first if the focus has changed since the last keystroke.
-        let currentFocusedElement = copyCurrentFocusedAXElement()
+        appendTypedCharacters(typedCharacters, focusedElement: copyCurrentFocusedAXElement())
+    }
+
+    /// Regular character. Append to the active buffer, flushing
+    /// first if the focus has changed since the last keystroke.
+    private func appendTypedCharacters(_ typedCharacters: String, focusedElement currentFocusedElement: AXUIElement?) {
         let currentFocusIsSecure = elementIsSecureTextField(currentFocusedElement)
 
         if activeTypingBuffer == nil {
@@ -549,12 +562,14 @@ final class PaceFlowRecorder: ObservableObject {
         return (focusedElementObject as! AXUIElement)
     }
 
+    /// Classifies the ACTUAL focused element with the same policy QBridge uses. A real password
+    /// field reports role AXTextField with subrole AXSecureTextField, so a role comparison alone
+    /// never recognises it. Pace's own classification is the boundary here — not the OS-wide
+    /// secure-input state. When there is no readable focused element, or its secure status cannot
+    /// be established, the keystrokes are treated as secure (placeholder only, no characters).
     private func elementIsSecureTextField(_ element: AXUIElement?) -> Bool {
-        guard let element else { return false }
-        guard let roleString = stringAXAttribute(kAXRoleAttribute as String, of: element) else {
-            return false
-        }
-        return roleString == "AXSecureTextField"
+        guard let element else { return true }
+        return QAXSecureTextElementPolicy.classify(element: element) != .notSecure
     }
 
     /// Roles we consider "pressable enough" to record as the leaf of

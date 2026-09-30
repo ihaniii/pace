@@ -5827,6 +5827,10 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element before reading its old value or writing anything:
+            // a requested "AXTextField" also matches real password fields (subrole AXSecureTextField),
+            // and an approval granted for the requested role never covers a secure target.
+            try Self.requireNonSecureTextElement(matches[0].element) { .disallowedTargetRole($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -5928,6 +5932,8 @@ extension QBridgeAccessibility {
             let appElement = AXUIElementCreateApplication(processIdentifier)
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard matches.count == 1 else { return nil }
+            // Never observe (or report the length of) a secure element's value; verification fails closed.
+            guard QAXSecureTextElementPolicy.classify(element: matches[0].element) == .notSecure else { return nil }
             guard let currentValue = Self.axStringAttribute(kAXValueAttribute, of: matches[0].element) else { return nil }
             return (Self.sha256Hex(currentValue), currentValue.count)
         }.value
@@ -5988,6 +5994,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, snapshot) = matches[0]
 
@@ -6055,6 +6064,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -6161,6 +6173,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -6270,6 +6285,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -6382,6 +6400,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -6497,6 +6518,13 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField). Role/subrole only: this
+            // capability exists to REPORT AXContainsProtectedContent, so a true flag must not refuse it.
+            let secureTextClassification = QAXSecureTextElementPolicy.classifySecureTextRepresentation(element: matches[0].element)
+            guard secureTextClassification == .notSecure else {
+                throw QAXInteractionError.secureFieldReadDenied(QAXSecureTextElementPolicy.denialLabel(for: secureTextClassification))
+            }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -6616,6 +6644,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -7407,6 +7438,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -7550,6 +7584,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -7676,6 +7713,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -7815,6 +7855,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -7954,6 +7997,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -8228,6 +8274,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -8445,9 +8494,9 @@ extension QBridgeAccessibility {
             // The single privacy-sensitive exclusion — never a broader role allowlist, since a
             // scroll area's visible children are legitimately varied (rows, cells, groups, tables,
             // outlines, arbitrary content).
-            guard visibleChildRole != "AXSecureTextField" else {
-                throw QAXInteractionError.secureFieldReadDenied(visibleChildRole)
-            }
+            // Classified from the child's own role/subrole: a real password field reports role
+            // AXTextField with subrole AXSecureTextField. Indeterminate status is refused too.
+            try requireNonSecureTextElement(visibleChild) { .secureFieldReadDenied($0) }
 
             let rawTitle = Self.axStringAttribute(kAXTitleAttribute, of: visibleChild)
             let visibleChildTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
@@ -8686,6 +8735,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -8896,9 +8948,9 @@ extension QBridgeAccessibility {
         // one of QAXElementReadRolePolicy's leaf-control roles), not a leaf label, so it is
         // deliberately NOT held to that narrower allowlist.
         let headerElementRole = Self.axStringAttribute(kAXRoleAttribute, of: headerElement) ?? "none"
-        guard headerElementRole != "AXSecureTextField" else {
-            throw QAXInteractionError.secureFieldReadDenied(headerElementRole)
-        }
+        // Classified from the header's own role/subrole, so a real password field (role
+        // AXTextField, subrole AXSecureTextField) is refused too, as is indeterminate status.
+        try requireNonSecureTextElement(headerElement) { .secureFieldReadDenied($0) }
 
         let rawTitle = Self.axStringAttribute(kAXTitleAttribute, of: headerElement)
         let headerTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
@@ -9003,6 +9055,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -9098,9 +9153,9 @@ extension QBridgeAccessibility {
             // The single privacy-sensitive exclusion — never a broader role allowlist, since a
             // "linked" relationship is legitimately varied (any two elements an app author
             // chooses to associate).
-            guard linkedElementRole != "AXSecureTextField" else {
-                throw QAXInteractionError.secureFieldReadDenied(linkedElementRole)
-            }
+            // Classified from the linked element's own role/subrole: a real password field reports
+            // role AXTextField with subrole AXSecureTextField. Indeterminate status is refused too.
+            try requireNonSecureTextElement(linkedElement) { .secureFieldReadDenied($0) }
 
             let rawTitle = Self.axStringAttribute(kAXTitleAttribute, of: linkedElement)
             let linkedElementTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
@@ -9199,6 +9254,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -9300,6 +9358,9 @@ extension QBridgeAccessibility {
             guard QAXElementReadRolePolicy.isAllowedReadRole(servedElementRole) else {
                 throw QAXInteractionError.servedElementsElementDisallowedRole(servedElementRole)
             }
+            // The allowlist admits AXTextField, which real password fields report as their role
+            // (their subrole is AXSecureTextField), so the served element itself is classified too.
+            try requireNonSecureTextElement(servedElement) { .servedElementsElementDisallowedRole($0) }
 
             let rawTitle = Self.axStringAttribute(kAXTitleAttribute, of: servedElement)
             let servedElementTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
@@ -10111,9 +10172,13 @@ extension QBridgeAccessibility {
 
             // Value exposure is the ONLY policy-gated field — identity/structural metadata above
             // is always returned. Mirrors ui.read_element_value's exact contract: a secure or
-            // disallowed role withholds the value, never the whole read.
+            // disallowed role withholds the value, never the whole read. Secure status comes from
+            // the ACTUAL focused element (a real password field reports role AXTextField with
+            // subrole AXSecureTextField, and its masked AXValue has the password's length), and an
+            // indeterminate classification withholds the value too.
             let value: String?
-            if role != "AXSecureTextField" && QAXElementReadRolePolicy.isAllowedReadRole(role) {
+            if QAXSecureTextElementPolicy.classify(element: focusedElement) == .notSecure
+                && QAXElementReadRolePolicy.isAllowedReadRole(role) {
                 value = Self.axValueDescription(of: focusedElement)
             } else {
                 value = nil
@@ -12486,6 +12551,9 @@ extension QBridgeAccessibility {
             let matches = Self.collectMatches(root: appElement, role: role, identifier: identifier, title: title)
             guard !matches.isEmpty else { throw QAXInteractionError.noMatchingElement }
             guard matches.count == 1 else { throw QAXInteractionError.ambiguousTarget(count: matches.count) }
+            // Classify the ACTUAL resolved element: a requested "AXTextField" also matches real
+            // password fields (role AXTextField, subrole AXSecureTextField).
+            try Self.requireNonSecureTextElement(matches[0].element) { .secureFieldReadDenied($0) }
 
             let (targetElement, observedAtSearch) = matches[0]
 
@@ -12542,6 +12610,9 @@ extension QBridgeAccessibility {
         guard QAXElementReadRolePolicy.isAllowedReadRole(titleElementRole) else {
             throw QAXInteractionError.titleReferenceDisallowedRole(titleElementRole)
         }
+        // The allowlist admits AXTextField, which real password fields report as their role
+        // (their subrole is AXSecureTextField), so the referenced element itself is classified too.
+        try requireNonSecureTextElement(titleElement) { .titleReferenceDisallowedRole($0) }
 
         let rawTitle = Self.axStringAttribute(kAXTitleAttribute, of: titleElement)
         let referenceTitle = (rawTitle?.isEmpty == false) ? rawTitle : nil
@@ -16650,6 +16721,20 @@ extension QBridgeAccessibility {
 
         visit(root, depth: 0)
         return matches
+    }
+
+    /// Throws `makeDenial(label)` unless the ACTUAL element is classified `.notSecure` by
+    /// `QAXSecureTextElementPolicy`. Secure and indeterminate elements are both refused, so a failure
+    /// to establish secure-text status never fails open. The label is the policy's fixed denial
+    /// label — never the element's value, length, or selection.
+    fileprivate nonisolated static func requireNonSecureTextElement(
+        _ element: AXUIElement,
+        makeDenial: (String) -> QAXInteractionError
+    ) throws {
+        let classification = QAXSecureTextElementPolicy.classify(element: element)
+        guard classification == .notSecure else {
+            throw makeDenial(QAXSecureTextElementPolicy.denialLabel(for: classification))
+        }
     }
 
     fileprivate nonisolated static func snapshotIfMatches(
