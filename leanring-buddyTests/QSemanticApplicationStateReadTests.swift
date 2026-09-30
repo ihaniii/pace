@@ -15,6 +15,9 @@
 //  test suite in this codebase already established. See
 //  docs/PHASE_2BH_SEMANTIC_APPLICATION_STATE_READ.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -24,25 +27,21 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeMainWindow(title: String) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 120),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    window.makeKeyAndOrderFront(nil)
-    window.makeMain()
-    return window
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same size,
+/// title and style mask ([.titled]) as the in-process helper, then made key, ordered front and made
+/// main within the fixture app. Returns the window token.
+///
+/// The fixture app is activated first: AppKit only reports a main window for the active
+/// application, and the in-process helper ran inside the XCTest host, which was the active app.
+@discardableResult
+private func makeMainWindow(in fixture: PaceAXFixture, title: String) async throws -> String {
+    try await fixture.activateApplication()
+    let windowToken = try await fixture.createWindow(title: title, width: 300, height: 120, styles: ["titled"])
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    try await fixture.perform(windowToken, "makeMain")
+    return windowToken
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticApplicationStateReadTests")
 struct QSemanticApplicationStateReadTests {
@@ -148,11 +147,12 @@ struct QSemanticApplicationStateReadTests {
     @MainActor
     func authoritativeStateBooleansAreRead() async throws {
         guard AXIsProcessTrusted() else { return }
-        let window = makeMainWindow(title: "QSemanticApplicationStateReadTestFixture-\(UUID().uuidString)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: "QSemanticApplicationStateReadTestFixture-\(UUID().uuidString)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
+        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
         // The isolated XCTest host process is never hidden while actively running its own test
         // window — a real, honest assertion, not a hard-coded fabrication.
         #expect(snapshot.isHidden == false)
@@ -169,11 +169,12 @@ struct QSemanticApplicationStateReadTests {
     func mainWindowRelationshipResolvedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let title = "QSemanticApplicationStateReadTestFixture-main-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 250_000_000)
 
-        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
+        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
         #expect(snapshot.mainWindowTitle == title)
     }
 
@@ -184,11 +185,12 @@ struct QSemanticApplicationStateReadTests {
     func windowTitleAndIdentifierReturnedWhenAvailable() async throws {
         guard AXIsProcessTrusted() else { return }
         let title = "QSemanticApplicationStateReadTestFixture-titled-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 250_000_000)
 
-        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
+        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
         #expect(snapshot.mainWindowTitle == title)
         // NSWindow does not set an AXIdentifier by default (unlike accessibilityIdentifier'd
         // controls) — identifier legitimately being nil here is itself the correct, honest
@@ -294,13 +296,14 @@ struct QSemanticApplicationStateReadTests {
     func noMutationOccurs() async throws {
         guard AXIsProcessTrusted() else { return }
         let title = "QSemanticApplicationStateReadTestFixture-nomutate-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        _ = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
-        #expect(window.title == title)
-        #expect(window.isMainWindow == true)
+        _ = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
+        #expect(try await fixture.string(window, "title") == title)
+        #expect(try await fixture.bool(window, "isMainWindow") == true)
     }
 
     // MARK: - 19. No polling occurs
@@ -385,8 +388,9 @@ struct QSemanticApplicationStateReadTests {
     @MainActor
     func noSensitiveDataPersisted() async throws {
         guard AXIsProcessTrusted() else { return }
-        let window = makeMainWindow(title: "QSemanticApplicationStateReadTestFixture-persist-\(UUID().uuidString)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: "QSemanticApplicationStateReadTestFixture-persist-\(UUID().uuidString)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -399,7 +403,7 @@ struct QSemanticApplicationStateReadTests {
                   "actionName": "ui.read_application_state",
                   "toolFamily": "app",
                   "description": "Read the application's authoritative AX state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -426,7 +430,7 @@ struct QSemanticApplicationStateReadTests {
             return
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_application_state" })
-        #expect(stepSnapshot?.arguments["applicationName"] == currentProcessAppName)
+        #expect(stepSnapshot?.arguments["applicationName"] == fixture.applicationName)
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
         // Evidence carries only the application name and status — never the booleans or window
         // titles themselves (see test 25's verification-strategy-level proof for the exact
@@ -440,8 +444,9 @@ struct QSemanticApplicationStateReadTests {
     func normalPipelineIsUsedEndToEnd() async throws {
         guard AXIsProcessTrusted() else { return }
         let title = "QSemanticApplicationStateReadTestFixture-pipeline-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -454,7 +459,7 @@ struct QSemanticApplicationStateReadTests {
                   "actionName": "ui.read_application_state",
                   "toolFamily": "app",
                   "description": "Read the application's authoritative AX state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -558,12 +563,13 @@ struct QSemanticApplicationStateReadTests {
     func repeatedReadsAreIdempotent() async throws {
         guard AXIsProcessTrusted() else { return }
         let title = "QSemanticApplicationStateReadTestFixture-idempotent-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let first = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
-        let second = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
+        let first = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
+        let second = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
         #expect(first.mainWindowTitle == title)
         #expect(second.mainWindowTitle == title)
         #expect(first.isHidden == second.isHidden)
@@ -581,11 +587,12 @@ struct QSemanticApplicationStateReadTests {
             return
         }
         let title = "QSemanticApplicationStateReadE2EFixture-\(UUID().uuidString)"
-        let window = makeMainWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeMainWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 250_000_000)
 
-        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: currentProcessAppName)
+        let snapshot = try await QBridgeAccessibility.shared.readApplicationState(applicationName: fixture.applicationName)
         #expect(snapshot.mainWindowTitle == title)
         #expect(snapshot.isHidden == false)
     }

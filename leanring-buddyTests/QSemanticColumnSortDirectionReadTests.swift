@@ -35,6 +35,9 @@
 //  codebase already established. See docs/PHASE_2BT_SEMANTIC_COLUMN_SORT_DIRECTION.md for the
 //  full contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -42,37 +45,36 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSTableView` with a single, distinctly-titled `NSTableColumn` — the
 /// exact same fixture shape `ui.list_table_columns`'s own real E2E test (Phase 2BI) already
 /// established as proven-working for resolving a real `AXColumn` by title.
-@MainActor
-private func makeSingleColumnTableFixture(tableIdentifier: String, columnTitle: String) -> (window: NSWindow, tableView: NSTableView, column: NSTableColumn) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+/// 400x300 titled/closable window, single 150-point "SortCol" column, AX identifier and AX label
+/// the in-process helper used. The scroll view fills the window's content area, exactly as
+/// `window.contentView = scrollView` made it. Returns the fixture window token, the table's fixture
+/// handle (also its AX identifier), and that same handle for the column slot: the table has
+/// exactly one column, whose title the tests read back through the table.
+@discardableResult
+private func makeSingleColumnTableFixture(in fixture: PaceAXFixture, tableIdentifier: String, columnTitle: String) async throws -> (window: String, tableView: String, column: String) {
+    let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+    try await fixture.addControl(
+        kind: "tableView",
+        identifier: tableIdentifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+        properties: [
+            "columns": ["SortCol"],
+            "columnTitles": [columnTitle],
+            "columnWidths": [150.0]
+        ]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    let scrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-    let tableView = NSTableView(frame: scrollView.bounds)
-    let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("SortCol"))
-    column.title = columnTitle
-    column.width = 150
-    tableView.addTableColumn(column)
-    tableView.setAccessibilityIdentifier(tableIdentifier)
-    tableView.setAccessibilityLabel("Test Sortable Table")
-    scrollView.documentView = tableView
-    window.contentView = scrollView
-    window.makeKeyAndOrderFront(nil)
-    return (window, tableView, column)
+    try await fixture.setAccessibility(tableIdentifier, "label", "Test Sortable Table")
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, tableIdentifier, tableIdentifier)
 }
 
 private final class ColumnSortDirectionMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -193,9 +195,11 @@ struct QSemanticColumnSortDirectionReadTests {
     @Test("5. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readColumnSortDirection(
-                applicationName: currentProcessAppName, identifier: nil, title: nil
+                applicationName: fixture.applicationName, identifier: nil, title: nil
             )
         }
     }
@@ -334,13 +338,14 @@ struct QSemanticColumnSortDirectionReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeSingleColumnTableFixture(tableIdentifier: "present-\(suffix)", columnTitle: "Present")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "present-\(suffix)", columnTitle: "Present")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readColumnSortDirection(
-                applicationName: currentProcessAppName, identifier: nil, title: "Absent-\(suffix)"
+                applicationName: fixture.applicationName, identifier: nil, title: "Absent-\(suffix)"
             )
         }
     }
@@ -350,32 +355,26 @@ struct QSemanticColumnSortDirectionReadTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollA = NSScrollView(frame: NSRect(x: 10, y: 10, width: 180, height: 280))
-        let tableA = NSTableView(frame: scrollA.bounds)
-        let colA = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColA"))
-        colA.title = "DupSortCol-\(suffix)"
-        tableA.addTableColumn(colA)
-        scrollA.documentView = tableA
-        let scrollB = NSScrollView(frame: NSRect(x: 200, y: 10, width: 180, height: 280))
-        let tableB = NSTableView(frame: scrollB.bounds)
-        let colB = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColB"))
-        colB.title = "DupSortCol-\(suffix)"
-        tableB.addTableColumn(colB)
-        scrollB.documentView = tableB
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(scrollA)
-        container.addSubview(scrollB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tables whose columns deliberately share one title, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "tableView", identifier: "DupSortTableA-\(suffix)", windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColA"], "columnTitles": ["DupSortCol-\(suffix)"]]
+        )
+        try await fixture.addControl(
+            kind: "tableView", identifier: "DupSortTableB-\(suffix)", windowToken: windowToken,
+            frame: NSRect(x: 200, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColB"], "columnTitles": ["DupSortCol-\(suffix)"]]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readColumnSortDirection(
-                applicationName: currentProcessAppName, identifier: nil, title: "DupSortCol-\(suffix)"
+                applicationName: fixture.applicationName, identifier: nil, title: "DupSortCol-\(suffix)"
             )
         }
     }
@@ -415,8 +414,9 @@ struct QSemanticColumnSortDirectionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelColumnTitle = "SortCol-\(suffix)"
-        let (window, _, _) = makeSingleColumnTableFixture(tableIdentifier: "durable-\(suffix)", columnTitle: sentinelColumnTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "durable-\(suffix)", columnTitle: sentinelColumnTitle)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -429,7 +429,7 @@ struct QSemanticColumnSortDirectionReadTests {
                   "actionName": "ui.read_column_sort_direction",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified column's sort direction",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "\(sentinelColumnTitle)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "\(sentinelColumnTitle)"}
                 }
               ]
             }
@@ -455,7 +455,7 @@ struct QSemanticColumnSortDirectionReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_column_sort_direction" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("29. Audit records for this capability never contain table/cell content — only bounded structural metadata")
@@ -464,8 +464,9 @@ struct QSemanticColumnSortDirectionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelColumnTitle = "AuditSortCol-\(suffix)"
-        let (window, _, _) = makeSingleColumnTableFixture(tableIdentifier: "audit-\(suffix)", columnTitle: sentinelColumnTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "audit-\(suffix)", columnTitle: sentinelColumnTitle)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -478,7 +479,7 @@ struct QSemanticColumnSortDirectionReadTests {
                   "actionName": "ui.read_column_sort_direction",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified column's sort direction",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "\(sentinelColumnTitle)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "\(sentinelColumnTitle)"}
                 }
               ]
             }
@@ -550,14 +551,15 @@ struct QSemanticColumnSortDirectionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let columnTitle = "NoMutate-\(suffix)"
-        let (window, _, column) = makeSingleColumnTableFixture(tableIdentifier: "nomutate-\(suffix)", columnTitle: columnTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _, column) = try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "nomutate-\(suffix)", columnTitle: columnTitle)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readColumnSortDirection(
-            applicationName: currentProcessAppName, identifier: nil, title: columnTitle
+            applicationName: fixture.applicationName, identifier: nil, title: columnTitle
         )
-        #expect(column.title == columnTitle)
+        #expect((try await fixture.value(column, "tableColumnTitles") as? [String])?.first == columnTitle)
     }
 
     @Test("33. Observing the current sort direction never authorizes clicking the column header or any other mutation — the authorization paths are entirely disjoint")
@@ -703,18 +705,19 @@ struct QSemanticColumnSortDirectionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let columnTitle = "Repeat-\(suffix)"
-        let (window, _, column) = makeSingleColumnTableFixture(tableIdentifier: "repeat-\(suffix)", columnTitle: columnTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _, column) = try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "repeat-\(suffix)", columnTitle: columnTitle)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readColumnSortDirection(
-            applicationName: currentProcessAppName, identifier: nil, title: columnTitle
+            applicationName: fixture.applicationName, identifier: nil, title: columnTitle
         )
         let second = try await QBridgeAccessibility.shared.readColumnSortDirection(
-            applicationName: currentProcessAppName, identifier: nil, title: columnTitle
+            applicationName: fixture.applicationName, identifier: nil, title: columnTitle
         )
         #expect(first.sortDirection == second.sortDirection)
-        #expect(column.title == columnTitle)
+        #expect((try await fixture.value(column, "tableColumnTitles") as? [String])?.first == columnTitle)
     }
 
     // MARK: - Real macOS AppKit E2E Fixture (TCC Guarded)
@@ -730,22 +733,23 @@ struct QSemanticColumnSortDirectionReadTests {
         }
         let suffix = UUID().uuidString
         let columnTitle = "E2ESortCol-\(suffix)"
-        let (window, _, column) = makeSingleColumnTableFixture(tableIdentifier: "e2e-sortdir-\(suffix)", columnTitle: columnTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _, column) = try await makeSingleColumnTableFixture(in: fixture, tableIdentifier: "e2e-sortdir-\(suffix)", columnTitle: columnTitle)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readColumnSortDirection(
-            applicationName: currentProcessAppName, identifier: nil, title: columnTitle
+            applicationName: fixture.applicationName, identifier: nil, title: columnTitle
         )
         // The CONTRACT under test: the call succeeds and returns a genuine, honest native answer
         // (either nil absence, or one of the three documented values) — never a fabricated
         // guess. The exact native default for a column with no sort descriptor applied is
         // observed here, not assumed in advance.
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         if let direction = metadata.sortDirection {
             #expect(["ascending", "descending", "none"].contains(direction))
         }
         // The read never mutated the fixture's own column.
-        #expect(column.title == columnTitle)
+        #expect((try await fixture.value(column, "tableColumnTitles") as? [String])?.first == columnTitle)
     }
 }

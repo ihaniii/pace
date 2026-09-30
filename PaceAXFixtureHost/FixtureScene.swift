@@ -51,7 +51,7 @@ final class FixtureScene: NSObject {
     static let supportedControlKinds: Set<String> = [
         "button", "checkbox", "radio", "textField", "label", "secureTextField", "searchField",
         "textView", "slider", "stepper", "popUpButton", "comboBox", "segmentedControl",
-        "tabView", "scrollView", "splitView", "view"
+        "tabView", "scrollView", "splitView", "view", "tableView"
     ]
 
     private static let buttonTypesByName: [String: NSButton.ButtonType] = [
@@ -202,6 +202,12 @@ final class FixtureScene: NSObject {
         activeModalSession = NSApp.beginModalSession(for: modalWindow)
     }
 
+    /// One non-blocking `NSApp.runModalSession(_:)` pump of the running session.
+    func pumpModalSession() throws {
+        guard let activeModalSession else { throw FixtureSceneError.invalidValue(key: "no modal session running") }
+        _ = NSApp.runModalSession(activeModalSession)
+    }
+
     func stopModalSession() {
         guard let activeModalSession else { return }
         NSApp.endModalSession(activeModalSession)
@@ -224,9 +230,16 @@ final class FixtureScene: NSObject {
         guard Self.supportedControlKinds.contains(kind) || kind.hasPrefix("custom:") else { throw FixtureSceneError.unknownControlKind(kind) }
         try requireUnusedIdentifier(identifier)
 
-        let containerView: NSView
+        // "detached": the control is created and registered but never added to any view, exactly
+        // like in-process helpers that built an element only to hand it to an accessibility
+        // relationship (for example row-header elements that live in no window).
+        let isDetached = properties["detached"] as? Bool == true
+        let containerView: NSView?
         let slotWindowToken: String
-        if let parentIdentifier {
+        if isDetached {
+            containerView = nil
+            slotWindowToken = "detached"
+        } else if let parentIdentifier {
             guard let parentView = viewsByIdentifier[parentIdentifier] else { throw FixtureSceneError.unknownIdentifier(parentIdentifier) }
             containerView = try childContainer(of: parentView, parentIdentifier: parentIdentifier, properties: properties)
             slotWindowToken = "parent:\(parentIdentifier)"
@@ -258,7 +271,7 @@ final class FixtureScene: NSObject {
         // the same unless the test asks for a different one — which is how a test builds two
         // controls that deliberately share one AX identifier (ambiguous-target tests).
         registeredView.setAccessibilityIdentifier(properties["accessibilityIdentifier"] as? String ?? identifier)
-        containerView.addSubview(viewAddedToContainer)
+        containerView?.addSubview(viewAddedToContainer)
         viewsByIdentifier[identifier] = registeredView
         handlesByViewObject[ObjectIdentifier(registeredView)] = identifier
         if let identifierAfterPress = properties["onPressSetAccessibilityIdentifier"] as? String {
@@ -270,7 +283,7 @@ final class FixtureScene: NSObject {
 
         // Every remaining property goes through the same allowlist the "set" command uses,
         // so creation-time and later mutations can never diverge.
-        let creationOnlyKeys: Set<String> = ["hasVerticalScroller", "detachAction", "testIndex", "buttonType", "customRole", "customSubrole", "customIsSelected", "accessibilityIdentifier", "inScrollView", "onPressSetAccessibilityIdentifier", "onPressSetTitle", "hasHorizontalScroller", "scrollerStyle", "documentWidth", "title", "items", "segments", "tabs", "minValue", "maxValue", "documentHeight", "paneCount", "isVertical", "paneIndex", "tabIndex"]
+        let creationOnlyKeys: Set<String> = ["hasVerticalScroller", "detachAction", "testIndex", "buttonType", "customRole", "customSubrole", "customIsSelected", "accessibilityIdentifier", "inScrollView", "onPressSetAccessibilityIdentifier", "onPressSetTitle", "hasHorizontalScroller", "scrollerStyle", "documentWidth", "title", "items", "segments", "tabs", "minValue", "maxValue", "documentHeight", "paneCount", "isVertical", "paneIndex", "tabIndex", "detached", "columns", "columnTitles", "columnWidths", "includeHeader"]
         for (key, value) in properties where !creationOnlyKeys.contains(key) {
             try setValue(value, forKey: key, identifier: identifier)
         }
@@ -392,6 +405,32 @@ final class FixtureScene: NSObject {
             let documentHeight = properties["documentHeight"] as? Double ?? 2000
             scrollView.documentView = NSView(frame: NSRect(x: 0, y: 0, width: documentWidth, height: documentHeight))
             return (scrollView, scrollView)
+        case "tableView":
+            // A real NSTableView as the document view of a real NSScrollView, built the way the
+            // migrated helpers built theirs: one NSTableColumn per entry in "columns" (titles from
+            // "columnTitles" and widths from "columnWidths" when given), and the default
+            // NSTableHeaderView unless "includeHeader" is false (headerView = nil). The table
+            // itself is the registered view.
+            let scrollView = NSScrollView(frame: frame)
+            let tableView = NSTableView(frame: NSRect(origin: .zero, size: frame.size))
+            let columnIdentifiers = properties["columns"] as? [String] ?? []
+            let columnTitles = properties["columnTitles"] as? [String] ?? []
+            let columnWidths = properties["columnWidths"] as? [Double] ?? []
+            for (columnIndex, columnIdentifier) in columnIdentifiers.enumerated() {
+                let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(columnIdentifier))
+                if columnIndex < columnTitles.count {
+                    column.title = columnTitles[columnIndex]
+                }
+                if columnIndex < columnWidths.count {
+                    column.width = CGFloat(columnWidths[columnIndex])
+                }
+                tableView.addTableColumn(column)
+            }
+            if properties["includeHeader"] as? Bool == false {
+                tableView.headerView = nil
+            }
+            scrollView.documentView = tableView
+            return (tableView, scrollView)
         case "splitView":
             let splitView = NSSplitView(frame: frame)
             splitView.isVertical = properties["isVertical"] as? Bool ?? true
@@ -440,7 +479,7 @@ final class FixtureScene: NSObject {
         nextDefaultControlSlotByWindowToken[slotKey] = slotIndex + 1
         let height: CGFloat
         switch kind {
-        case "textView", "tabView", "scrollView", "splitView", "view": height = 120
+        case "textView", "tabView", "scrollView", "splitView", "view", "tableView": height = 120
         default: height = 26
         }
         return NSRect(x: 20, y: 20 + CGFloat(slotIndex) * 34, width: 220, height: height)

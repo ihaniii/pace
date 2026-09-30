@@ -33,6 +33,9 @@
 //  codebase already established. See docs/PHASE_2BU_SEMANTIC_TABLE_DIMENSIONS.md for the full
 //  contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -40,41 +43,34 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSTableView` with two distinctly-titled `NSTableColumn`s — the exact
 /// same fixture shape `ui.list_table_columns`'s own real E2E test (Phase 2BI) already established
 /// as proven-working for resolving a real `AXTable` by identifier.
-@MainActor
-private func makeTwoColumnTableFixture(identifier: String) -> (window: NSWindow, tableView: NSTableView) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+/// 400x300 titled/closable window, 380x280 scroll view, two 150-point columns, AX identifier and
+/// AX label the in-process helper used. Returns the fixture window token and the table's fixture
+/// handle (also its AX identifier).
+@discardableResult
+private func makeTwoColumnTableFixture(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, tableView: String) {
+    let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+    try await fixture.addControl(
+        kind: "tableView",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+        properties: [
+            "columns": ["NameCol", "DateCol"],
+            "columnTitles": ["Name", "Date Modified"],
+            "columnWidths": [150.0, 150.0]
+        ]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    let scrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-    let tableView = NSTableView(frame: scrollView.bounds)
-    let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("NameCol"))
-    nameColumn.title = "Name"
-    nameColumn.width = 150
-    let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("DateCol"))
-    dateColumn.title = "Date Modified"
-    dateColumn.width = 150
-    tableView.addTableColumn(nameColumn)
-    tableView.addTableColumn(dateColumn)
-    tableView.setAccessibilityIdentifier(identifier)
-    tableView.setAccessibilityLabel("Test Table")
-    scrollView.documentView = tableView
-    window.contentView?.addSubview(scrollView)
-    window.makeKeyAndOrderFront(nil)
-    return (window, tableView)
+    try await fixture.setAccessibility(identifier, "label", "Test Table")
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class TableDimensionsMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -195,9 +191,11 @@ struct QSemanticTableDimensionsReadTests {
     @Test("5. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readTableDimensions(
-                applicationName: currentProcessAppName, identifier: nil, title: nil
+                applicationName: fixture.applicationName, identifier: nil, title: nil
             )
         }
     }
@@ -336,13 +334,14 @@ struct QSemanticTableDimensionsReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTwoColumnTableFixture(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTwoColumnTableFixture(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readTableDimensions(
-                applicationName: currentProcessAppName, identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -353,30 +352,26 @@ struct QSemanticTableDimensionsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupTable-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollA = NSScrollView(frame: NSRect(x: 10, y: 10, width: 180, height: 280))
-        let tableA = NSTableView(frame: scrollA.bounds)
-        tableA.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("A")))
-        tableA.setAccessibilityIdentifier(sharedIdentifier)
-        scrollA.documentView = tableA
-        let scrollB = NSScrollView(frame: NSRect(x: 200, y: 10, width: 180, height: 280))
-        let tableB = NSTableView(frame: scrollB.bounds)
-        tableB.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("B")))
-        tableB.setAccessibilityIdentifier(sharedIdentifier)
-        scrollB.documentView = tableB
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(scrollA)
-        container.addSubview(scrollB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tables that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "tableView", identifier: "\(sharedIdentifier)-A", windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 180, height: 280),
+            properties: ["columns": ["A"], "accessibilityIdentifier": sharedIdentifier]
+        )
+        try await fixture.addControl(
+            kind: "tableView", identifier: "\(sharedIdentifier)-B", windowToken: windowToken,
+            frame: NSRect(x: 200, y: 10, width: 180, height: 280),
+            properties: ["columns": ["B"], "accessibilityIdentifier": sharedIdentifier]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readTableDimensions(
-                applicationName: currentProcessAppName, identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -418,8 +413,9 @@ struct QSemanticTableDimensionsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelTableIdentifier = "DurableTable-\(suffix)"
-        let (window, _) = makeTwoColumnTableFixture(identifier: sentinelTableIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTwoColumnTableFixture(in: fixture, identifier: sentinelTableIdentifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -432,7 +428,7 @@ struct QSemanticTableDimensionsReadTests {
                   "actionName": "ui.read_table_dimensions",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified table's row/column count",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "identifier": "\(sentinelTableIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "identifier": "\(sentinelTableIdentifier)"}
                 }
               ]
             }
@@ -458,7 +454,7 @@ struct QSemanticTableDimensionsReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_table_dimensions" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("31. Audit records for this capability never contain table/cell content — only bounded structural metadata")
@@ -467,8 +463,9 @@ struct QSemanticTableDimensionsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelTableIdentifier = "AuditTable-\(suffix)"
-        let (window, _) = makeTwoColumnTableFixture(identifier: sentinelTableIdentifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTwoColumnTableFixture(in: fixture, identifier: sentinelTableIdentifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -481,7 +478,7 @@ struct QSemanticTableDimensionsReadTests {
                   "actionName": "ui.read_table_dimensions",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified table's row/column count",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "identifier": "\(sentinelTableIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "identifier": "\(sentinelTableIdentifier)"}
                 }
               ]
             }
@@ -555,15 +552,16 @@ struct QSemanticTableDimensionsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "NoMutate-\(suffix)"
-        let (window, tableView) = makeTwoColumnTableFixture(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView) = try await makeTwoColumnTableFixture(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readTableDimensions(
-            applicationName: currentProcessAppName, identifier: identifier, title: nil
+            applicationName: fixture.applicationName, identifier: identifier, title: nil
         )
-        #expect(tableView.tableColumns.count == 2)
-        #expect(tableView.tableColumns.map { $0.title } == ["Name", "Date Modified"])
+        #expect(try await fixture.int(tableView, "tableColumnCount") == 2)
+        #expect((try await fixture.value(tableView, "tableColumnTitles") as? [String]) == ["Name", "Date Modified"])
     }
 
     @Test("35. Observing a table's dimensions never authorizes ui.list_table_rows/ui.list_table_columns/ui.select_table_row — the authorization paths are entirely disjoint")
@@ -694,19 +692,20 @@ struct QSemanticTableDimensionsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, tableView) = makeTwoColumnTableFixture(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView) = try await makeTwoColumnTableFixture(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readTableDimensions(
-            applicationName: currentProcessAppName, identifier: identifier, title: nil
+            applicationName: fixture.applicationName, identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readTableDimensions(
-            applicationName: currentProcessAppName, identifier: identifier, title: nil
+            applicationName: fixture.applicationName, identifier: identifier, title: nil
         )
         #expect(first.rowCount == second.rowCount)
         #expect(first.columnCount == second.columnCount)
-        #expect(tableView.tableColumns.count == 2)
+        #expect(try await fixture.int(tableView, "tableColumnCount") == 2)
     }
 
     // MARK: - Real macOS AppKit E2E Fixture (TCC Guarded)
@@ -722,28 +721,29 @@ struct QSemanticTableDimensionsReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-dims-\(suffix)"
-        let (window, tableView) = makeTwoColumnTableFixture(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView) = try await makeTwoColumnTableFixture(in: fixture, identifier: identifier)
 
         // Force deterministic, known values via the real, declared AppKit accessors
         // (accessibilityRowCount/accessibilityColumnCount, NSAccessibilityProtocols.h) — the FIRST
         // capability this session found with a genuine forced-value round-trip path for its exact
         // attributes.
-        tableView.setAccessibilityRowCount(7)
-        tableView.setAccessibilityColumnCount(4)
-        #expect(tableView.accessibilityRowCount() == 7)
-        #expect(tableView.accessibilityColumnCount() == 4)
+        try await fixture.setAccessibility(tableView, "rowCount", 7)
+        try await fixture.setAccessibility(tableView, "columnCount", 4)
+        #expect(try await fixture.int(tableView, "accessibility:rowCount") == 7)
+        #expect(try await fixture.int(tableView, "accessibility:columnCount") == 4)
 
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readTableDimensions(
-            applicationName: currentProcessAppName, identifier: identifier, title: nil
+            applicationName: fixture.applicationName, identifier: identifier, title: nil
         )
 
         #expect(metadata.rowCount == 7)
         #expect(metadata.columnCount == 4)
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         // The read never mutated the fixture's own columns.
-        #expect(tableView.tableColumns.count == 2)
+        #expect(try await fixture.int(tableView, "tableColumnCount") == 2)
     }
 }

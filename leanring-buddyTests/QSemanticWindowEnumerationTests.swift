@@ -22,6 +22,9 @@
 //  branches on AXIsProcessTrusted() and no-ops rather than fabricating a pass, mirroring the exact
 //  convention every prior semantic AX test suite in this codebase already establishes.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -31,34 +34,30 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+/// size, styles, title and optional AX identifier as the in-process helper, then made key and
+/// ordered front — and miniaturized when asked — within the fixture app. Returns the window token.
+@discardableResult
 private func makeEnumerableWindow(
+    in fixture: PaceAXFixture,
     title: String,
     identifier: String? = nil,
     minimize: Bool = false
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 160, y: 160, width: 220, height: 90),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable],
-        backing: .buffered,
-        defer: false
+) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 220,
+        height: 90,
+        styles: ["titled", "closable", "miniaturizable", "resizable"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
     if minimize {
-        window.miniaturize(nil)
+        try await fixture.perform(windowToken, "miniaturize")
     }
-    return window
+    return windowToken
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticWindowEnumerationTests")
 struct QSemanticWindowEnumerationTests {
@@ -171,11 +170,12 @@ struct QSemanticWindowEnumerationTests {
     func validApplicationResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeEnumerableWindow(title: "ResolveApp-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "ResolveApp-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         #expect(windows.contains { $0.title == "ResolveApp-\(suffix)" })
     }
 
@@ -198,11 +198,13 @@ struct QSemanticWindowEnumerationTests {
     @MainActor
     func emptyOrUnreadableWindowsAttributeIsValidEmptyResult() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // This test process itself, at the moment no test-created window fixture is alive, is a
         // reasonable proxy for "an application with no matching enumerable state right now" —
         // the key assertion is that the CALL ITSELF never throws for this reason; it is the
         // absence-vs-failure distinction, applied to enumeration rather than target resolution.
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         // A valid (possibly non-empty, depending on other concurrently-alive fixtures/tests) array
         // is returned without throwing — the call completing without error is itself the
         // assertion under test.
@@ -224,11 +226,12 @@ struct QSemanticWindowEnumerationTests {
     func axWindowElementIncluded() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeEnumerableWindow(title: "RoleValidWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "RoleValidWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         #expect(windows.contains { $0.title == "RoleValidWindow-\(suffix)" })
     }
 
@@ -250,11 +253,12 @@ struct QSemanticWindowEnumerationTests {
     func titlePresentAndOptionalHandling() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeEnumerableWindow(title: "TitlePresent-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "TitlePresent-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         let match = windows.first { $0.title == "TitlePresent-\(suffix)" }
         #expect(match != nil)
         // A genuinely title-unavailable AXWindow is not reproducible via a standard AppKit
@@ -270,15 +274,13 @@ struct QSemanticWindowEnumerationTests {
     func identifierPresentAndAbsent() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let withId = makeEnumerableWindow(title: "IdPresent-\(suffix)", identifier: "list-windows-id-\(suffix)")
-        let withoutId = makeEnumerableWindow(title: "IdAbsent-\(suffix)")
-        defer {
-            withId.close()
-            withoutId.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "IdPresent-\(suffix)", identifier: "list-windows-id-\(suffix)")
+        try await makeEnumerableWindow(in: fixture, title: "IdAbsent-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         let withIdMatch = windows.first { $0.title == "IdPresent-\(suffix)" }
         let withoutIdMatch = windows.first { $0.title == "IdAbsent-\(suffix)" }
         #expect(withIdMatch?.identifier == "list-windows-id-\(suffix)")
@@ -291,15 +293,13 @@ struct QSemanticWindowEnumerationTests {
     func minimizedPresentBothDirections() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let minimizedWindow = makeEnumerableWindow(title: "MinimizedTrue-\(suffix)", minimize: true)
-        let normalWindow = makeEnumerableWindow(title: "MinimizedFalse-\(suffix)", minimize: false)
-        defer {
-            minimizedWindow.close()
-            normalWindow.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "MinimizedTrue-\(suffix)", minimize: true)
+        try await makeEnumerableWindow(in: fixture, title: "MinimizedFalse-\(suffix)", minimize: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         let minimizedMatch = windows.first { $0.title == "MinimizedTrue-\(suffix)" }
         let normalMatch = windows.first { $0.title == "MinimizedFalse-\(suffix)" }
         #expect(minimizedMatch?.minimized == true)
@@ -311,11 +311,12 @@ struct QSemanticWindowEnumerationTests {
     func mainPresentAndOptionalHandling() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeEnumerableWindow(title: "MainPresent-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "MainPresent-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         let match = windows.first { $0.title == "MainPresent-\(suffix)" }
         #expect(match?.main != nil)
     }
@@ -344,17 +345,14 @@ struct QSemanticWindowEnumerationTests {
     func normalWindowCountEnumeratesCompletely() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeEnumerableWindow(title: "NormalCountA-\(suffix)")
-        let windowB = makeEnumerableWindow(title: "NormalCountB-\(suffix)")
-        let windowC = makeEnumerableWindow(title: "NormalCountC-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-            windowC.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "NormalCountA-\(suffix)")
+        try await makeEnumerableWindow(in: fixture, title: "NormalCountB-\(suffix)")
+        try await makeEnumerableWindow(in: fixture, title: "NormalCountC-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         let titles = Set(windows.compactMap(\.title))
         #expect(titles.isSuperset(of: ["NormalCountA-\(suffix)", "NormalCountB-\(suffix)", "NormalCountC-\(suffix)"]))
     }
@@ -391,15 +389,13 @@ struct QSemanticWindowEnumerationTests {
     func orderingNeverInterpreted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = makeEnumerableWindow(title: "OrderA-\(suffix)")
-        let windowB = makeEnumerableWindow(title: "OrderB-\(suffix)")
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "OrderA-\(suffix)")
+        try await makeEnumerableWindow(in: fixture, title: "OrderB-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         // Both windows are present regardless of which order kAXWindowsAttribute happened to
         // return them in — no assertion anywhere in this suite (or in the production
         // implementation) ever indexes into the result to infer "the first/frontmost window."
@@ -431,12 +427,13 @@ struct QSemanticWindowEnumerationTests {
     func enumerationDoesNotAuthorizeMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeEnumerableWindow(title: "NoAutoAuthorize-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "NoAutoAuthorize-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // Enumerate first.
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
         #expect(windows.contains { $0.title == "NoAutoAuthorize-\(suffix)" })
 
         // A subsequent mutation attempt (ui.set_window_main) still goes through the FULL,
@@ -453,7 +450,7 @@ struct QSemanticWindowEnumerationTests {
                   "actionName": "ui.set_window_main",
                   "toolFamily": "ui",
                   "description": "Make the window main",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXWindow", "title": "NoAutoAuthorize-\(suffix)", "desiredMain": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXWindow", "title": "NoAutoAuthorize-\(suffix)", "desiredMain": "true"}
                 }
               ]
             }
@@ -519,14 +516,15 @@ struct QSemanticWindowEnumerationTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sensitiveTitle = "PrivateJournal-\(suffix)-DoNotPersist"
-        let window = makeEnumerableWindow(title: sensitiveTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: sensitiveTitle)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let request = QActionRequest(
             toolName: "ui.list_windows", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "List windows",
-            parameters: ["applicationName": currentProcessAppName]
+            parameters: ["applicationName": fixture.applicationName]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-summary-privacy"))
         #expect(result.success == true)
@@ -534,7 +532,7 @@ struct QSemanticWindowEnumerationTests {
         #expect(result.outputData["window0.title"] == sensitiveTitle || result.outputData.values.contains(sensitiveTitle))
 
         let strategy = QVerificationStrategy.windowEnumerationSucceeded(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             windowCount: Int(result.outputData["windowCount"] ?? "0") ?? 0
         )
         let verifyRequest = QActionRequest(toolName: "ui.list_windows", toolFamily: "ui", riskLevel: .level0ReadOnly, literalAction: "n/a")
@@ -552,8 +550,9 @@ struct QSemanticWindowEnumerationTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sensitiveTitle = "TopSecretDocument-\(suffix)"
-        let window = makeEnumerableWindow(title: sensitiveTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: sensitiveTitle)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -566,7 +565,7 @@ struct QSemanticWindowEnumerationTests {
                   "actionName": "ui.list_windows",
                   "toolFamily": "ui",
                   "description": "Enumerate the windows of an application",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -694,6 +693,8 @@ struct QSemanticWindowEnumerationTests {
 
     @Test("38. An exhausted execution budget still blocks a ui.list_windows step from executing — QAgentBudget applies generically regardless of risk level, Level 0 included")
     func budgetExhaustionAppliesEvenToLevel0Reads() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
             """
@@ -704,13 +705,13 @@ struct QSemanticWindowEnumerationTests {
                   "actionName": "ui.list_windows",
                   "toolFamily": "ui",
                   "description": "Enumerate the windows of an application",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 },
                 {
                   "actionName": "ui.list_windows",
                   "toolFamily": "ui",
                   "description": "Enumerate the windows of an application again",
-                  "parameters": {"applicationName": "\(currentProcessAppName)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)"}
                 }
               ]
             }
@@ -759,16 +760,14 @@ struct QSemanticWindowEnumerationTests {
             return
         }
         let suffix = UUID().uuidString
-        let mainWindow = makeEnumerableWindow(title: "E2EMain-\(suffix)", identifier: "e2e-main-\(suffix)", minimize: false)
-        let minimizedWindow = makeEnumerableWindow(title: "E2EMinimized-\(suffix)", identifier: "e2e-min-\(suffix)", minimize: true)
-        defer {
-            mainWindow.close()
-            minimizedWindow.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeEnumerableWindow(in: fixture, title: "E2EMain-\(suffix)", identifier: "e2e-main-\(suffix)", minimize: false)
+        try await makeEnumerableWindow(in: fixture, title: "E2EMinimized-\(suffix)", identifier: "e2e-min-\(suffix)", minimize: true)
         try? await Task.sleep(nanoseconds: 250_000_000)
 
         // 1. Application resolves.
-        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: currentProcessAppName)
+        let windows = try await QBridgeAccessibility.shared.listWindows(applicationName: fixture.applicationName)
 
         // 2. kAXWindowsAttribute returns windows (both fixtures present).
         let mainMatch = windows.first { $0.title == "E2EMain-\(suffix)" }

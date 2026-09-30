@@ -28,6 +28,9 @@
 //  codebase already established. See docs/PHASE_2BY_SEMANTIC_WINDOW_AUXILIARY_BUTTONS.md for the
 //  full contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -35,38 +38,48 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSWindow` — already a real `AXWindow`-role AXUIElement via default
 /// AppKit Accessibility bridging.
-@MainActor
-private func makeWindow(title: String, identifier: String? = nil) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
-    return window
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same size,
+/// title, optional AX identifier and style mask ([.titled, .closable]) as the in-process helper, then
+/// made key and ordered front. Returns the window token.
+@discardableResult
+private func makeWindow(in fixture: PaceAXFixture, title: String, identifier: String? = nil) async throws -> String {
+    let windowToken = try await fixture.createWindow(identifier: identifier, title: title, width: 400, height: 150, styles: ["titled", "closable"])
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
 /// A genuine, real, live `NSWindow` configured with the real, standard AppKit mechanisms that
 /// organically produce native zoom/minimize/toolbar/full-screen title-bar chrome — `.miniaturizable`
 /// and `.resizable` style-mask flags, a real attached `NSToolbar`, and `.fullScreenPrimary`
 /// collection behavior — no forced accessor value needed at all, unlike prior phases' fixtures.
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host): the same size,
+/// title, optional AX identifier and style mask ([.titled, .closable, .miniaturizable, .resizable])
+/// as the in-process helper, with a real NSToolbar installed and `.fullScreenPrimary` added to its
+/// collection behavior, then made key and ordered front. Returns the window token.
+@discardableResult
+private func makeWindowWithAuxiliaryChrome(in fixture: PaceAXFixture, title: String, identifier: String? = nil) async throws -> String {
+    let windowToken = try await fixture.createWindow(
+        identifier: identifier,
+        title: title,
+        width: 400,
+        height: 150,
+        styles: ["titled", "closable", "miniaturizable", "resizable"]
+    )
+    try await fixture.perform(windowToken, "installToolbar")
+    try await fixture.perform(windowToken, "addFullScreenPrimaryBehavior")
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
+}
+
+/// The original in-process window, kept ONLY for the ownership regression test (#39), which never
+/// touches Accessibility: it checks this test-side NSWindow's own `isReleasedWhenClosed` lifecycle.
 @MainActor
-private func makeWindowWithAuxiliaryChrome(title: String, identifier: String? = nil) -> NSWindow {
+private func makeInProcessWindowWithAuxiliaryChrome(title: String, identifier: String? = nil) -> NSWindow {
     let window = NSWindow(
         contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -207,9 +220,11 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
     @Test("5. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-                applicationName: currentProcessAppName, windowTitle: nil, windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: nil, windowIdentifier: nil
             )
         }
     }
@@ -229,13 +244,14 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeWindow(title: "Present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindow(in: fixture, title: "Present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-                applicationName: currentProcessAppName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
             )
         }
     }
@@ -246,25 +262,19 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedTitle = "DupWindow-\(suffix)"
-        let windowA = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowA.isReleasedWhenClosed = false
-        windowA.animationBehavior = .none
-        windowA.title = sharedTitle
-        windowA.makeKeyAndOrderFront(nil)
-        let windowB = NSWindow(contentRect: NSRect(x: 400, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowB.isReleasedWhenClosed = false
-        windowB.animationBehavior = .none
-        windowB.title = sharedTitle
-        windowB.makeKeyAndOrderFront(nil)
-        defer {
-            windowA.close()
-            windowB.close()
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real windows sharing one title, built in the fixture exactly as the inline AppKit
+        // block built them ([.titled], 300x120, made key and ordered front).
+        let windowA = try await fixture.createWindow(title: sharedTitle, width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowA, "makeKeyAndOrderFront")
+        let windowB = try await fixture.createWindow(title: sharedTitle, width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowB, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-                applicationName: currentProcessAppName, windowTitle: sharedTitle, windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: sharedTitle, windowIdentifier: nil
             )
         }
     }
@@ -393,8 +403,9 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelWindowTitle = "DurableWindow-\(suffix)"
-        let window = makeWindow(title: sentinelWindowTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindow(in: fixture, title: sentinelWindowTitle)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -407,7 +418,7 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
                   "actionName": "ui.read_window_auxiliary_buttons",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified window's auxiliary button references",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "\(sentinelWindowTitle)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "\(sentinelWindowTitle)"}
                 }
               ]
             }
@@ -433,7 +444,7 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_window_auxiliary_buttons" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("25. Audit records for this capability never contain any button's own title/identifier — only conservative presence metadata")
@@ -442,8 +453,9 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelWindowTitle = "AuditWindow-\(suffix)"
-        let window = makeWindow(title: sentinelWindowTitle)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindow(in: fixture, title: sentinelWindowTitle)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -456,7 +468,7 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
                   "actionName": "ui.read_window_auxiliary_buttons",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified window's auxiliary button references",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "\(sentinelWindowTitle)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "\(sentinelWindowTitle)"}
                 }
               ]
             }
@@ -518,15 +530,16 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let title = "Repeat-\(suffix)"
-        let window = makeWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-            applicationName: currentProcessAppName, windowTitle: title, windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: title, windowIdentifier: nil
         )
         let second = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-            applicationName: currentProcessAppName, windowTitle: title, windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: title, windowIdentifier: nil
         )
         #expect((first.zoomButton != nil) == (second.zoomButton != nil))
         #expect((first.minimizeButton != nil) == (second.minimizeButton != nil))
@@ -551,15 +564,16 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let title = "NoMutate-\(suffix)"
-        let window = makeWindow(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeWindow(in: fixture, title: title)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-            applicationName: currentProcessAppName, windowTitle: title, windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: title, windowIdentifier: nil
         )
-        #expect(window.title == title)
-        #expect(window.isVisible == true)
+        #expect(try await fixture.string(window, "title") == title)
+        #expect(try await fixture.bool(window, "isVisible") == true)
     }
 
     @Test("30. Observing these button references never authorizes ui.set_window_full_screen/ui.set_window_minimized — the authorization paths are entirely disjoint")
@@ -684,16 +698,17 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
     func realAppKitWindowAuxiliaryButtonsRead() async throws {
         let suffix = UUID().uuidString
         let title = "e2e-auxbuttons-\(suffix)"
-        let window = makeWindowWithAuxiliaryChrome(title: title)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeWindowWithAuxiliaryChrome(in: fixture, title: title)
 
         // AppKit-level configuration facts — provable without TCC, confirming the fixture is
         // genuinely wired to produce native auxiliary-button chrome (unlike a forced accessor
         // value, this is standard AppKit behavior the OS itself is responsible for surfacing).
-        #expect(window.styleMask.contains(.miniaturizable))
-        #expect(window.styleMask.contains(.resizable))
-        #expect(window.toolbar != nil)
-        #expect(window.collectionBehavior.contains(.fullScreenPrimary))
+        #expect(try await fixture.bool(window, "isMiniaturizable"))
+        #expect(try await fixture.bool(window, "isResizable"))
+        #expect(try await fixture.bool(window, "hasToolbar"))
+        #expect(try await fixture.bool(window, "isFullScreenPrimary"))
 
         guard AXIsProcessTrusted() else {
             // BLOCKED — TCC / Accessibility permission. This isolated/unsigned XCTest host is not
@@ -709,10 +724,10 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowAuxiliaryButtons(
-            applicationName: currentProcessAppName, windowTitle: title, windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: title, windowIdentifier: nil
         )
 
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         // Never asserting a specific expected true/false for any one button — the exact native
         // behavior for which references a live AX provider vends under this styleMask/toolbar/
         // collectionBehavior combination is genuinely not something this sandboxed session can
@@ -729,7 +744,7 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
             }
         }
         // The read never mutated the fixture's own window.
-        #expect(window.title == title)
+        #expect(try await fixture.string(window, "title") == title)
     }
 
     // MARK: - Regression: fixture window ownership (recurring EXC_BAD_ACCESS root cause)
@@ -759,7 +774,7 @@ struct QSemanticWindowAuxiliaryButtonsReadTests {
     @MainActor
     func fixtureWindowDoesNotOverReleaseOnClose() throws {
         let suffix = UUID().uuidString
-        let window = makeWindowWithAuxiliaryChrome(title: "e2e-regression-\(suffix)")
+        let window = makeInProcessWindowWithAuxiliaryChrome(title: "e2e-regression-\(suffix)")
 
         #expect(window.isReleasedWhenClosed == false)
 

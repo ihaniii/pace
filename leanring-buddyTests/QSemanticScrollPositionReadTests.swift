@@ -22,6 +22,9 @@
 //  outside [0.0, 1.0] — fails closed with its own dedicated diagnostic. Nothing is ever silently
 //  defaulted, clamped, or guessed.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -29,41 +32,38 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 /// A genuine, real, live `NSScrollView` — already a real `AXScrollArea`-role AXUIElement via
 /// default AppKit Accessibility bridging, identical construction to
 /// QSemanticScrollPositionTests' own `makeScrollableWindow` fixture (Phase 2W), reused here rather
 /// than forked, since target resolution is the exact same reused chain.
-@MainActor
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+/// window, scroll-view geometry, 1200x1200 document view and legacy scrollers the in-process helper
+/// used; laid out after being shown, as before. Returns the fixture window token and the scroll
+/// view's fixture handle (also its AX identifier).
+@discardableResult
 private func makeReadableScrollableWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     includeHorizontalScroller: Bool = true
-) -> (window: NSWindow, scrollView: NSScrollView) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 200),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, scrollView: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticScrollPositionReadTestFixture", width: 200, height: 200, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "scrollView",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 0, y: 0, width: 200, height: 200),
+        properties: [
+            "hasHorizontalScroller": includeHorizontalScroller,
+            "scrollerStyle": "legacy",
+            "documentWidth": 1200.0,
+            "documentHeight": 1200.0
+        ]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticScrollPositionReadTestFixture"
-    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
-    scrollView.hasVerticalScroller = true
-    scrollView.hasHorizontalScroller = includeHorizontalScroller
-    scrollView.scrollerStyle = .legacy
-    scrollView.setAccessibilityIdentifier(identifier)
-
-    let documentView = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 1200))
-    scrollView.documentView = documentView
-
-    window.contentView = scrollView
-    window.makeKeyAndOrderFront(nil)
-    scrollView.layoutSubtreeIfNeeded()
-    return (window, scrollView)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    try await fixture.perform(identifier, "layoutSubtreeIfNeeded")
+    return (windowToken, identifier)
 }
 
 private final class ScrollPositionReadMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -171,16 +171,18 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("3. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readScrollPosition(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: nil, title: nil, orientation: "vertical"
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: nil, title: nil, orientation: "vertical"
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_scroll_position", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read scroll position",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXScrollArea", "orientation": "vertical"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXScrollArea", "orientation": "vertical"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-scroll-read"))
         #expect(result.success == false)
@@ -189,10 +191,12 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("4. Missing orientation parameter fails closed")
     func missingOrientationFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_scroll_position", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read scroll position",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXScrollArea", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXScrollArea", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-orientation-scroll-read"))
         #expect(result.success == false)
@@ -201,11 +205,13 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("5. Invalid orientation values fail closed — never inferred from arbitrary metadata")
     func invalidOrientationFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalid in ["", "Vertical", "VERTICAL", "up", "down", "both", "diagonal"] {
             let req = QActionRequest(
                 toolName: "ui.read_scroll_position", toolFamily: "ui", riskLevel: .level0ReadOnly,
                 literalAction: "Read scroll position",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXScrollArea", "identifier": "x", "orientation": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXScrollArea", "identifier": "x", "orientation": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-invalid-orientation-scroll-read"))
             #expect(result.success == false, "Invalid orientation '\(invalid)' must be rejected — exact 'horizontal'/'vertical' only.")
@@ -214,7 +220,7 @@ struct QSemanticScrollPositionReadTests {
 
         await #expect(throws: QAXInteractionError.invalidOrientation("diagonal")) {
             _ = try await QBridgeAccessibility.shared.readScrollPosition(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "x", title: nil, orientation: "diagonal"
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "x", title: nil, orientation: "diagonal"
             )
         }
     }
@@ -240,10 +246,12 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("7. Disallowed role (e.g. AXScrollBar, AXWindow, AXSlider) is rejected before tree walk — QAXScrollAreaRolePolicy reused verbatim, not forked")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXScrollBar", "AXWindow", "AXSlider", "AXStepper", "AXGroup", "AXRow", "AXTable", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedScrollAreaRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readScrollPosition(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, orientation: "vertical"
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, orientation: "vertical"
                 )
             }
         }
@@ -259,15 +267,16 @@ struct QSemanticScrollPositionReadTests {
     func validScrollAreaTargetResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, scrollView) = makeReadableScrollableWindow(identifier: "ValidScrollRead-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, scrollView) = try await makeReadableScrollableWindow(in: fixture, identifier: "ValidScrollRead-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
-        guard scrollView.verticalScroller != nil else { return }
+        guard try await fixture.optionalDouble(scrollView, "verticalScrollerValue") != nil else { return }
 
         let metadata = try await QBridgeAccessibility.shared.readScrollPosition(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "ValidScrollRead-\(suffix)", title: nil, orientation: "vertical"
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "ValidScrollRead-\(suffix)", title: nil, orientation: "vertical"
         )
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
         #expect(metadata.role == "AXScrollArea")
         #expect(metadata.orientation == "vertical")
         #expect(metadata.position >= 0.0 && metadata.position <= 1.0)
@@ -278,13 +287,14 @@ struct QSemanticScrollPositionReadTests {
     func horizontalOrientationResolvesDistinctly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, scrollView) = makeReadableScrollableWindow(identifier: "HorizScrollRead-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, scrollView) = try await makeReadableScrollableWindow(in: fixture, identifier: "HorizScrollRead-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
-        guard scrollView.horizontalScroller != nil else { return }
+        guard try await fixture.optionalDouble(scrollView, "horizontalScrollerValue") != nil else { return }
 
         let metadata = try await QBridgeAccessibility.shared.readScrollPosition(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "HorizScrollRead-\(suffix)", title: nil, orientation: "horizontal"
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "HorizScrollRead-\(suffix)", title: nil, orientation: "horizontal"
         )
         #expect(metadata.orientation == "horizontal")
         #expect(metadata.position >= 0.0 && metadata.position <= 1.0)
@@ -295,14 +305,15 @@ struct QSemanticScrollPositionReadTests {
     func missingScrollBarRelationshipFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, scrollView) = makeReadableScrollableWindow(identifier: "NoHorizScrollRead-\(suffix)", includeHorizontalScroller: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, scrollView) = try await makeReadableScrollableWindow(in: fixture, identifier: "NoHorizScrollRead-\(suffix)", includeHorizontalScroller: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
-        guard scrollView.horizontalScroller == nil else { return }
+        guard try await fixture.optionalDouble(scrollView, "horizontalScrollerValue") == nil else { return }
 
         do {
             _ = try await QBridgeAccessibility.shared.readScrollPosition(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "NoHorizScrollRead-\(suffix)", title: nil, orientation: "horizontal"
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "NoHorizScrollRead-\(suffix)", title: nil, orientation: "horizontal"
             )
             Issue.record("Expected scrollBarReferenceUnavailable to be thrown")
         } catch let error as QAXInteractionError {
@@ -325,10 +336,12 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("13. Non-existent scroll area target fails closed (zero matches)")
     func nonExistentTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_scroll_position", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read scroll position",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXScrollArea", "identifier": "QNoSuchScroll-2CA-\(UUID().uuidString)", "orientation": "vertical"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXScrollArea", "identifier": "QNoSuchScroll-2CA-\(UUID().uuidString)", "orientation": "vertical"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-target-scroll-read"))
         #expect(result.success == false)
@@ -340,29 +353,26 @@ struct QSemanticScrollPositionReadTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-
-        let scrollA = NSScrollView(frame: NSRect(x: 10, y: 10, width: 180, height: 280))
-        scrollA.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 800))
-        scrollA.setAccessibilityIdentifier("dup-scroll-read-\(suffix)")
-        contentView.addSubview(scrollA)
-
-        let scrollB = NSScrollView(frame: NSRect(x: 200, y: 10, width: 180, height: 280))
-        scrollB.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 800, height: 800))
-        scrollB.setAccessibilityIdentifier("dup-scroll-read-\(suffix)")
-        contentView.addSubview(scrollB)
-
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real scroll areas that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "scrollView", identifier: "dup-scroll-read-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 180, height: 280),
+            properties: ["hasVerticalScroller": false, "documentWidth": 800.0, "documentHeight": 800.0, "accessibilityIdentifier": "dup-scroll-read-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "scrollView", identifier: "dup-scroll-read-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 200, y: 10, width: 180, height: 280),
+            properties: ["hasVerticalScroller": false, "documentWidth": 800.0, "documentHeight": 800.0, "accessibilityIdentifier": "dup-scroll-read-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readScrollPosition(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "dup-scroll-read-\(suffix)", title: nil, orientation: "vertical"
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "dup-scroll-read-\(suffix)", title: nil, orientation: "vertical"
             )
         }
     }
@@ -541,10 +551,12 @@ struct QSemanticScrollPositionReadTests {
 
     @Test("33. QResourceGuard's generic per-step targetResources validation applies to ui.read_scroll_position exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_scroll_position", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read scroll position", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXScrollArea", "identifier": "x", "orientation": "vertical"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXScrollArea", "identifier": "x", "orientation": "vertical"]
         )
         // Empty targetResources (no file-path targets for this AX capability) means
         // QResourceGuard.validate is never invoked with a denying path — the generic guard at the
@@ -739,11 +751,12 @@ struct QSemanticScrollPositionReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, scrollView) = makeReadableScrollableWindow(identifier: "E2EScrollRead-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, scrollView) = try await makeReadableScrollableWindow(in: fixture, identifier: "E2EScrollRead-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        guard scrollView.verticalScroller != nil else {
+        guard try await fixture.optionalDouble(scrollView, "verticalScrollerValue") != nil else {
             // This environment's AppKit did not instantiate a live vertical scroller for this
             // fixture — an honest hardware-validation finding, not a defect in
             // ui.read_scroll_position itself, mirroring QSemanticScrollPositionTests' own test
@@ -758,17 +771,17 @@ struct QSemanticScrollPositionReadTests {
         // sleep-based waiting for the value itself to settle, since AXUIElementSetAttributeValue
         // is a synchronous call.
         _ = try await QBridgeAccessibility.shared.setScrollPosition(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "E2EScrollRead-\(suffix)", title: nil,
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "E2EScrollRead-\(suffix)", title: nil,
             orientation: "vertical", desiredValue: 0.75
         )
 
         let metadata = try await QBridgeAccessibility.shared.readScrollPosition(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "E2EScrollRead-\(suffix)", title: nil, orientation: "vertical"
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "E2EScrollRead-\(suffix)", title: nil, orientation: "vertical"
         )
 
         #expect(QBridgeAccessibility.sliderValuesAreEqual(metadata.position, 0.75))
         #expect(metadata.orientation == "vertical")
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     @Test("46/E2E. Real macOS AX E2E — reading a real NSScrollView's position at its genuine default (untouched) state yields a valid, in-range value — never an error merely for being at a default position, guarded by AXIsProcessTrusted()")
@@ -778,13 +791,14 @@ struct QSemanticScrollPositionReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, scrollView) = makeReadableScrollableWindow(identifier: "E2EScrollDefault-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, scrollView) = try await makeReadableScrollableWindow(in: fixture, identifier: "E2EScrollDefault-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
-        guard scrollView.verticalScroller != nil else { return }
+        guard try await fixture.optionalDouble(scrollView, "verticalScrollerValue") != nil else { return }
 
         let metadata = try await QBridgeAccessibility.shared.readScrollPosition(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "E2EScrollDefault-\(suffix)", title: nil, orientation: "vertical"
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "E2EScrollDefault-\(suffix)", title: nil, orientation: "vertical"
         )
         #expect(metadata.position >= 0.0 && metadata.position <= 1.0)
         #expect(metadata.position.isFinite)

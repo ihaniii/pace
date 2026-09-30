@@ -24,6 +24,9 @@
 //  codebase already established. See docs/PHASE_2BO_SEMANTIC_WINDOW_MODAL_STATE.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -31,30 +34,19 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSWindow` — already a real `AXWindow`-role AXUIElement via default
 /// AppKit Accessibility bridging.
-@MainActor
-private func makeModalStateTestWindow(title: String, identifier: String? = nil) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 300, height: 120),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = title
-    if let identifier {
-        window.setAccessibilityIdentifier(identifier)
-    }
-    window.makeKeyAndOrderFront(nil)
-    return window
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same size,
+/// title, optional AX identifier and style mask ([.titled, .closable]) as the in-process helper, then
+/// made key and ordered front. Returns the window token.
+@discardableResult
+private func makeModalStateTestWindow(in fixture: PaceAXFixture, title: String, identifier: String? = nil) async throws -> String {
+    let windowToken = try await fixture.createWindow(identifier: identifier, title: title, width: 300, height: 120, styles: ["titled", "closable"])
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
 private final class WindowModalStateMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -133,14 +125,15 @@ struct QSemanticWindowModalStateReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "ModalStateWindow-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "ModalStateWindow-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "ModalStateWindow-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ModalStateWindow-\(suffix)", windowIdentifier: nil
         )
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     // MARK: - Resolution: zero application match
@@ -169,17 +162,18 @@ struct QSemanticWindowModalStateReadTests {
     func exactWindowMatchSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "ByTitleModalWindow-\(suffix)", identifier: "byid-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "ByTitleModalWindow-\(suffix)", identifier: "byid-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let byIdentifier = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: nil, windowIdentifier: "byid-\(suffix)"
+            applicationName: fixture.applicationName, windowTitle: nil, windowIdentifier: "byid-\(suffix)"
         )
         #expect(byIdentifier.windowIdentifier == "byid-\(suffix)")
 
         let byTitle = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "ByTitleModalWindow-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ByTitleModalWindow-\(suffix)", windowIdentifier: nil
         )
         #expect(byTitle.windowTitle == "ByTitleModalWindow-\(suffix)")
     }
@@ -191,13 +185,14 @@ struct QSemanticWindowModalStateReadTests {
     func zeroWindowMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "Present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "Present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readWindowModalState(
-                applicationName: currentProcessAppName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
             )
         }
     }
@@ -209,22 +204,19 @@ struct QSemanticWindowModalStateReadTests {
     func ambiguousWindowMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowA.isReleasedWhenClosed = false
-        windowA.animationBehavior = .none
-        windowA.title = "DupModalWindow-\(suffix)"
-        windowA.makeKeyAndOrderFront(nil)
-        let windowB = NSWindow(contentRect: NSRect(x: 400, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowB.isReleasedWhenClosed = false
-        windowB.animationBehavior = .none
-        windowB.title = "DupModalWindow-\(suffix)"
-        windowB.makeKeyAndOrderFront(nil)
-        defer { windowA.close(); windowB.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real windows sharing one title, built in the fixture exactly as the inline AppKit
+        // block built them ([.titled], 300x120, made key and ordered front).
+        let windowA = try await fixture.createWindow(title: "DupModalWindow-\(suffix)", width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowA, "makeKeyAndOrderFront")
+        let windowB = try await fixture.createWindow(title: "DupModalWindow-\(suffix)", width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowB, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readWindowModalState(
-                applicationName: currentProcessAppName, windowTitle: "DupModalWindow-\(suffix)", windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: "DupModalWindow-\(suffix)", windowIdentifier: nil
             )
         }
     }
@@ -236,21 +228,22 @@ struct QSemanticWindowModalStateReadTests {
     func modalTrueReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "ModalTrue-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeModalStateTestWindow(in: fixture, title: "ModalTrue-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let session = NSApp.beginModalSession(for: window)
+        try await fixture.startModalSession(identifier: window)
         // A single, non-blocking pump — `runModalSession(_:)` processes one batch of pending
         // events and returns immediately; it never blocks the way `runModal(for:)` would, and is
         // the documented way to keep a modal session's internal state current without an
         // indefinite run loop. Cleaned up in the same scope, never left active after this test.
-        _ = NSApp.runModalSession(session)
-        defer { NSApp.endModalSession(session) }
+        _ = try await fixture.applicationOperation("pumpModalSession")
+        // Ended by the fixture's own teardown (fixture.stop() ends its process and the session).
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "ModalTrue-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ModalTrue-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.isModal == true)
     }
@@ -260,12 +253,13 @@ struct QSemanticWindowModalStateReadTests {
     func modalFalseReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "ModalFalse-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "ModalFalse-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "ModalFalse-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ModalFalse-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.isModal == false)
     }
@@ -312,12 +306,13 @@ struct QSemanticWindowModalStateReadTests {
     func exactWindowIdentityEchoedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "IdentityCheck-\(suffix)", identifier: "identity-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "IdentityCheck-\(suffix)", identifier: "identity-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "IdentityCheck-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "IdentityCheck-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.windowTitle == "IdentityCheck-\(suffix)")
         #expect(metadata.windowIdentifier == "identity-\(suffix)")
@@ -349,17 +344,18 @@ struct QSemanticWindowModalStateReadTests {
     func neverBeginsEndsSessionOrMutatesWindow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "NoSessionSideEffect-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeModalStateTestWindow(in: fixture, title: "NoSessionSideEffect-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
-        let wasKeyBefore = window.isKeyWindow
+        let wasKeyBefore = try await fixture.bool(window, "isKeyWindow")
 
         _ = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "NoSessionSideEffect-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "NoSessionSideEffect-\(suffix)", windowIdentifier: nil
         )
         // The read itself never calls beginModalSession/endModalSession/makeKey/etc. — the
         // window's own key-window state is unaffected by the read.
-        #expect(window.isKeyWindow == wasKeyBefore)
+        #expect(try await fixture.bool(window, "isKeyWindow") == wasKeyBefore)
     }
 
     @Test("18. QPermissionGate.evaluate returns .allow (never .requireApproval) for ui.read_window_modal_state — routed through the real gate, not bypassed")
@@ -409,8 +405,9 @@ struct QSemanticWindowModalStateReadTests {
     func durableSnapshotContainsOnlyStructuralState() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "DurablePrivacy-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "DurablePrivacy-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -423,7 +420,7 @@ struct QSemanticWindowModalStateReadTests {
                   "actionName": "ui.read_window_modal_state",
                   "toolFamily": "ui",
                   "description": "Read a window's modal state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "DurablePrivacy-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "DurablePrivacy-\(suffix)"}
                 }
               ]
             }
@@ -449,7 +446,7 @@ struct QSemanticWindowModalStateReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_window_modal_state" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("22. No raw AXUIElement reference is ever persisted — structural proof: QAXWindowModalStateMetadata's stored properties are String?/Bool only, no AXUIElement-typed field exists anywhere in the declaration")
@@ -465,8 +462,9 @@ struct QSemanticWindowModalStateReadTests {
     func noArbitraryWindowContentPersisted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "NoArbitraryContent-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeModalStateTestWindow(in: fixture, title: "NoArbitraryContent-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -479,7 +477,7 @@ struct QSemanticWindowModalStateReadTests {
                   "actionName": "ui.read_window_modal_state",
                   "toolFamily": "ui",
                   "description": "Read a window's modal state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "NoArbitraryContent-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "NoArbitraryContent-\(suffix)"}
                 }
               ]
             }
@@ -632,22 +630,23 @@ struct QSemanticWindowModalStateReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let window = makeModalStateTestWindow(title: "E2EModalState-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let window = try await makeModalStateTestWindow(in: fixture, title: "E2EModalState-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let beforeSession = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "E2EModalState-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "E2EModalState-\(suffix)", windowIdentifier: nil
         )
         #expect(beforeSession.isModal == false)
 
-        let session = NSApp.beginModalSession(for: window)
-        _ = NSApp.runModalSession(session) // single, non-blocking pump — never loops, never blocks
-        defer { NSApp.endModalSession(session) } // always cleaned up, session never left active
+        try await fixture.startModalSession(identifier: window)
+        _ = try await fixture.applicationOperation("pumpModalSession") // single, non-blocking pump — never loops, never blocks
+        // Ended by the fixture's own teardown (fixture.stop() ends its process and the session).
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let duringSession = try await QBridgeAccessibility.shared.readWindowModalState(
-            applicationName: currentProcessAppName, windowTitle: "E2EModalState-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "E2EModalState-\(suffix)", windowIdentifier: nil
         )
         // The actual AX attribute is observed directly — success here is never inferred merely
         // because the AppKit modal-session API was called.
