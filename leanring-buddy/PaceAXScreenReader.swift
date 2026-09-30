@@ -51,6 +51,13 @@ final class PaceAXScreenReader {
     // use the raw role strings here so every role is reachable.
     private static let axLinkRoleString = "AXLink"
 
+    /// Roles whose AXValue is copied verbatim into the element's text.
+    private static let rolesWithVerbatimText: Set<String> = [
+        kAXStaticTextRole as String,
+        kAXTextFieldRole as String,
+        kAXTextAreaRole as String
+    ]
+
     private static let interestingAXRoles: Set<String> = [
         kAXButtonRole as String,
         axLinkRoleString,
@@ -312,7 +319,8 @@ final class PaceAXScreenReader {
                let element = makeScreenElement(
                    from: menuBarItem,
                    role: role,
-                   pixelScaleFactor: pixelScaleFactor
+                   pixelScaleFactor: pixelScaleFactor,
+                   mayCopyVerbatimText: mayCopyVerbatimText(from: menuBarItem, role: role)
                ) {
                 collectedElements.append(element)
             }
@@ -333,15 +341,27 @@ final class PaceAXScreenReader {
     ) {
         guard Date() < deadline else { return }
 
-        if let role = stringAttribute(kAXRoleAttribute as String, of: element),
+        let role = stringAttribute(kAXRoleAttribute as String, of: element)
+
+        // Password-field boundary: a real password field reports role AXTextField with subrole
+        // AXSecureTextField, and its AXValue is a mask with the password's exact length. Only
+        // elements whose value would be copied are classified (keeping the walk within its
+        // deadline); a secure or indeterminate one contributes no value text and is not walked
+        // into, so nothing from inside a password field reaches the planner prompt.
+        let mayCopyVerbatimText = mayCopyVerbatimText(from: element, role: role)
+
+        if let role,
            Self.interestingAXRoles.contains(role),
            let elementInPixels = makeScreenElement(
                from: element,
                role: role,
-               pixelScaleFactor: pixelScaleFactor
+               pixelScaleFactor: pixelScaleFactor,
+               mayCopyVerbatimText: mayCopyVerbatimText
            ) {
             collectedElements.append(elementInPixels)
         }
+
+        guard mayCopyVerbatimText else { return }
 
         var childrenValue: CFTypeRef?
         let childrenResult = AXUIElementCopyAttributeValue(
@@ -365,13 +385,22 @@ final class PaceAXScreenReader {
         }
     }
 
+    /// Whether this element's AXValue may be copied into planner context. Only elements whose value
+    /// would be copied are classified, with the same `QAXSecureTextElementPolicy` QBridge uses; a
+    /// secure (password) or indeterminate one never contributes its value.
+    private func mayCopyVerbatimText(from element: AXUIElement, role: String?) -> Bool {
+        guard let role, Self.rolesWithVerbatimText.contains(role) else { return true }
+        return QAXSecureTextElementPolicy.classify(element: element, knownRole: role) == .notSecure
+    }
+
     /// Pull frame + label + text content off one AX element and
     /// package it as a `LocalVLMScreenElement`. Returns nil for
     /// elements with no frame (off-screen, hidden) or no useful label.
     private func makeScreenElement(
         from element: AXUIElement,
         role: String,
-        pixelScaleFactor: CGFloat
+        pixelScaleFactor: CGFloat,
+        mayCopyVerbatimText: Bool
     ) -> LocalVLMScreenElement? {
         guard let pointFrame = frameAttribute(of: element),
               pointFrame.width > 1,
@@ -390,7 +419,7 @@ final class PaceAXScreenReader {
         ]
 
         let shortLabel = labelFor(element: element, role: role)
-        let verbatimText = verbatimTextFor(element: element, role: role)
+        let verbatimText = mayCopyVerbatimText ? verbatimTextFor(element: element, role: role) : nil
         guard shortLabel != nil || verbatimText != nil else {
             // Nothing readable here. Skip — empty entries just bloat
             // the planner prompt.
@@ -432,12 +461,7 @@ final class PaceAXScreenReader {
     /// might want to reference. Skipped for buttons / images / etc.
     /// where the title is the meaningful label.
     private func verbatimTextFor(element: AXUIElement, role: String) -> String? {
-        let rolesWithVerbatimText: Set<String> = [
-            kAXStaticTextRole as String,
-            kAXTextFieldRole as String,
-            kAXTextAreaRole as String
-        ]
-        guard rolesWithVerbatimText.contains(role) else { return nil }
+        guard Self.rolesWithVerbatimText.contains(role) else { return nil }
         guard let valueString = stringAttribute(kAXValueAttribute as String, of: element),
               !valueString.isEmpty else {
             return nil

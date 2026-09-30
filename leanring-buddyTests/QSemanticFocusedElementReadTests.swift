@@ -322,7 +322,12 @@ struct QSemanticFocusedElementReadTests {
         let snapshot = try await QBridgeAccessibility.shared.readFocusedElement(
             applicationName: currentProcessAppName, windowTitle: nil
         )
-        #expect(snapshot.role == "AXSecureTextField")
+        // A real NSSecureTextField reports role AXTextField with subrole AXSecureTextField
+        // (kAXSecureTextFieldSubrole; observed cross-process for AppKit, SwiftUI and WebKit
+        // password fields). Both are asserted, so the field is neither mislabelled nor treated as
+        // an ordinary text field.
+        #expect(snapshot.role == "AXTextField")
+        #expect(snapshot.subrole == "AXSecureTextField")
         #expect(snapshot.identifier == "secure-focused-\(suffix)")
         // The password itself must NEVER appear anywhere in the result.
         #expect(snapshot.value == nil)
