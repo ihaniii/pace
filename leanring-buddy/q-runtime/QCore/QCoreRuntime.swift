@@ -1456,6 +1456,11 @@ public final class QCoreRuntime: @unchecked Sendable {
                 observer: observer
             )
 
+            // Persist what this resume actually executed, mirroring submitIntent. Without this the
+            // durable plan stays frozen at the pre-approval snapshot (halted step, no result), so
+            // completed/failed/cancelled resumes lose each step's state and verifiedEvidence.
+            try? durableStore?.savePlan(QDurablePlanSnapshot(from: executedPlan))
+
             // Phase 4.4: Handle cancelled resumed plan
             if case .cancelled(let reason) = executedPlan.state {
                 var task = taskState.toTask()
