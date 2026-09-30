@@ -33,6 +33,9 @@
 //  codebase already established. See docs/PHASE_2CD_SEMANTIC_PLACEHOLDER_VALUE.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -40,34 +43,31 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSTextField` — the natural fixture shape for a placeholder-bearing
 /// control, mirroring `ui.read_element_help_text`'s own real E2E `NSButton` fixture but using the
 /// control type placeholder text actually applies to.
-@MainActor
-private func makeTextFieldWindow(identifier: String, stringValue: String = "") -> (window: NSWindow, textField: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, stringValue: String = ""
+) async throws -> (window: String, textField: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementPlaceholderValueReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 24),
+        properties: ["stringValue": stringValue, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementPlaceholderValueReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let textField = NSTextField(frame: NSRect(x: 20, y: 20, width: 180, height: 24))
-    textField.stringValue = stringValue
-    textField.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(textField)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, textField)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class PlaceholderValueMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -192,9 +192,11 @@ struct QSemanticElementPlaceholderValueReadTests {
     @MainActor
     func secureFieldRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -206,13 +208,14 @@ struct QSemanticElementPlaceholderValueReadTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "wrongrole-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "wrongrole-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -220,16 +223,18 @@ struct QSemanticElementPlaceholderValueReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_placeholder_value", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read placeholder value",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTextField"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTextField"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-placeholder"))
         #expect(result.success == false)
@@ -250,10 +255,12 @@ struct QSemanticElementPlaceholderValueReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_placeholder_value", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read placeholder value",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-placeholder"))
         #expect(result.success == false)
@@ -277,13 +284,14 @@ struct QSemanticElementPlaceholderValueReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -296,24 +304,17 @@ struct QSemanticElementPlaceholderValueReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupField-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let fieldA = NSTextField(frame: NSRect(x: 10, y: 10, width: 150, height: 24))
-        fieldA.setAccessibilityIdentifier(sharedIdentifier)
-        let fieldB = NSTextField(frame: NSRect(x: 10, y: 100, width: 150, height: 24))
-        fieldB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(fieldA)
-        container.addSubview(fieldB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 150, height: 24), properties: ["accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 150, height: 24), properties: ["accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -413,15 +414,16 @@ struct QSemanticElementPlaceholderValueReadTests {
     func neverMutatesFieldNeverReadsRawValue() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, textField) = makeTextFieldWindow(identifier: "nomutate-\(suffix)", stringValue: "untouched")
-        textField.placeholderString = "Search"
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: "nomutate-\(suffix)", stringValue: "untouched")
+        try await fixture.set(textField, "placeholderString", "Search")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(textField.stringValue == "untouched")
+        #expect(try await fixture.string(textField, "stringValue") == "untouched")
     }
 
     // MARK: - 18. No traversal / 19. No polling / 20. No retries / 21. Bounded resource accounting
@@ -433,10 +435,12 @@ struct QSemanticElementPlaceholderValueReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_placeholder_value exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_placeholder_value", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read placeholder value", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTextField", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTextField", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-placeholder"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -601,9 +605,10 @@ struct QSemanticElementPlaceholderValueReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "DurableField-\(suffix)"
-        let (window, textField) = makeTextFieldWindow(identifier: sentinelIdentifier)
-        textField.placeholderString = "Search"
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: sentinelIdentifier)
+        try await fixture.set(textField, "placeholderString", "Search")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -616,7 +621,7 @@ struct QSemanticElementPlaceholderValueReadTests {
                   "actionName": "ui.read_element_placeholder_value",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's placeholder value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -642,7 +647,7 @@ struct QSemanticElementPlaceholderValueReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_placeholder_value" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("Audit records for this capability never contain anything beyond bounded semantic UI metadata")
@@ -651,9 +656,10 @@ struct QSemanticElementPlaceholderValueReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "AuditField-\(suffix)"
-        let (window, textField) = makeTextFieldWindow(identifier: sentinelIdentifier)
-        textField.placeholderString = "Search"
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: sentinelIdentifier)
+        try await fixture.set(textField, "placeholderString", "Search")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -666,7 +672,7 @@ struct QSemanticElementPlaceholderValueReadTests {
                   "actionName": "ui.read_element_placeholder_value",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's placeholder value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -698,19 +704,20 @@ struct QSemanticElementPlaceholderValueReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, textField) = makeTextFieldWindow(identifier: identifier)
-        textField.placeholderString = "Search"
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: identifier)
+        try await fixture.set(textField, "placeholderString", "Search")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
         #expect(first?.placeholderValue == second?.placeholderValue)
-        #expect(textField.stringValue.isEmpty)
+        #expect(try await fixture.string(textField, "stringValue").isEmpty)
     }
 
     // MARK: - 25. Capability-count integrity
@@ -764,29 +771,30 @@ struct QSemanticElementPlaceholderValueReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-placeholder-\(suffix)"
-        let (window, textField) = makeTextFieldWindow(identifier: identifier)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeTextFieldWindow(in: fixture, identifier: identifier)
 
         // Force a deterministic, known placeholder string via the real, declared AppKit accessor
         // (placeholderString, NSTextField) — the same genuine forced-value round-trip pattern
         // ui.read_element_help_text's own E2E test established for setAccessibilityHelp.
-        textField.placeholderString = "Search"
-        #expect(textField.placeholderString == "Search")
+        try await fixture.set(textField, "placeholderString", "Search")
+        #expect((try await fixture.optionalString(textField, "placeholderString")) == "Search")
 
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
 
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
         #expect(metadata?.placeholderValue == "Search")
-        #expect(metadata?.placeholderValue == textField.placeholderString)
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.placeholderValue == (try await fixture.optionalString(textField, "placeholderString")))
+        #expect(metadata?.applicationName == fixture.applicationName)
         // The read never mutated the fixture's own state.
-        #expect(textField.stringValue.isEmpty)
+        #expect(try await fixture.string(textField, "stringValue").isEmpty)
     }
 
     @Test("E2E. Real macOS AppKit E2E — a genuine NSTextField with no placeholder set correctly reports honest absence via the optional-reference contract (guarded by AXIsProcessTrusted)")
@@ -797,12 +805,13 @@ struct QSemanticElementPlaceholderValueReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-noplaceholder-\(suffix)"
-        let (window, _) = makeTextFieldWindow(identifier: identifier)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: identifier)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementPlaceholderValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
 
         // An ordinary NSTextField with no placeholder ever set is the common, expected case —

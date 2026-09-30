@@ -16,6 +16,9 @@
 //    - Verified via closed-loop independent re-observation (axComboBoxValueMatchesDesired)
 //    - Level 2 — requires explicit single-use user approval bound to execution identity
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -25,37 +28,32 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit Fixtures
 
-@MainActor
+/// A real NSComboBox with the given items in a titled window, built inside the out-of-process
+/// PaceAXFixtureHost (never in this XCTest host) with the same geometry the in-process helper
+/// used; an item is selected only when `selectedIndex` is in range, exactly as before. Returns the
+/// fixture window token and the combo box's fixture handle (also its AX identifier).
 private func makeComboBoxWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     items: [String],
     selectedIndex: Int = 0
-) -> (window: NSWindow, comboBox: NSComboBox) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticComboBoxSelectionTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let comboBox = NSComboBox(frame: NSRect(x: 20, y: 20, width: 200, height: 24))
-    comboBox.addItems(withObjectValues: items)
+) async throws -> (window: String, comboBox: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticComboBoxSelectionTestFixture", width: 300, height: 80, styles: ["titled"])
+    var properties: [String: Any] = ["items": items]
     if selectedIndex >= 0 && selectedIndex < items.count {
-        comboBox.selectItem(at: selectedIndex)
+        properties["indexOfSelectedItem"] = selectedIndex
     }
-    comboBox.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(comboBox)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, comboBox)
+    try await fixture.addControl(
+        kind: "comboBox",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 200, height: 24),
+        properties: properties
+    )
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticComboBoxSelectionTests")
 struct QSemanticComboBoxSelectionTests {
@@ -204,13 +202,15 @@ struct QSemanticComboBoxSelectionTests {
 
     @Test("8. Missing selection criteria (neither itemTitle nor itemIndex) fails closed")
     func missingSelectionCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_combo_box_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select combo box item",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "state.cb"
             ]
         )
@@ -221,13 +221,15 @@ struct QSemanticComboBoxSelectionTests {
 
     @Test("9. Invalid/malformed itemIndex string fails closed")
     func malformedItemIndexFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_combo_box_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select combo box item",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "state.cb",
                 "itemIndex": "notAnIndex"
             ]
@@ -239,13 +241,15 @@ struct QSemanticComboBoxSelectionTests {
 
     @Test("10. Disallowed role (AXPopUpButton) fails closed with AX_DISALLOWED_ROLE")
     func disallowedRolePopUpButtonFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_combo_box_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select combo box item",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXPopUpButton",
                 "itemTitle": "Option A"
             ]
@@ -257,13 +261,15 @@ struct QSemanticComboBoxSelectionTests {
 
     @Test("11. Disallowed role (AXButton) fails closed with AX_DISALLOWED_ROLE")
     func disallowedRoleButtonFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_combo_box_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select combo box item",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXButton",
                 "itemTitle": "Option A"
             ]
@@ -481,13 +487,15 @@ struct QSemanticComboBoxSelectionTests {
 
     @Test("20. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_combo_box_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select combo box item",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "identifier": "state.cb",
                 "windowTitle": "DefinitelyNonExistentWindow_99999",
                 "itemTitle": "Option A"
@@ -525,12 +533,13 @@ struct QSemanticComboBoxSelectionTests {
     func liveAppKitComboBoxSelection() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, comboBox) = makeComboBoxWindow(identifier: "fixture-cb-\(suffix)", items: ["Alpha", "Beta", "Gamma"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, comboBox) = try await makeComboBoxWindow(in: fixture, identifier: "fixture-cb-\(suffix)", items: ["Alpha", "Beta", "Gamma"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectComboBoxItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXComboBox",
             identifier: "fixture-cb-\(suffix)",
             title: nil,
@@ -541,7 +550,7 @@ struct QSemanticComboBoxSelectionTests {
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.requestedItemTitle == "Beta")
-        #expect(comboBox.stringValue == "Beta")
+        #expect(try await fixture.string(comboBox, "stringValue") == "Beta")
     }
 
     @Test("24. Live AppKit combo box idempotent selection when already selected")
@@ -549,12 +558,13 @@ struct QSemanticComboBoxSelectionTests {
     func liveAppKitComboBoxIdempotentSelection() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, comboBox) = makeComboBoxWindow(identifier: "fixture-cb-noop-\(suffix)", items: ["Alpha", "Beta", "Gamma"], selectedIndex: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, comboBox) = try await makeComboBoxWindow(in: fixture, identifier: "fixture-cb-noop-\(suffix)", items: ["Alpha", "Beta", "Gamma"], selectedIndex: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectComboBoxItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXComboBox",
             identifier: "fixture-cb-noop-\(suffix)",
             title: nil,
@@ -565,7 +575,7 @@ struct QSemanticComboBoxSelectionTests {
         )
         #expect(outcome.changeKind == .alreadySelected)
         #expect(outcome.previousValue == "Beta")
-        #expect(comboBox.stringValue == "Beta")
+        #expect(try await fixture.string(comboBox, "stringValue") == "Beta")
     }
 
     @Test("25. Real macOS accessibility trust guard probe runs safely without crashing")

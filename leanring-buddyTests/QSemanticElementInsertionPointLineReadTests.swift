@@ -31,6 +31,9 @@
 //  codebase already established. See docs/PHASE_2CJ_SEMANTIC_INSERTION_POINT_LINE.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -38,9 +41,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -52,31 +52,29 @@ private var currentProcessAppName: String {
 /// `setAccessibilityEdited` already established as proven-working for forcing a deterministic AX
 /// state — this attribute sits in the same general per-element property cluster (not gated
 /// behind any specialized protocol, unlike `ui.read_element_index`'s `accessibilityIndex`).
-@MainActor
+/// Fixture-backed replacement for the in-process `makeInsertionPointLineTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
 private func makeInsertionPointLineTextFieldWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     lineNumber: Int? = nil
-) -> (window: NSWindow, textField: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, textField: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementInsertionPointLineReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 24),
+        properties: ["stringValue": "Line content", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementInsertionPointLineReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let textField = NSTextField(frame: NSRect(x: 20, y: 20, width: 180, height: 24))
-    textField.stringValue = "Line content"
-    textField.setAccessibilityIdentifier(identifier)
     if let lineNumber {
-        textField.setAccessibilityInsertionPointLineNumber(lineNumber)
+        try await fixture.setAccessibility(identifier, "insertionPointLineNumber", lineNumber)
     }
-    contentView.addSubview(textField)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, textField)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementInsertionPointLineMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -158,12 +156,13 @@ struct QSemanticElementInsertionPointLineReadTests {
     func nonZeroLineNumberReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "line2-\(suffix)", lineNumber: 2)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "line2-\(suffix)", lineNumber: 2)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "line2-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "line2-\(suffix)", title: nil
         )
         #expect(metadata.lineNumber == 2)
     }
@@ -175,12 +174,13 @@ struct QSemanticElementInsertionPointLineReadTests {
     func zeroLineNumberReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "line0-\(suffix)", lineNumber: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "line0-\(suffix)", lineNumber: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "line0-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "line0-\(suffix)", title: nil
         )
         #expect(metadata.lineNumber == 0)
     }
@@ -192,17 +192,18 @@ struct QSemanticElementInsertionPointLineReadTests {
     func genuineAbsenceDoesNotThrow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "unset-\(suffix)", lineNumber: nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "unset-\(suffix)", lineNumber: nil)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "unset-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "unset-\(suffix)", title: nil
         )
         // Whatever AppKit's real, honest answer is (nil absence, or a genuine value actually
         // reported by the OS) is accepted here — the CONTRACT under test is that no exception was
         // thrown merely because the attribute was never explicitly set.
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     @Test("4/5. kAXErrorNoValue and kAXErrorAttributeUnsupported are both treated identically as genuine, expected absence — never an error, never converted to 0 (structural, by direct inspection of resolveElementInsertionPointLine's single absence branch)")
@@ -247,13 +248,14 @@ struct QSemanticElementInsertionPointLineReadTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "present-\(suffix)", lineNumber: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "present-\(suffix)", lineNumber: 1)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -265,24 +267,17 @@ struct QSemanticElementInsertionPointLineReadTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldA.setAccessibilityIdentifier("dup-insertion-point-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        fieldB.setAccessibilityIdentifier("dup-insertion-point-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-insertion-point-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-insertion-point-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-insertion-point-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-insertion-point-\(suffix)", title: nil
             )
         }
     }
@@ -315,10 +310,12 @@ struct QSemanticElementInsertionPointLineReadTests {
 
     @Test("14. Disallowed roles are rejected before any AX search is even attempted — QAXElementReadRolePolicy reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea"] {
             await #expect(throws: QAXInteractionError.disallowedReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -326,9 +323,11 @@ struct QSemanticElementInsertionPointLineReadTests {
 
     @Test("14b. AXSecureTextField is rejected before any AX search, mirroring every prior read capability's identical secure-field precedent")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -415,15 +414,16 @@ struct QSemanticElementInsertionPointLineReadTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, textField) = makeInsertionPointLineTextFieldWindow(identifier: "nomutate-\(suffix)", lineNumber: 3)
-        let stringValueBefore = textField.stringValue
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "nomutate-\(suffix)", lineNumber: 3)
+        let stringValueBefore = try await fixture.string(textField, "stringValue")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(textField.stringValue == stringValueBefore)
+        #expect(try await fixture.string(textField, "stringValue") == stringValueBefore)
     }
 
     @Test("22. An uncertain in-flight insertion-point-line-read step fails closed to pending, and recovery never replays or persists any line-number value that could be treated as standing authorization")
@@ -476,8 +476,9 @@ struct QSemanticElementInsertionPointLineReadTests {
     func evidenceOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "durable-\(suffix)", lineNumber: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "durable-\(suffix)", lineNumber: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -490,7 +491,7 @@ struct QSemanticElementInsertionPointLineReadTests {
                   "actionName": "ui.read_element_insertion_point_line_number",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's insertion point line number",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -516,7 +517,7 @@ struct QSemanticElementInsertionPointLineReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_insertion_point_line_number" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability contain only permitted structural metadata — no arbitrary window/document content ever appears")
@@ -524,8 +525,9 @@ struct QSemanticElementInsertionPointLineReadTests {
     func auditOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeInsertionPointLineTextFieldWindow(identifier: "audit-\(suffix)", lineNumber: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "audit-\(suffix)", lineNumber: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -538,7 +540,7 @@ struct QSemanticElementInsertionPointLineReadTests {
                   "actionName": "ui.read_element_insertion_point_line_number",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's insertion point line number",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -570,18 +572,19 @@ struct QSemanticElementInsertionPointLineReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, textField) = makeInsertionPointLineTextFieldWindow(identifier: identifier, lineNumber: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, textField) = try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: identifier, lineNumber: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: identifier, title: nil
         )
         #expect(first.lineNumber == second.lineNumber)
-        #expect(textField.stringValue == "Line content")
+        #expect(try await fixture.string(textField, "stringValue") == "Line content")
     }
 
     // MARK: - Verification
@@ -712,10 +715,12 @@ struct QSemanticElementInsertionPointLineReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_insertion_point_line_number exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_insertion_point_line_number", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read insertion point line number", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTextField", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTextField", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-insertion-point-line"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -735,10 +740,12 @@ struct QSemanticElementInsertionPointLineReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_insertion_point_line_number", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read insertion point line number",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-insertion-point-line"))
         #expect(result.success == false)
@@ -748,16 +755,18 @@ struct QSemanticElementInsertionPointLineReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_insertion_point_line_number", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read insertion point line number",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTextField"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTextField"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-insertion-point-line"))
         #expect(result.success == false)
@@ -785,25 +794,25 @@ struct QSemanticElementInsertionPointLineReadTests {
         }
         let suffix = UUID().uuidString
 
-        let (thirdWindow, thirdField) = makeInsertionPointLineTextFieldWindow(identifier: "e2e-third-\(suffix)", lineNumber: 3)
-        defer { thirdWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (thirdWindow, thirdField) = try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "e2e-third-\(suffix)", lineNumber: 3)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let thirdMetadata = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-third-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-third-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        #expect(thirdMetadata.lineNumber == thirdField.accessibilityInsertionPointLineNumber())
+        #expect(thirdMetadata.lineNumber == (try await fixture.int(thirdField, "accessibility:insertionPointLineNumber")))
         #expect(thirdMetadata.lineNumber == 3)
 
-        let (firstWindow, firstField) = makeInsertionPointLineTextFieldWindow(identifier: "e2e-first-\(suffix)", lineNumber: 0)
-        defer { firstWindow.close() }
+        let (firstWindow, firstField) = try await makeInsertionPointLineTextFieldWindow(in: fixture, identifier: "e2e-first-\(suffix)", lineNumber: 0)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let firstMetadata = try await QBridgeAccessibility.shared.readElementInsertionPointLine(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-first-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-first-\(suffix)", title: nil
         )
-        #expect(firstMetadata.lineNumber == firstField.accessibilityInsertionPointLineNumber())
+        #expect(firstMetadata.lineNumber == (try await fixture.int(firstField, "accessibility:insertionPointLineNumber")))
         #expect(firstMetadata.lineNumber == 0)
     }
 }

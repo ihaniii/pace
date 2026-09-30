@@ -28,6 +28,9 @@
 //  codebase already established. See docs/PHASE_2CE_SEMANTIC_EXPANDED_STATE.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -35,9 +38,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -46,28 +46,28 @@ private var currentProcessAppName: String {
 /// protocol, `NSAccessibilityProtocols.h`), the same declared-accessor pattern
 /// `ui.read_element_help_text`'s `setAccessibilityHelp`/`ui.read_element_placeholder_value`'s
 /// `placeholderString` already established as proven-working for forcing a deterministic AX state.
-@MainActor
-private func makePopUpButtonWindow(identifier: String, expanded: Bool? = nil) -> (window: NSWindow, popUpButton: NSPopUpButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makePopUpButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makePopUpButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, expanded: Bool? = nil
+) async throws -> (window: String, popUpButton: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementExpandedStateReadTestFixture", width: 220, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "popUpButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 180, height: 24),
+        properties: ["items": ["One", "Two", "Three"], "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementExpandedStateReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 80))
-    let popUpButton = NSPopUpButton(frame: NSRect(x: 20, y: 20, width: 180, height: 24))
-    popUpButton.addItems(withTitles: ["One", "Two", "Three"])
-    popUpButton.setAccessibilityIdentifier(identifier)
     if let expanded {
-        popUpButton.setAccessibilityExpanded(expanded)
+        try await fixture.setAccessibility(identifier, "expanded", expanded)
     }
-    contentView.addSubview(popUpButton)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, popUpButton)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementExpandedStateMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -149,12 +149,13 @@ struct QSemanticElementExpandedStateReadTests {
     func expandedTrueReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "expanded-\(suffix)", expanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "expanded-\(suffix)", expanded: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "expanded-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "expanded-\(suffix)", title: nil
         )
         #expect(metadata.isExpanded == true)
     }
@@ -166,12 +167,13 @@ struct QSemanticElementExpandedStateReadTests {
     func expandedFalseReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "notexpanded-\(suffix)", expanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "notexpanded-\(suffix)", expanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "notexpanded-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "notexpanded-\(suffix)", title: nil
         )
         #expect(metadata.isExpanded == false)
     }
@@ -183,17 +185,18 @@ struct QSemanticElementExpandedStateReadTests {
     func genuineAbsenceDoesNotThrow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "unset-\(suffix)", expanded: nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "unset-\(suffix)", expanded: nil)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "unset-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "unset-\(suffix)", title: nil
         )
         // Whatever AppKit's real, honest answer is (nil absence, or a genuine value actually
         // reported by the OS) is accepted here — the CONTRACT under test is that no exception was
         // thrown merely because the attribute was never explicitly set.
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     @Test("4/5. kAXErrorNoValue and kAXErrorAttributeUnsupported are both treated identically as genuine, expected absence — never an error, never converted to false (structural, by direct inspection of resolveElementExpandedState's single absence branch)")
@@ -237,13 +240,14 @@ struct QSemanticElementExpandedStateReadTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makePopUpButtonWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -255,26 +259,17 @@ struct QSemanticElementExpandedStateReadTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let popUpA = NSPopUpButton(frame: NSRect(x: 20, y: 20, width: 180, height: 24))
-        popUpA.addItems(withTitles: ["A1", "A2"])
-        popUpA.setAccessibilityIdentifier("dup-expanded-\(suffix)")
-        let popUpB = NSPopUpButton(frame: NSRect(x: 20, y: 60, width: 180, height: 24))
-        popUpB.addItems(withTitles: ["B1", "B2"])
-        popUpB.setAccessibilityIdentifier("dup-expanded-\(suffix)")
-        contentView.addSubview(popUpA)
-        contentView.addSubview(popUpB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "popUpButton", identifier: "inline-popUpA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 180, height: 24), properties: ["items": ["A1", "A2"], "accessibilityIdentifier": "dup-expanded-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "popUpButton", identifier: "inline-popUpB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 180, height: 24), properties: ["items": ["B1", "B2"], "accessibilityIdentifier": "dup-expanded-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "dup-expanded-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "dup-expanded-\(suffix)", title: nil
             )
         }
     }
@@ -307,10 +302,12 @@ struct QSemanticElementExpandedStateReadTests {
 
     @Test("14. Disallowed roles are rejected before any AX search is even attempted — QAXElementReadRolePolicy reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea"] {
             await #expect(throws: QAXInteractionError.disallowedReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -318,9 +315,11 @@ struct QSemanticElementExpandedStateReadTests {
 
     @Test("14b. AXSecureTextField is rejected before any AX search, mirroring every prior read capability's identical secure-field precedent")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -401,16 +400,17 @@ struct QSemanticElementExpandedStateReadTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popUpButton) = makePopUpButtonWindow(identifier: "nomutate-\(suffix)", expanded: true)
-        popUpButton.selectItem(at: 1)
-        let selectedIndexBefore = popUpButton.indexOfSelectedItem
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popUpButton) = try await makePopUpButtonWindow(in: fixture, identifier: "nomutate-\(suffix)", expanded: true)
+        try await fixture.set(popUpButton, "indexOfSelectedItem", 1)
+        let selectedIndexBefore = try await fixture.int(popUpButton, "indexOfSelectedItem")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(popUpButton.indexOfSelectedItem == selectedIndexBefore)
+        #expect(try await fixture.int(popUpButton, "indexOfSelectedItem") == selectedIndexBefore)
     }
 
     @Test("22. An uncertain in-flight expanded-state-read step fails closed to pending, and recovery never replays or persists any expanded-state value that could be treated as standing authorization")
@@ -463,8 +463,9 @@ struct QSemanticElementExpandedStateReadTests {
     func evidenceOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "durable-\(suffix)", expanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "durable-\(suffix)", expanded: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -477,7 +478,7 @@ struct QSemanticElementExpandedStateReadTests {
                   "actionName": "ui.read_element_expanded_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's expanded state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -503,7 +504,7 @@ struct QSemanticElementExpandedStateReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_expanded_state" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability contain only permitted structural metadata — no arbitrary window/document content ever appears")
@@ -511,8 +512,9 @@ struct QSemanticElementExpandedStateReadTests {
     func auditOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "audit-\(suffix)", expanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "audit-\(suffix)", expanded: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -525,7 +527,7 @@ struct QSemanticElementExpandedStateReadTests {
                   "actionName": "ui.read_element_expanded_state",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's expanded state",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -654,10 +656,12 @@ struct QSemanticElementExpandedStateReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_expanded_state exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_expanded_state", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read expanded state", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXPopUpButton", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXPopUpButton", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-expanded"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -677,10 +681,12 @@ struct QSemanticElementExpandedStateReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_expanded_state", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read expanded state",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-expanded"))
         #expect(result.success == false)
@@ -690,16 +696,18 @@ struct QSemanticElementExpandedStateReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementExpandedState(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_expanded_state", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read expanded state",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXPopUpButton"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXPopUpButton"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-expanded"))
         #expect(result.success == false)
@@ -727,24 +735,24 @@ struct QSemanticElementExpandedStateReadTests {
         }
         let suffix = UUID().uuidString
 
-        let (expandedWindow, expandedPopUp) = makePopUpButtonWindow(identifier: "e2e-expanded-\(suffix)", expanded: true)
-        defer { expandedWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (expandedWindow, expandedPopUp) = try await makePopUpButtonWindow(in: fixture, identifier: "e2e-expanded-\(suffix)", expanded: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let expandedMetadata = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "e2e-expanded-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "e2e-expanded-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        #expect(expandedMetadata.isExpanded == expandedPopUp.isAccessibilityExpanded())
+        #expect(expandedMetadata.isExpanded == (try await fixture.bool(expandedPopUp, "accessibility:expanded")))
 
-        let (collapsedWindow, collapsedPopUp) = makePopUpButtonWindow(identifier: "e2e-notexpanded-\(suffix)", expanded: false)
-        defer { collapsedWindow.close() }
+        let (collapsedWindow, collapsedPopUp) = try await makePopUpButtonWindow(in: fixture, identifier: "e2e-notexpanded-\(suffix)", expanded: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let collapsedMetadata = try await QBridgeAccessibility.shared.readElementExpandedState(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "e2e-notexpanded-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "e2e-notexpanded-\(suffix)", title: nil
         )
-        #expect(collapsedMetadata.isExpanded == collapsedPopUp.isAccessibilityExpanded())
+        #expect(collapsedMetadata.isExpanded == (try await fixture.bool(collapsedPopUp, "accessibility:expanded")))
         #expect(collapsedMetadata.isExpanded == false)
     }
 }

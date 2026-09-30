@@ -36,6 +36,9 @@
 //  codebase already established. See docs/PHASE_2CH_SEMANTIC_VISIBLE_CHILDREN.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -43,9 +46,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -56,45 +56,31 @@ private var currentProcessAppName: String {
 /// `QAXScrollAreaRolePolicy` chain. A small number of real `NSButton` children are placed inside
 /// the document view, positioned within the initial visible viewport (scroll position 0,0) so a
 /// genuinely-trusted AX host would report them as visible children.
-@MainActor
+/// Fixture-backed replacement for the in-process `makeScrollableWindowWithVisibleButtons`: the same
+/// window, legacy-scroller scroll view (1200-tall document), buttons, layout and scroll-to-top the
+/// in-process helper performed, inside the out-of-process PaceAXFixtureHost. Returns the window
+/// token, the scroll view's handle and the buttons' handles.
 private func makeScrollableWindowWithVisibleButtons(
+    in fixture: PaceAXFixture,
     scrollAreaIdentifier: String,
     buttonIdentifiers: [String]
-) -> (window: NSWindow, scrollView: NSScrollView, buttons: [NSButton]) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 220),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticVisibleChildrenListTestFixture"
-    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 220, height: 220))
-    scrollView.hasVerticalScroller = true
-    scrollView.hasHorizontalScroller = false
-    scrollView.scrollerStyle = .legacy
-    scrollView.setAccessibilityIdentifier(scrollAreaIdentifier)
-
-    let documentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 1200))
-    var buttons: [NSButton] = []
+) async throws -> (window: String, scrollView: String, buttons: [String]) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticVisibleChildrenListTestFixture", width: 220, height: 220, styles: ["titled"])
+    try await fixture.addControl(kind: "scrollView", identifier: scrollAreaIdentifier, windowToken: windowToken,
+                                 frame: NSRect(x: 0, y: 0, width: 220, height: 220),
+                                 properties: ["hasHorizontalScroller": false, "scrollerStyle": "legacy", "documentWidth": 200.0, "documentHeight": 1200.0])
+    var buttons: [String] = []
     for (index, buttonIdentifier) in buttonIdentifiers.enumerated() {
-        let button = NSButton(frame: NSRect(x: 10, y: 1200 - 30 - (CGFloat(index) * 30), width: 160, height: 24))
-        button.title = "Item \(index)"
-        button.setAccessibilityIdentifier(buttonIdentifier)
-        documentView.addSubview(button)
-        buttons.append(button)
+        let buttonHandle = "\(buttonIdentifier)#\(index)"
+        try await fixture.addControl(kind: "button", identifier: buttonHandle, parentIdentifier: scrollAreaIdentifier,
+                                     frame: NSRect(x: 10, y: 1200 - 30 - (CGFloat(index) * 30), width: 160, height: 24),
+                                     properties: ["title": "Item \(index)", "accessibilityIdentifier": buttonIdentifier, "detachAction": true])
+        buttons.append(buttonHandle)
     }
-    scrollView.documentView = documentView
-
-    window.contentView = scrollView
-    window.makeKeyAndOrderFront(nil)
-    scrollView.layoutSubtreeIfNeeded()
-    // Scroll to the top so the just-added buttons (placed at the top of the document) are within
-    // the initial visible viewport.
-    scrollView.contentView.scroll(to: NSPoint(x: 0, y: 1200 - 220))
-    scrollView.reflectScrolledClipView(scrollView.contentView)
-    return (window, scrollView, buttons)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    try await fixture.perform(scrollAreaIdentifier, "layoutSubtreeIfNeeded")
+    try await fixture.set(scrollAreaIdentifier, "verticalScrollOffset", 1200.0 - 220.0)
+    return (windowToken, scrollAreaIdentifier, buttons)
 }
 
 private final class VisibleChildrenMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -210,13 +196,14 @@ struct QSemanticVisibleChildrenListTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: "wrongrole-\(suffix)", buttonIdentifiers: [])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: "wrongrole-\(suffix)", buttonIdentifiers: [])
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedScrollAreaRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -224,9 +211,11 @@ struct QSemanticVisibleChildrenListTests {
     @Test("5. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: nil, title: nil
             )
         }
     }
@@ -246,13 +235,14 @@ struct QSemanticVisibleChildrenListTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: "present-\(suffix)", buttonIdentifiers: [])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: "present-\(suffix)", buttonIdentifiers: [])
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -263,26 +253,17 @@ struct QSemanticVisibleChildrenListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupScrollArea-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollViewA = NSScrollView(frame: NSRect(x: 0, y: 0, width: 140, height: 140))
-        scrollViewA.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 140, height: 400))
-        scrollViewA.setAccessibilityIdentifier(sharedIdentifier)
-        let scrollViewB = NSScrollView(frame: NSRect(x: 150, y: 0, width: 140, height: 140))
-        scrollViewB.documentView = NSView(frame: NSRect(x: 0, y: 0, width: 140, height: 400))
-        scrollViewB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
-        container.addSubview(scrollViewA)
-        container.addSubview(scrollViewB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "scrollView", identifier: "inline-scrollViewA", windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 140, height: 140), properties: ["hasVerticalScroller": false, "documentWidth": 140.0, "documentHeight": 400.0, "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "scrollView", identifier: "inline-scrollViewB", windowToken: windowToken, frame: NSRect(x: 150, y: 0, width: 140, height: 140), properties: ["hasVerticalScroller": false, "documentWidth": 140.0, "documentHeight": 400.0, "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -372,16 +353,17 @@ struct QSemanticVisibleChildrenListTests {
     func secureFieldVisibleChildFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, scrollView, _) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: "securechild-\(suffix)", buttonIdentifiers: ["ok-\(suffix)"])
-        let secureField = NSSecureTextField(frame: NSRect(x: 10, y: 1200 - 220, width: 160, height: 24))
-        secureField.setAccessibilityIdentifier("secret-\(suffix)")
-        scrollView.documentView?.addSubview(secureField)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, scrollView, _) = try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: "securechild-\(suffix)", buttonIdentifiers: ["ok-\(suffix)"])
+        try await fixture.addControl(kind: "secureTextField", identifier: "inline-secureField", parentIdentifier: scrollView,
+                                     frame: NSRect(x: 10, y: 1200 - 220, width: 160, height: 24),
+                                     properties: ["accessibilityIdentifier": "secret-\(suffix)", "detachAction": true])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-                applicationName: currentProcessAppName, role: "AXScrollArea", identifier: "securechild-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXScrollArea", identifier: "securechild-\(suffix)", title: nil
             )
             // A genuinely-trusted host that happens not to report the secure field as visible
             // (e.g. viewport geometry differences) is still a structurally valid outcome — the
@@ -435,8 +417,9 @@ struct QSemanticVisibleChildrenListTests {
         let suffix = UUID().uuidString
         let sentinelScrollAreaIdentifier = "DurableScrollArea-\(suffix)"
         let sentinelButtonIdentifier = "SuperSecretVisibleChildSentinel-\(suffix)"
-        let (window, _, _) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: sentinelScrollAreaIdentifier, buttonIdentifiers: [sentinelButtonIdentifier])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: sentinelScrollAreaIdentifier, buttonIdentifiers: [sentinelButtonIdentifier])
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -449,7 +432,7 @@ struct QSemanticVisibleChildrenListTests {
                   "actionName": "ui.list_visible_children",
                   "toolFamily": "ui",
                   "description": "List a semantically-identified scroll area's currently visible children",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXScrollArea", "identifier": "\(sentinelScrollAreaIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXScrollArea", "identifier": "\(sentinelScrollAreaIdentifier)"}
                 }
               ]
             }
@@ -485,8 +468,9 @@ struct QSemanticVisibleChildrenListTests {
         let suffix = UUID().uuidString
         let sentinelScrollAreaIdentifier = "AuditScrollArea-\(suffix)"
         let sentinelButtonIdentifier = "SuperSecretAuditChildSentinel-\(suffix)"
-        let (window, _, _) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: sentinelScrollAreaIdentifier, buttonIdentifiers: [sentinelButtonIdentifier])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: sentinelScrollAreaIdentifier, buttonIdentifiers: [sentinelButtonIdentifier])
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -499,7 +483,7 @@ struct QSemanticVisibleChildrenListTests {
                   "actionName": "ui.list_visible_children",
                   "toolFamily": "ui",
                   "description": "List a semantically-identified scroll area's currently visible children",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXScrollArea", "identifier": "\(sentinelScrollAreaIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXScrollArea", "identifier": "\(sentinelScrollAreaIdentifier)"}
                 }
               ]
             }
@@ -559,18 +543,19 @@ struct QSemanticVisibleChildrenListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let scrollAreaIdentifier = "Repeat-\(suffix)"
-        let (window, _, buttons) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: scrollAreaIdentifier, buttonIdentifiers: ["repeat-btn-\(suffix)"])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, buttons) = try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: scrollAreaIdentifier, buttonIdentifiers: ["repeat-btn-\(suffix)"])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.listVisibleChildren(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.listVisibleChildren(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
         )
         #expect(first?.visibleChildren.count == second?.visibleChildren.count)
-        #expect(buttons.first?.title == "Item 0")
+        #expect(try await fixture.stringIfPresent(buttons.first, "title") == "Item 0")
     }
 
     @Test("31. No raw AXUIElement reference is ever persisted — structural proof: QAXVisibleChildrenMetadata's and QAXVisibleChildReference's stored properties are String?/String/[QAXVisibleChildReference] only, no AXUIElement-typed field exists anywhere in the declarations")
@@ -589,15 +574,16 @@ struct QSemanticVisibleChildrenListTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let scrollAreaIdentifier = "NoMutate-\(suffix)"
-        let (window, _, buttons) = makeScrollableWindowWithVisibleButtons(scrollAreaIdentifier: scrollAreaIdentifier, buttonIdentifiers: ["nomutate-btn-\(suffix)"])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, buttons) = try await makeScrollableWindowWithVisibleButtons(in: fixture, scrollAreaIdentifier: scrollAreaIdentifier, buttonIdentifiers: ["nomutate-btn-\(suffix)"])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.listVisibleChildren(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
         )
-        #expect(buttons.first?.title == "Item 0")
-        #expect(buttons.first?.state == .off)
+        #expect(try await fixture.stringIfPresent(buttons.first, "title") == "Item 0")
+        #expect(try await fixture.intIfPresent(buttons.first, "state").map(NSControl.StateValue.init(rawValue:)) == .off)
     }
 
     @Test("33. Observing this relationship never authorizes any mutation against the scroll area or any visible child — the authorization paths are entirely disjoint")
@@ -743,6 +729,8 @@ struct QSemanticVisibleChildrenListTests {
     @Test("44/E2E. Real macOS AppKit E2E — a real NSScrollView with real NSButton children placed inside its document view resolves via kAXVisibleChildrenAttribute; the reported COUNT is cross-validated against the identical control's own direct accessibilityVisibleChildren() accessor call; no view is ever mutated (guarded by AXIsProcessTrusted)")
     @MainActor
     func realAppKitVisibleChildrenList() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         guard AXIsProcessTrusted() else {
             // BLOCKED BY ENVIRONMENT — TCC / Accessibility permission. This isolated/unsigned
             // XCTest host is not expected to hold Accessibility trust; never fabricated as a
@@ -752,29 +740,29 @@ struct QSemanticVisibleChildrenListTests {
         }
         let suffix = UUID().uuidString
         let scrollAreaIdentifier = "e2e-visible-children-\(suffix)"
-        let (window, scrollView, buttons) = makeScrollableWindowWithVisibleButtons(
+        let (window, scrollView, buttons) = try await makeScrollableWindowWithVisibleButtons(
+            in: fixture,
             scrollAreaIdentifier: scrollAreaIdentifier, buttonIdentifiers: ["e2e-btn-0-\(suffix)", "e2e-btn-1-\(suffix)"]
         )
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 250_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.listVisibleChildren(
-            applicationName: currentProcessAppName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
+            applicationName: fixture.applicationName, role: "AXScrollArea", identifier: scrollAreaIdentifier, title: nil
         )
 
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report. Both paths ultimately observe the same live
         // viewport state, so their reported counts must agree.
-        let directAccessorCount = (scrollView.accessibilityVisibleChildren() as? [Any])?.count
+        let directAccessorCount = try await fixture.handles(scrollView, "accessibility:visibleChildren")?.count
         if let visibleChildrenCount = metadata?.visibleChildren.count, let directAccessorCount {
             #expect(visibleChildrenCount <= max(directAccessorCount, buttons.count))
         }
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.applicationName == fixture.applicationName)
 
         // The read never mutated any button's own state.
         for button in buttons {
-            #expect(button.state == .off)
+            #expect(NSControl.StateValue(rawValue: try await fixture.int(button, "state")) == .off)
         }
     }
 }

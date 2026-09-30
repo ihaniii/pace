@@ -13,6 +13,9 @@
 //  tool is registered under toolFamily "perception" specifically so it inherits that boundary
 //  with zero changes to QPlanExecutor. See docs/PHASE_2J_SEMANTIC_ELEMENT_READ.md.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -22,95 +25,90 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeTextFieldWindow(identifier: String, value: String) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: String
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = value
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeButtonWindow(identifier: String, title: String) -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 32),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let button = NSButton(frame: NSRect(x: 20, y: 20, width: 240, height: 32))
-    button.title = title
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeCheckboxWindow(identifier: String, isChecked: Bool) -> (window: NSWindow, checkbox: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeCheckboxWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeCheckboxWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, isChecked: Bool
+) async throws -> (window: String, checkbox: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "checkbox",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["title": "Enabled", "state": (isChecked ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let checkbox = NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil)
-    checkbox.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    checkbox.state = isChecked ? .on : .off
-    checkbox.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(checkbox)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, checkbox)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeTextAreaWindow(identifier: String, value: String) -> (window: NSWindow, view: NSTextView) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 160),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextAreaWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextAreaWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: String
+) async throws -> (window: String, view: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementReadTestFixture", width: 300, height: 160, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textView",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 260, height: 120),
+        properties: ["inScrollView": false, "string": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 160))
-    let textView = NSTextView(frame: NSRect(x: 20, y: 20, width: 260, height: 120))
-    textView.string = value
-    textView.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(textView)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, textView)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticElementReadTests")
 struct QSemanticElementReadTests {
@@ -168,12 +166,13 @@ struct QSemanticElementReadTests {
     func validTextFieldValueIsRead() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "read-field-\(suffix)", value: "hello world")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "read-field-\(suffix)", value: "hello world")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let (value, snapshot) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "read-field-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "read-field-\(suffix)", title: nil
         )
         #expect(value == "hello world")
         #expect(snapshot.identifier == "read-field-\(suffix)")
@@ -186,12 +185,13 @@ struct QSemanticElementReadTests {
     func buttonReadFallsBackToTitle() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "read-button-\(suffix)", title: "Submit Form")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "read-button-\(suffix)", title: "Submit Form")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let (value, _) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "read-button-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "read-button-\(suffix)", title: nil
         )
         #expect(value == "Submit Form")
     }
@@ -203,12 +203,13 @@ struct QSemanticElementReadTests {
     func checkboxStateIsReadPolymorphically() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeCheckboxWindow(identifier: "read-checkbox-\(suffix)", isChecked: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeCheckboxWindow(in: fixture, identifier: "read-checkbox-\(suffix)", isChecked: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let (value, _) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXCheckBox", identifier: "read-checkbox-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXCheckBox", identifier: "read-checkbox-\(suffix)", title: nil
         )
         // AXCheckBox's kAXValueAttribute is a boxed NSNumber (typically 1 for checked) — proves
         // the polymorphic reader handles non-String AX values, not just text-field strings.
@@ -223,12 +224,13 @@ struct QSemanticElementReadTests {
     func validTextAreaValueIsRead() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextAreaWindow(identifier: "read-area-\(suffix)", value: "multi\nline body")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextAreaWindow(in: fixture, identifier: "read-area-\(suffix)", value: "multi\nline body")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let (value, snapshot) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXTextArea", identifier: "read-area-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextArea", identifier: "read-area-\(suffix)", title: nil
         )
         #expect(value == "multi\nline body")
         #expect(snapshot.identifier == "read-area-\(suffix)")
@@ -238,17 +240,19 @@ struct QSemanticElementReadTests {
 
     @Test("4c. A role not on the allowlist is rejected, even though it is a real, unremarkable AX role")
     func unknownRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // AXImage is a real, ordinary macOS AX role that is simply not on the read allowlist —
         // proves the policy is a fail-closed allowlist (reject anything not listed) rather than a
         // denylist (reject only known-bad roles).
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXImage")) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXImage", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXImage", identifier: "whatever", title: nil
             )
         }
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXMadeUpRole42")) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXMadeUpRole42", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXMadeUpRole42", identifier: "whatever", title: nil
             )
         }
     }
@@ -257,9 +261,11 @@ struct QSemanticElementReadTests {
 
     @Test("5. Missing required parameters fail closed with deterministic errors")
     func missingParametersFailClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: nil, title: nil
             )
         }
     }
@@ -268,9 +274,11 @@ struct QSemanticElementReadTests {
 
     @Test("6. A secure-text-field role is rejected before any AX search is even attempted")
     func secureTextFieldReadDenied() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -282,13 +290,14 @@ struct QSemanticElementReadTests {
     func zeroMatchesFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "present-\(suffix)", value: "x")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "present-\(suffix)", value: "x")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -300,24 +309,17 @@ struct QSemanticElementReadTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldA.setAccessibilityIdentifier("dup-read-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        fieldB.setAccessibilityIdentifier("dup-read-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-read-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "textField", identifier: "inline-fieldB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-read-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementValue(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-read-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-read-\(suffix)", title: nil
             )
         }
     }
@@ -329,19 +331,20 @@ struct QSemanticElementReadTests {
     func repeatedReadsAreIdempotent() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "idempotent-\(suffix)", value: "stable")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "idempotent-\(suffix)", value: "stable")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let (first, _) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "idempotent-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "idempotent-\(suffix)", title: nil
         )
         let (second, _) = try await QBridgeAccessibility.shared.readElementValue(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "idempotent-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "idempotent-\(suffix)", title: nil
         )
         #expect(first == "stable")
         #expect(second == "stable")
-        #expect(field.stringValue == "stable") // the read itself never mutated the field
+        #expect(try await fixture.string(field, "stringValue") == "stable") // the read itself never mutated the field
     }
 
     // MARK: - 10. No approval ever created for a Level 0 read — routed through QPermissionGate, not bypassed
@@ -351,8 +354,9 @@ struct QSemanticElementReadTests {
     func readElementValueNeverHaltsForApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "noapproval-\(suffix)", value: "no approval needed")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "noapproval-\(suffix)", value: "no approval needed")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -365,7 +369,7 @@ struct QSemanticElementReadTests {
                   "actionName": "ui.read_element_value",
                   "toolFamily": "perception",
                   "description": "Read a semantically-identified element's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "noapproval-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "noapproval-\(suffix)"}
                 }
               ]
             }
@@ -445,9 +449,10 @@ struct QSemanticElementReadTests {
     func readStepsAreCountedAgainstBudget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (windowA, _) = makeTextFieldWindow(identifier: "budget-a-\(suffix)", value: "one")
-        let (windowB, _) = makeTextFieldWindow(identifier: "budget-b-\(suffix)", value: "two")
-        defer { windowA.close(); windowB.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (windowA, _) = try await makeTextFieldWindow(in: fixture, identifier: "budget-a-\(suffix)", value: "one")
+        let (windowB, _) = try await makeTextFieldWindow(in: fixture, identifier: "budget-b-\(suffix)", value: "two")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -460,13 +465,13 @@ struct QSemanticElementReadTests {
                   "actionName": "ui.read_element_value",
                   "toolFamily": "perception",
                   "description": "Read the first field",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "budget-a-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "budget-a-\(suffix)"}
                 },
                 {
                   "actionName": "ui.read_element_value",
                   "toolFamily": "perception",
                   "description": "Read the second field",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "budget-b-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "budget-b-\(suffix)"}
                 }
               ]
             }
@@ -502,11 +507,12 @@ struct QSemanticElementReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let secret = "sk-elementread0123456789012345678901"
-        let (window, _) = makeTextFieldWindow(identifier: "secret-read-\(suffix)", value: secret)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTextFieldWindow(in: fixture, identifier: "secret-read-\(suffix)", value: secret)
         // The read resolves through the frontmost application's Accessibility tree; without this,
         // a headless test run leaves another app frontmost and the read never happens.
-        NSApp.activate(ignoringOtherApps: true)
+        try await fixture.activateApplication()
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -519,7 +525,7 @@ struct QSemanticElementReadTests {
                   "actionName": "ui.read_element_value",
                   "toolFamily": "perception",
                   "description": "Read a semantically-identified element's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "secret-read-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "secret-read-\(suffix)"}
                 }
               ]
             }
@@ -618,8 +624,9 @@ struct QSemanticElementReadTests {
     func readTaintForcesApprovalOnLaterStep() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTextFieldWindow(identifier: "taint-read-\(suffix)", value: "some content")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTextFieldWindow(in: fixture, identifier: "taint-read-\(suffix)", value: "some content")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let readStep = QPlanStep(
@@ -627,7 +634,7 @@ struct QSemanticElementReadTests {
             action: QPlannedAction(
                 actionName: "ui.read_element_value", toolFamily: "perception", riskLevel: .level0ReadOnly,
                 literalAction: "Read the field",
-                arguments: ["applicationName": currentProcessAppName, "role": "AXTextField", "identifier": "taint-read-\(suffix)"]
+                arguments: ["applicationName": fixture.applicationName, "role": "AXTextField", "identifier": "taint-read-\(suffix)"]
             ),
             description: "Read field"
         )
@@ -660,13 +667,14 @@ struct QSemanticElementReadTests {
     func writeThenReadComposesCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "compose-\(suffix)", value: "original")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "compose-\(suffix)", value: "original")
 
         // Establish real focus for the write step (read requires no focus).
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-        _ = window.makeFirstResponder(field)
+        try await fixture.activateApplication()
+        try await fixture.perform(window, "makeKeyAndOrderFront")
+        try await fixture.perform(field, "attemptMakeFirstResponder")
         var focused = false
         for _ in 0..<20 {
             let systemWide = AXUIElementCreateSystemWide()
@@ -680,7 +688,7 @@ struct QSemanticElementReadTests {
                     break
                 }
             }
-            _ = window.makeFirstResponder(field)
+            try await fixture.perform(field, "attemptMakeFirstResponder")
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
         guard focused else { return }
@@ -695,13 +703,13 @@ struct QSemanticElementReadTests {
                   "actionName": "ui.set_text_value",
                   "toolFamily": "ui",
                   "description": "Set a semantically-identified text field's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "compose-\(suffix)", "value": "composed value"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "compose-\(suffix)", "value": "composed value"}
                 },
                 {
                   "actionName": "ui.read_element_value",
                   "toolFamily": "perception",
                   "description": "Read a semantically-identified element's value",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "compose-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "compose-\(suffix)"}
                 }
               ]
             }
@@ -724,7 +732,7 @@ struct QSemanticElementReadTests {
             Issue.record("Expected the full two-step plan to complete, got: \(resolved.state)")
             return
         }
-        #expect(field.stringValue == "composed value")
+        #expect(try await fixture.string(field, "stringValue") == "composed value")
         // The grounded summary is built from safe evidence for the write (Phase 2I) but the
         // read's own raw value is real evidence the goal evaluator legitimately saw.
         #expect(!summary.isEmpty)

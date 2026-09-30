@@ -20,6 +20,9 @@
 //  rather than fabricating a pass, mirroring the exact convention every prior semantic AX test
 //  suite in this codebase already established.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -29,95 +32,52 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXRadioButton` with subrole `AXTabButton`, and a real, live, independently-readable
-/// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
-/// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
-/// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
-/// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
-/// reports as `isAccessibilitySelected()`.
-///
-/// Empirical note (see docs/PHASE_2R_SEMANTIC_TAB_SELECTION.md's Known limitations): SwiftUI's
-/// `TabView` hosted via `NSHostingView` was the presumed first-choice fixture per this phase's
-/// Discovery, but its exact AX role/attribute behavior could not be empirically confirmed in
-/// this session (AXIsProcessTrusted() is false here, so no live AX query of any kind — SwiftUI or
-/// otherwise — could be exercised to check). Consistent with the identical, honest choice already
-/// made for Phase 2Q's disclosure-triangle fixture (where `NSOutlineView`'s internal disclosure
-/// control turned out to have no accessible way to attach a settable `AXIdentifier`), this suite
-/// uses a custom `NSAccessibility`-role-overriding control instead: a genuinely real, live,
-/// identifiable AXUIElement, not a simulation, without weakening the production role policy
-/// (`QAXTabRolePolicy.allowedRoles` remains exactly `["AXRadioButton"]`, and the mandatory
-/// `AXTabButton` subrole check is unrelated to this fixture decision).
-@MainActor
-private final class QTabFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        .radioButton
-    }
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXRadioButton` with subrole `AXTabButton`, and a real, live, independently-readable
+// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
+// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
+// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
+// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
+// reports as `isAccessibilitySelected()`.
+//
+// Empirical note (see docs/PHASE_2R_SEMANTIC_TAB_SELECTION.md's Known limitations): SwiftUI's
+// `TabView` hosted via `NSHostingView` was the presumed first-choice fixture per this phase's
+// Discovery, but its exact AX role/attribute behavior could not be empirically confirmed in
+// this session (AXIsProcessTrusted() is false here, so no live AX query of any kind — SwiftUI or
+// otherwise — could be exercised to check). Consistent with the identical, honest choice already
+// made for Phase 2Q's disclosure-triangle fixture (where `NSOutlineView`'s internal disclosure
+// control turned out to have no accessible way to attach a settable `AXIdentifier`), this suite
+// uses a custom `NSAccessibility`-role-overriding control instead: a genuinely real, live,
+// identifiable AXUIElement, not a simulation, without weakening the production role policy
+// (`QAXTabRolePolicy.allowedRoles` remains exactly `["AXRadioButton"]`, and the mandatory
+// `AXTabButton` subrole check is unrelated to this fixture decision).
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QTabFixtureButton".)
 
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        // `.tabButton` is not exposed as a pre-defined static member on this Swift SDK's
-        // `NSAccessibility.Subrole` overlay (confirmed empirically — it fails to resolve at
-        // compile time, unlike `.radioButton`/`.disclosureTriangle`), even though
-        // `NSAccessibilityTabButtonSubrole` ("AXTabButton") is a real, header-confirmed ObjC
-        // constant. Constructing directly from the raw string is the standard, fully-supported
-        // way to obtain any `NS_TYPED_ENUM`-backed value, pre-defined static member or not.
-        NSAccessibility.Subrole(rawValue: "AXTabButton")
-    }
+// A fixture that is a genuine `AXRadioButton` WITHOUT the `AXTabButton` subrole — an ordinary
+// radio button, used to prove `ui.select_tab` correctly refuses to treat it as a tab.
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QOrdinaryRadioButtonFixture".)
 
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-/// A fixture that is a genuine `AXRadioButton` WITHOUT the `AXTabButton` subrole — an ordinary
-/// radio button, used to prove `ui.select_tab` correctly refuses to treat it as a tab.
-@MainActor
-private final class QOrdinaryRadioButtonFixture: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        .radioButton
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-@MainActor
+/// Builds the same window and tab button the in-process helper built — geometry, .pushOnPushOff
+/// button type, initial state, "Tab" title, identifier — inside the out-of-process fixture.
+/// Returns the fixture window token and the tab's fixture handle (also its AX identifier).
 private func makeTabWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     initiallySelected: Bool
-) -> (window: NSWindow, tab: QTabFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, tab: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTabSelectionTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "custom:QTabFixtureButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 80, height: 24),
+        properties: ["buttonType": "pushOnPushOff", "state": (initiallySelected ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue, "title": "Tab"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTabSelectionTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let tab = QTabFixtureButton(frame: NSRect(x: 20, y: 20, width: 80, height: 24))
-    tab.setButtonType(.pushOnPushOff)
-    tab.state = initiallySelected ? .on : .off
-    tab.title = "Tab"
-    tab.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(tab)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, tab)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @Suite("QSemanticTabSelectionTests")
@@ -174,16 +134,18 @@ struct QSemanticTabSelectionTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: nil, title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: nil, title: nil, desiredSelected: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.select_tab", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select tab",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRadioButton", "desiredSelected": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRadioButton", "desiredSelected": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria"))
         #expect(result.success == false)
@@ -192,10 +154,12 @@ struct QSemanticTabSelectionTests {
 
     @Test("6/7. Missing/invalid desiredSelected fails closed with a deterministic error")
     func missingOrInvalidDesiredSelectedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.select_tab", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select tab",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRadioButton", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRadioButton", "identifier": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-selected"))
         #expect(missingResult.success == false)
@@ -205,7 +169,7 @@ struct QSemanticTabSelectionTests {
             let request = QActionRequest(
                 toolName: "ui.select_tab", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Select tab",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXRadioButton", "identifier": "x", "desiredSelected": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXRadioButton", "identifier": "x", "desiredSelected": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-selected"))
             #expect(result.success == false, "Invalid desiredSelected '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -222,10 +186,12 @@ struct QSemanticTabSelectionTests {
 
     @Test("9-16. AXCheckBox, AXPopUpButton, AXDisclosureTriangle, AXButton, AXTextField, AXTextArea, AXSlider, and AXStepper are all rejected for tab selection at the role-policy gate")
     func nonTabRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXCheckBox", "AXPopUpButton", "AXDisclosureTriangle", "AXButton", "AXTextField", "AXTextArea", "AXSlider", "AXStepper", "AXStaticText", "AXSecureTextField", "AXGroup", "AXComboBox", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedTabRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.selectTab(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
                 )
             }
         }
@@ -238,26 +204,23 @@ struct QSemanticTabSelectionTests {
     func ordinaryRadioButtonWithoutTabButtonSubroleRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let ordinaryRadio = QOrdinaryRadioButtonFixture(frame: NSRect(x: 20, y: 20, width: 80, height: 24))
-        ordinaryRadio.setButtonType(.pushOnPushOff)
-        ordinaryRadio.title = "Radio"
-        ordinaryRadio.setAccessibilityIdentifier("ordinary-\(suffix)")
-        contentView.addSubview(ordinaryRadio)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        let ordinaryRadio = "ordinary-\(suffix)"
+        try await fixture.addControl(
+            kind: "custom:QOrdinaryRadioButtonFixture", identifier: ordinaryRadio, windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 80, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Radio"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.targetNotATabButton("none")) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "ordinary-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "ordinary-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(ordinaryRadio.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(ordinaryRadio, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     @Test("18. A genuine AXRadioButton WITH the AXTabButton subrole is accepted — proving the subrole gate correctly distinguishes a real tab from an ordinary radio button")
@@ -265,12 +228,13 @@ struct QSemanticTabSelectionTests {
     func tabButtonSubroleAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "subrole-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTabWindow(in: fixture, identifier: "subrole-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "subrole-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "subrole-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
     }
@@ -282,18 +246,19 @@ struct QSemanticTabSelectionTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "present-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTabWindow(in: fixture, identifier: "present-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "present-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "present-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
             )
         }
 
@@ -311,28 +276,22 @@ struct QSemanticTabSelectionTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let tabA = QTabFixtureButton(frame: NSRect(x: 20, y: 70, width: 80, height: 24))
-        tabA.setButtonType(.pushOnPushOff)
-        tabA.title = "Tab"
-        tabA.setAccessibilityIdentifier("dup-tab-\(suffix)")
-        let tabB = QTabFixtureButton(frame: NSRect(x: 20, y: 20, width: 80, height: 24))
-        tabB.setButtonType(.pushOnPushOff)
-        tabB.title = "Tab"
-        tabB.setAccessibilityIdentifier("dup-tab-\(suffix)")
-        contentView.addSubview(tabA)
-        contentView.addSubview(tabB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tab buttons that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 200, height: 120, styles: ["titled"])
+        for (handleSuffix, tabFrame) in [("A", NSRect(x: 20, y: 70, width: 80, height: 24)), ("B", NSRect(x: 20, y: 20, width: 80, height: 24))] {
+            try await fixture.addControl(
+                kind: "custom:QTabFixtureButton", identifier: "dup-tab-\(suffix)-\(handleSuffix)", windowToken: windowToken,
+                frame: tabFrame, properties: ["buttonType": "pushOnPushOff", "title": "Tab", "accessibilityIdentifier": "dup-tab-\(suffix)"]
+            )
+        }
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "dup-tab-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "dup-tab-\(suffix)", title: nil, desiredSelected: true
             )
         }
     }
@@ -360,18 +319,19 @@ struct QSemanticTabSelectionTests {
     func nonExactIdentifierVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "exact-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeTabWindow(in: fixture, identifier: "exact-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "exact-", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "exact-", title: nil, desiredSelected: true
             )
         }
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
             )
         }
     }
@@ -398,12 +358,13 @@ struct QSemanticTabSelectionTests {
     func alreadyDesiredStateIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "noop-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "noop-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
         )
         // .alreadyDesired is the ONLY branch in selectTab's implementation that returns without
         // an intervening AXUIElementPerformAction press — structurally proving no mutation
@@ -413,17 +374,16 @@ struct QSemanticTabSelectionTests {
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(outcome.previousSelected == true)
         #expect(outcome.currentSelected == true)
-        #expect(tab.state == .on) // unchanged — proves no press occurred
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .on) // unchanged — proves no press occurred
 
         // Also prove the not-selected/not-selected idempotent path.
-        let (window2, tab2) = makeTabWindow(identifier: "noop2-\(suffix)", initiallySelected: false)
-        defer { window2.close() }
+        let (window2, tab2) = try await makeTabWindow(in: fixture, identifier: "noop2-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
         let outcome2 = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "noop2-\(suffix)", title: nil, desiredSelected: false
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "noop2-\(suffix)", title: nil, desiredSelected: false
         )
         #expect(outcome2.changeKind == .alreadyDesired)
-        #expect(tab2.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab2, "state")) == .off)
     }
 
     // MARK: - 29. Deselection of an already-selected tab is refused, never attempted
@@ -433,16 +393,17 @@ struct QSemanticTabSelectionTests {
     func deselectionRequestRefused() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "deselect-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "deselect-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.stateChangeNotGuaranteed("A tab cannot be reliably deselected via its own press action; select a different tab instead")) {
             _ = try await QBridgeAccessibility.shared.selectTab(
-                applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "deselect-\(suffix)", title: nil, desiredSelected: false
+                applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "deselect-\(suffix)", title: nil, desiredSelected: false
             )
         }
-        #expect(tab.state == .on) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .on) // unchanged — proves no press was attempted
     }
 
     // MARK: - 30/31. Mutation: not-selected -> selected
@@ -452,17 +413,18 @@ struct QSemanticTabSelectionTests {
     func notSelectedToSelectedMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "select-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "select-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "select-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "select-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousSelected == false)
         #expect(outcome.currentSelected == true)
-        #expect(tab.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .on)
     }
 
     // MARK: - 32. Approval required, never dispatches silently
@@ -510,8 +472,9 @@ struct QSemanticTabSelectionTests {
     func denyBlocksSelectTab() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "deny-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "deny-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -524,7 +487,7 @@ struct QSemanticTabSelectionTests {
                   "actionName": "ui.select_tab",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified tab",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -547,7 +510,7 @@ struct QSemanticTabSelectionTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(tab.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .off)
     }
 
     // MARK: - 34. Persisted / expiry-equivalent approval never self-authorizes
@@ -658,8 +621,9 @@ struct QSemanticTabSelectionTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "predispatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "predispatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -672,7 +636,7 @@ struct QSemanticTabSelectionTests {
                   "actionName": "ui.select_tab",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified tab",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -685,7 +649,7 @@ struct QSemanticTabSelectionTests {
             endpointName: "semantic-tab-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Select the tab")
-        #expect(tab.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .off)
     }
 
     @Test("38/39/40. Approving the request selects the tab exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -693,8 +657,9 @@ struct QSemanticTabSelectionTests {
     func allowSelectsTabAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "allow-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "allow-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -707,7 +672,7 @@ struct QSemanticTabSelectionTests {
                   "actionName": "ui.select_tab",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified tab",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -734,7 +699,7 @@ struct QSemanticTabSelectionTests {
         // Execution happens entirely inside executeSelectTab, invoked only after the approval
         // grant is consumed — resolution (collectMatches) is therefore always fresh, never a
         // reference held from before approval. Real, observed outcome:
-        #expect(tab.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .on)
     }
 
     // MARK: - 41. Selection-state drift between the two internal reads surrounding dispatch fails closed (documented)
@@ -760,17 +725,18 @@ struct QSemanticTabSelectionTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "verify-match-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTabWindow(in: fixture, identifier: "verify-match-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axTabSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRadioButton",
             matchIdentifier: "verify-match-\(suffix)",
             matchTitle: nil,
@@ -788,17 +754,18 @@ struct QSemanticTabSelectionTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTabWindow(in: fixture, identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTab(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axTabSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRadioButton",
             matchIdentifier: "verify-mismatch-\(suffix)",
             matchTitle: nil,
@@ -813,12 +780,14 @@ struct QSemanticTabSelectionTests {
 
     @Test("44. An unresolvable/ambiguous target after the selection fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axTabSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRadioButton",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRadioButton identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRadioButton identifier=vanished label=none",
             desiredSelected: true
         )
         let result = QActionResult(actionId: "verify-vanished-tab", success: true, summary: "n/a")
@@ -829,12 +798,14 @@ struct QSemanticTabSelectionTests {
 
     @Test("45. A successful AX press alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axTabSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRadioButton",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRadioButton identifier=insufficient label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRadioButton identifier=insufficient label=none",
             desiredSelected: true
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-tab", success: true, summary: "Tab selection attempted. Independent closed-loop verification pending.")
@@ -850,8 +821,9 @@ struct QSemanticTabSelectionTests {
     func recoveryRecognizesAlreadyDesiredAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "recovered-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTabWindow(in: fixture, identifier: "recovered-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -865,7 +837,7 @@ struct QSemanticTabSelectionTests {
             stepId: "step-uncertain-tab", index: 0, actionName: "ui.select_tab", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Select tab",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXRadioButton", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXRadioButton", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -995,8 +967,9 @@ struct QSemanticTabSelectionTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeTabWindow(identifier: "safe-evidence-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTabWindow(in: fixture, identifier: "safe-evidence-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -1009,7 +982,7 @@ struct QSemanticTabSelectionTests {
                   "actionName": "ui.select_tab",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified tab",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1077,11 +1050,12 @@ struct QSemanticTabSelectionTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, tab) = makeTabWindow(identifier: "e2e-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, tab) = try await makeTabWindow(in: fixture, identifier: "e2e-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(tab.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .off)
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -1093,7 +1067,7 @@ struct QSemanticTabSelectionTests {
                   "actionName": "ui.select_tab",
                   "toolFamily": "ui",
                   "description": "Select the tab",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRadioButton", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRadioButton", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1119,9 +1093,9 @@ struct QSemanticTabSelectionTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(tab.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(tab, "state")) == .on)
         let evidence = await QBridgeAccessibility.shared.observeTabSelectionEvidence(
-            applicationName: currentProcessAppName, role: "AXRadioButton", identifier: "e2e-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRadioButton", identifier: "e2e-\(suffix)", title: nil
         )
         guard case .resolved(let currentSelected) = evidence else {
             #expect(Bool(false), "Expected the tab to remain resolvable with a readable selection state, got: \(evidence)")

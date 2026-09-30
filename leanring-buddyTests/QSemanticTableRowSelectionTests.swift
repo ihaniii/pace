@@ -18,6 +18,9 @@
 //  AXIsProcessTrusted() and no-ops rather than fabricating a pass, mirroring the exact convention
 //  every prior semantic AX test suite in this codebase already established.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -27,117 +30,64 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-/// A container view that authentically self-reports Accessibility role `AXTable` — the parent
-/// context `ui.select_table_row` requires every genuine table row to resolve to. A plain `NSView`
-/// override, not a real `NSTableView`: the production role/parent-context checks only ever
-/// inspect `kAXRoleAttribute`/`kAXParentAttribute`, never the concrete control class, so this is a
-/// genuinely real, live AXUIElement satisfying the exact contract, not a simulation.
-@MainActor
-private final class QTableContainerFixtureView: NSView {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXTable")
-    }
-}
+// A container view that authentically self-reports Accessibility role `AXTable` — the parent
+// context `ui.select_table_row` requires every genuine table row to resolve to. A plain `NSView`
+// override, not a real `NSTableView`: the production role/parent-context checks only ever
+// inspect `kAXRoleAttribute`/`kAXParentAttribute`, never the concrete control class, so this is a
+// genuinely real, live AXUIElement satisfying the exact contract, not a simulation.
+//
+// (Class moved to PaceAXFixtureHost/FixtureCustomKinds.swift, built there as kind
+// "custom:QTableContainerFixtureView", with one approved addition: isAccessibilityElement() == true.)
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXRow` with subrole `AXTableRow`, and a real, live, independently-readable
-/// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
-/// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
-/// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
-/// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
-/// reports as `isAccessibilitySelected()`. Its default AX parent (unoverridden — the standard
-/// AppKit subview-mirrors-AX-tree behavior every prior fixture in this codebase already relies
-/// on) is whatever view it is added as a subview of.
-@MainActor
-private final class QTableRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXRow` with subrole `AXTableRow`, and a real, live, independently-readable
+// `kAXSelectedAttribute`, via the standard `NSAccessibility` protocol override mechanism — the
+// same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed by a
+// real on-screen `NSButton` configured as a `.pushOnPushOff` toggle so a genuine
+// `AXUIElementPerformAction(kAXPressAction)` call flips its `.state`, which this override then
+// reports as `isAccessibilitySelected()`. Its default AX parent (unoverridden — the standard
+// AppKit subview-mirrors-AX-tree behavior every prior fixture in this codebase already relies
+// on) is whatever view it is added as a subview of.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QTableRowFixtureButton".)
 
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        NSAccessibility.Subrole(rawValue: "AXTableRow")
-    }
+// A genuine `AXRow` WITHOUT the `AXTableRow` subrole — an unqualified row, used to prove
+// `ui.select_table_row` correctly refuses to treat it as a table row.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QUnqualifiedRowFixtureButton".)
 
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-/// A genuine `AXRow` WITHOUT the `AXTableRow` subrole — an unqualified row, used to prove
-/// `ui.select_table_row` correctly refuses to treat it as a table row.
-@MainActor
-private final class QUnqualifiedRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-/// A genuine `AXRow` carrying the real, SDK-confirmed, but deliberately-unsupported-in-this-phase
-/// `AXOutlineRow` subrole — used to prove `ui.select_table_row` explicitly and distinctly refuses
-/// it, never silently folding outline-row selection into table-row handling.
-@MainActor
-private final class QOutlineRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        NSAccessibility.Subrole(rawValue: "AXOutlineRow")
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
+// A genuine `AXRow` carrying the real, SDK-confirmed, but deliberately-unsupported-in-this-phase
+// `AXOutlineRow` subrole — used to prove `ui.select_table_row` explicitly and distinctly refuses
+// it, never silently folding outline-row selection into table-row handling.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QOutlineRowFixtureButton".)
 
 /// A properly-qualified table row (`AXRow` + `AXTableRow`), correctly nested inside an
 /// `AXTable`-role container — the "everything is correct" fixture most tests build on.
-@MainActor
+/// Builds the same window, `QTableContainerFixtureView` and `QTableRowFixtureButton` the in-process
+/// helper built — geometry, .pushOnPushOff button type, initial state, "Row" title, identifier —
+/// inside the out-of-process fixture. Returns the fixture window token, the container's fixture
+/// handle, and the row's fixture handle (also its AX identifier).
 private func makeTableRowWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     initiallySelected: Bool
-) -> (window: NSWindow, container: QTableContainerFixtureView, row: QTableRowFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, container: String, row: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTableRowSelectionTestFixture", width: 200, height: 80, styles: ["titled"])
+    let containerHandle = "container-\(identifier)"
+    try await fixture.addControl(kind: "custom:QTableContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+    try await fixture.addControl(
+        kind: "custom:QTableRowFixtureButton",
+        identifier: identifier,
+        parentIdentifier: containerHandle,
+        frame: NSRect(x: 20, y: 20, width: 160, height: 24),
+        properties: ["buttonType": "pushOnPushOff", "state": (initiallySelected ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue, "title": "Row"]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTableRowSelectionTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let container = QTableContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let row = QTableRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-    row.setButtonType(.pushOnPushOff)
-    row.state = initiallySelected ? .on : .off
-    row.title = "Row"
-    row.setAccessibilityIdentifier(identifier)
-    container.addSubview(row)
-    contentView.addSubview(container)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, container, row)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, containerHandle, identifier)
 }
 
 @Suite("QSemanticTableRowSelectionTests")
@@ -194,16 +144,18 @@ struct QSemanticTableRowSelectionTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: nil, title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: nil, title: nil, desiredSelected: true
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.select_table_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select table row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "desiredSelected": "true"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "desiredSelected": "true"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria-row"))
         #expect(result.success == false)
@@ -214,10 +166,12 @@ struct QSemanticTableRowSelectionTests {
 
     @Test("6/7. Missing/invalid desiredSelected fails closed with a deterministic error")
     func missingOrInvalidDesiredSelectedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.select_table_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select table row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-selected-row"))
         #expect(missingResult.success == false)
@@ -227,7 +181,7 @@ struct QSemanticTableRowSelectionTests {
             let request = QActionRequest(
                 toolName: "ui.select_table_row", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Select table row",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x", "desiredSelected": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x", "desiredSelected": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-selected-row"))
             #expect(result.success == false, "Invalid desiredSelected '\(invalid)' must be rejected — exact 'true'/'false' only.")
@@ -244,10 +198,12 @@ struct QSemanticTableRowSelectionTests {
 
     @Test("9-18. AXRadioButton, AXCheckBox, AXPopUpButton, AXDisclosureTriangle, AXButton, AXTextField, AXTable, AXOutline, AXComboBox, and an unrecognized role are all rejected for table-row selection at the role-policy gate")
     func nonRowRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXRadioButton", "AXCheckBox", "AXPopUpButton", "AXDisclosureTriangle", "AXButton", "AXTextField", "AXTable", "AXOutline", "AXComboBox", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedTableRowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.selectTableRow(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredSelected: true
                 )
             }
         }
@@ -260,28 +216,22 @@ struct QSemanticTableRowSelectionTests {
     func unqualifiedRowWithoutSubroleRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let container = QTableContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let unqualifiedRow = QUnqualifiedRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        unqualifiedRow.setButtonType(.pushOnPushOff)
-        unqualifiedRow.title = "Row"
-        unqualifiedRow.setAccessibilityIdentifier("unqualified-\(suffix)")
-        container.addSubview(unqualifiedRow)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QTableContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+        let unqualifiedRow = "unqualified-\(suffix)"
+        try await fixture.addControl(kind: "custom:QUnqualifiedRowFixtureButton", identifier: unqualifiedRow, parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Row", "accessibilityIdentifier": "unqualified-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.targetNotATableRow("none")) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(unqualifiedRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(unqualifiedRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 20. AXOutlineRow is a real, recognized, but distinctly-unsupported subrole
@@ -291,28 +241,22 @@ struct QSemanticTableRowSelectionTests {
     func outlineRowSubroleRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let container = QTableContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        let outlineRow = QOutlineRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        outlineRow.setButtonType(.pushOnPushOff)
-        outlineRow.title = "Row"
-        outlineRow.setAccessibilityIdentifier("outline-\(suffix)")
-        container.addSubview(outlineRow)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QTableContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 80), properties: ["accessibilityIdentifier": ""])
+        let outlineRow = "outline-\(suffix)"
+        try await fixture.addControl(kind: "custom:QOutlineRowFixtureButton", identifier: outlineRow, parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Row", "accessibilityIdentifier": "outline-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.outlineRowUnsupported("AXOutlineRow")) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "outline-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "outline-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(outlineRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(outlineRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 21. A qualified row lacking an AXTable parent context is refused
@@ -321,30 +265,27 @@ struct QSemanticTableRowSelectionTests {
     @MainActor
     func missingTableContextRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-        // Deliberately NOT nested inside a QTableContainerFixtureView — added directly to
-        // contentView (an ordinary, non-AXTable-role view), so its parent context cannot be
-        // established.
-        let orphanRow = QTableRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        orphanRow.setButtonType(.pushOnPushOff)
-        orphanRow.title = "Row"
-        orphanRow.setAccessibilityIdentifier("orphan-\(suffix)")
-        contentView.addSubview(orphanRow)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 80, styles: ["titled"])
+        // Deliberately NOT nested inside a QTableContainerFixtureView — added directly to the
+        // window's content view (an ordinary, non-AXTable-role view), so its parent context cannot
+        // be established.
+        let orphanRow = "orphan-\(suffix)"
+        try await fixture.addControl(
+            kind: "custom:QTableRowFixtureButton", identifier: orphanRow, windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Row"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.tableContextUnavailable("parent role is not AXTable")) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "orphan-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "orphan-\(suffix)", title: nil, desiredSelected: true
             )
         }
-        #expect(orphanRow.state == .off) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(orphanRow, "state")) == .off) // unchanged — proves no press was attempted
     }
 
     // MARK: - 22. A fully-qualified row (role + subrole + table context) is accepted
@@ -354,12 +295,13 @@ struct QSemanticTableRowSelectionTests {
     func fullyQualifiedRowAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "qualified-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableRowWindow(in: fixture, identifier: "qualified-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "qualified-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "qualified-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
     }
@@ -371,18 +313,19 @@ struct QSemanticTableRowSelectionTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "present-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeTableRowWindow(in: fixture, identifier: "present-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "present-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "present-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "absent-\(suffix)", title: nil, desiredSelected: true
             )
         }
 
@@ -400,30 +343,19 @@ struct QSemanticTableRowSelectionTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let container = QTableContainerFixtureView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let rowA = QTableRowFixtureButton(frame: NSRect(x: 20, y: 70, width: 160, height: 24))
-        rowA.setButtonType(.pushOnPushOff)
-        rowA.title = "Row"
-        rowA.setAccessibilityIdentifier("dup-row-\(suffix)")
-        let rowB = QTableRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-        rowB.setButtonType(.pushOnPushOff)
-        rowB.title = "Row"
-        rowB.setAccessibilityIdentifier("dup-row-\(suffix)")
-        container.addSubview(rowA)
-        container.addSubview(rowB)
-        contentView.addSubview(container)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 200, height: 120, styles: ["titled"])
+        let containerHandle = "container-\(suffix)"
+        try await fixture.addControl(kind: "custom:QTableContainerFixtureView", identifier: containerHandle, windowToken: windowToken, frame: NSRect(x: 0, y: 0, width: 200, height: 120), properties: ["accessibilityIdentifier": ""])
+        try await fixture.addControl(kind: "custom:QTableRowFixtureButton", identifier: "dup-row-\(suffix)-rowA", parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 70, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Row", "accessibilityIdentifier": "dup-row-\(suffix)"])
+        try await fixture.addControl(kind: "custom:QTableRowFixtureButton", identifier: "dup-row-\(suffix)-rowB", parentIdentifier: containerHandle, frame: NSRect(x: 20, y: 20, width: 160, height: 24), properties: ["buttonType": "pushOnPushOff", "title": "Row", "accessibilityIdentifier": "dup-row-\(suffix)"])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "dup-row-\(suffix)", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "dup-row-\(suffix)", title: nil, desiredSelected: true
             )
         }
     }
@@ -451,18 +383,19 @@ struct QSemanticTableRowSelectionTests {
     func nonExactIdentifierVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "exact-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, _) = try await makeTableRowWindow(in: fixture, identifier: "exact-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "exact-", title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "exact-", title: nil, desiredSelected: true
             )
         }
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectTableRow(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "EXACT-\(suffix)".uppercased(), title: nil, desiredSelected: true
             )
         }
         // No index/position-based parameter exists in the schema at all (only
@@ -493,12 +426,13 @@ struct QSemanticTableRowSelectionTests {
     func alreadySelectedIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "noop-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "noop-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "noop-\(suffix)", title: nil, desiredSelected: true
         )
         // .alreadyDesired is the ONLY branch in selectTableRow's implementation that returns
         // without an intervening AXUIElementPerformAction press — structurally proving no
@@ -507,7 +441,7 @@ struct QSemanticTableRowSelectionTests {
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(outcome.previousSelected == true)
         #expect(outcome.currentSelected == true)
-        #expect(row.state == .on) // unchanged — proves no press occurred
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on) // unchanged — proves no press occurred
     }
 
     // MARK: - 32/33. Deselection is categorically out of scope — refused before any AX call
@@ -531,19 +465,20 @@ struct QSemanticTableRowSelectionTests {
     func executionServiceLevelDeselectionRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "deselect-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "deselect-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let request = QActionRequest(
             toolName: "ui.select_table_row", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Deselect row",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "deselect-\(suffix)", "desiredSelected": "false"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "deselect-\(suffix)", "desiredSelected": "false"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-row-deselect"))
         #expect(result.success == false)
         #expect(result.error == "AX_ROW_DESELECTION_UNSUPPORTED")
-        #expect(row.state == .on) // unchanged — proves no press was attempted
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on) // unchanged — proves no press was attempted
     }
 
     // MARK: - 34/35. Mutation: not-selected -> selected
@@ -553,17 +488,18 @@ struct QSemanticTableRowSelectionTests {
     func notSelectedToSelectedMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "select-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "select-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "select-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "select-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousSelected == false)
         #expect(outcome.currentSelected == true)
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
     }
 
     // MARK: - 36. Approval required, never dispatches silently
@@ -611,8 +547,9 @@ struct QSemanticTableRowSelectionTests {
     func denyBlocksSelectTableRow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "deny-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "deny-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -625,7 +562,7 @@ struct QSemanticTableRowSelectionTests {
                   "actionName": "ui.select_table_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified table row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "deny-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -648,7 +585,7 @@ struct QSemanticTableRowSelectionTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
     }
 
     // MARK: - 38. Persisted / expiry-equivalent approval never self-authorizes
@@ -759,8 +696,9 @@ struct QSemanticTableRowSelectionTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "predispatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "predispatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -773,7 +711,7 @@ struct QSemanticTableRowSelectionTests {
                   "actionName": "ui.select_table_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified table row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "predispatch-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -786,7 +724,7 @@ struct QSemanticTableRowSelectionTests {
             endpointName: "semantic-row-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Select the row")
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
     }
 
     @Test("42. Approving the request selects the row exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -794,8 +732,9 @@ struct QSemanticTableRowSelectionTests {
     func allowSelectsRowAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "allow-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "allow-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -808,7 +747,7 @@ struct QSemanticTableRowSelectionTests {
                   "actionName": "ui.select_table_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified table row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "allow-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -835,7 +774,7 @@ struct QSemanticTableRowSelectionTests {
         // Execution happens entirely inside executeSelectTableRow, invoked only after the
         // approval grant is consumed — resolution (collectMatches) is therefore always fresh,
         // never a reference held from before approval. Real, observed outcome:
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
     }
 
     // MARK: - 43. Selection-state drift between the two internal reads surrounding dispatch fails closed (documented)
@@ -861,17 +800,18 @@ struct QSemanticTableRowSelectionTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "verify-match-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableRowWindow(in: fixture, identifier: "verify-match-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "verify-match-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axTableRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "verify-match-\(suffix)",
             matchTitle: nil,
@@ -889,17 +829,18 @@ struct QSemanticTableRowSelectionTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableRowWindow(in: fixture, identifier: "verify-mismatch-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectTableRow(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "verify-mismatch-\(suffix)", title: nil, desiredSelected: true
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axTableRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "verify-mismatch-\(suffix)",
             matchTitle: nil,
@@ -914,12 +855,14 @@ struct QSemanticTableRowSelectionTests {
 
     @Test("46. An unresolvable/ambiguous/table-context-unqualified target after the selection fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axTableRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRow subrole=AXTableRow identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRow subrole=AXTableRow identifier=vanished label=none",
             desiredSelected: true
         )
         let result = QActionResult(actionId: "verify-vanished-row", success: true, summary: "n/a")
@@ -930,12 +873,14 @@ struct QSemanticTableRowSelectionTests {
 
     @Test("47. A successful AX press alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axTableRowSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRow",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXRow subrole=AXTableRow identifier=insufficient label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXRow subrole=AXTableRow identifier=insufficient label=none",
             desiredSelected: true
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-row", success: true, summary: "Table row selection attempted. Independent closed-loop verification pending.")
@@ -951,8 +896,9 @@ struct QSemanticTableRowSelectionTests {
     func recoveryRecognizesAlreadySelectedAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "recovered-\(suffix)", initiallySelected: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableRowWindow(in: fixture, identifier: "recovered-\(suffix)", initiallySelected: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -966,7 +912,7 @@ struct QSemanticTableRowSelectionTests {
             stepId: "step-uncertain-row", index: 0, actionName: "ui.select_table_row", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Select row",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "recovered-\(suffix)", "desiredSelected": "true"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -1096,8 +1042,9 @@ struct QSemanticTableRowSelectionTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableRowWindow(identifier: "safe-evidence-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableRowWindow(in: fixture, identifier: "safe-evidence-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -1110,7 +1057,7 @@ struct QSemanticTableRowSelectionTests {
                   "actionName": "ui.select_table_row",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified table row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "safe-evidence-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1193,11 +1140,12 @@ struct QSemanticTableRowSelectionTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _, row) = makeTableRowWindow(identifier: "e2e-\(suffix)", initiallySelected: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _, row) = try await makeTableRowWindow(in: fixture, identifier: "e2e-\(suffix)", initiallySelected: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(row.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .off)
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -1209,7 +1157,7 @@ struct QSemanticTableRowSelectionTests {
                   "actionName": "ui.select_table_row",
                   "toolFamily": "ui",
                   "description": "Select the row",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "e2e-\(suffix)", "desiredSelected": "true"}
                 }
               ]
             }
@@ -1235,9 +1183,9 @@ struct QSemanticTableRowSelectionTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(row.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(row, "state")) == .on)
         let evidence = await QBridgeAccessibility.shared.observeTableRowSelectionEvidence(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-\(suffix)", title: nil
         )
         guard case .resolved(let currentSelected) = evidence else {
             #expect(Bool(false), "Expected the row to remain resolvable with a readable selection state, got: \(evidence)")

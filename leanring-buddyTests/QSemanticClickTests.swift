@@ -16,6 +16,9 @@
 //  limitation (a genuine observation-binding race cannot be triggered deterministically without
 //  adding a test-only seam to production code, which was deliberately not done).
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -74,63 +77,69 @@ private func waitUntil(timeout: TimeInterval, _ condition: @escaping () -> Bool)
     return condition()
 }
 
-/// Holds real NSButton target/action state for tests that need to prove a press actually
-/// happened, and/or that a target's own Accessibility identity changes as a direct result of
-/// being pressed (the same self-diffing behavior empirically confirmed on real Calculator
-/// buttons — see docs/PHASE_2H_SEMANTIC_CLICK.md).
-@MainActor
-private final class QClickTestHarness: NSObject {
-    var pressCount = 0
-
-    @objc func recordPress(_ sender: NSButton) {
-        pressCount += 1
-    }
-
-    @objc func recordPressAndToggleIdentity(_ sender: NSButton) {
-        pressCount += 1
-        sender.setAccessibilityIdentifier("toggled-\(uniqueSuffix)")
-        sender.title = "Toggled"
-    }
-
+/// Holds press-tracking state for tests that need to prove a press actually happened, and/or
+/// that a target's own Accessibility identity changes as a direct result of being pressed (the
+/// same self-diffing behavior empirically confirmed on real Calculator buttons — see
+/// docs/PHASE_2H_SEMANTIC_CLICK.md).
+///
+/// The buttons themselves are real NSButtons inside the out-of-process PaceAXFixtureHost. This
+/// harness remembers which of them count presses (exactly the buttons the in-process harness wired
+/// to recordPress / recordPressAndToggleIdentity), and `pressCount()` totals their presses as
+/// recorded by the fixture's own AppKit action callbacks — never through Accessibility.
+private final class QClickTestHarness: @unchecked Sendable {
     let uniqueSuffix: String
+    fileprivate var fixture: PaceAXFixture?
+    fileprivate var pressCountingButtonHandles: [String] = []
+
     init(uniqueSuffix: String) { self.uniqueSuffix = uniqueSuffix }
+
+    func pressCount() async throws -> Int {
+        guard let fixture else { return 0 }
+        var totalPresses = 0
+        for buttonHandle in pressCountingButtonHandles {
+            totalPresses += try await fixture.int(buttonHandle, "actionCount")
+        }
+        return totalPresses
+    }
 }
 
-@MainActor
+/// Builds the same window and buttons the in-process helper built — geometry, titles,
+/// identifiers, enabled state, and press behavior — inside the out-of-process PaceAXFixtureHost.
+/// Returns the fixture window token.
+@discardableResult
 private func makeTestWindow(
+    in fixture: PaceAXFixture,
     harness: QClickTestHarness,
     buttons: [(identifier: String, title: String, enabled: Bool, selfMutating: Bool, countsPress: Bool)]
-) -> NSWindow {
-    let window = NSWindow(
-        contentRect: NSRect(x: 60, y: 60, width: 260, height: max(60, 44 * buttons.count + 20)),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticClickTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: max(60, 44 * buttons.count + 20)))
+) async throws -> String {
+    let windowHeight = Double(max(60, 44 * buttons.count + 20))
+    let windowToken = try await fixture.createWindow(title: "QSemanticClickTestFixture", width: 260, height: windowHeight, styles: ["titled"])
+    harness.fixture = fixture
     for (index, spec) in buttons.enumerated() {
-        let button = NSButton(frame: NSRect(x: 20, y: CGFloat(20 + index * 44), width: 200, height: 32))
-        button.title = spec.title
-        button.setAccessibilityIdentifier(spec.identifier)
-        button.isEnabled = spec.enabled
-        button.target = harness
+        // A unique fixture handle per button, so two buttons may share one AX identifier.
+        let buttonHandle = "click-button-\(index)-\(harness.uniqueSuffix)"
+        var properties: [String: Any] = [
+            "title": spec.title,
+            "accessibilityIdentifier": spec.identifier,
+            "isEnabled": spec.enabled
+        ]
         if spec.selfMutating {
-            button.action = #selector(QClickTestHarness.recordPressAndToggleIdentity(_:))
-        } else if spec.countsPress {
-            button.action = #selector(QClickTestHarness.recordPress(_:))
+            properties["onPressSetAccessibilityIdentifier"] = "toggled-\(harness.uniqueSuffix)"
+            properties["onPressSetTitle"] = "Toggled"
         }
-        contentView.addSubview(button)
+        try await fixture.addControl(
+            kind: "button",
+            identifier: buttonHandle,
+            windowToken: windowToken,
+            frame: NSRect(x: 20, y: CGFloat(20 + index * 44), width: 200, height: 32),
+            properties: properties
+        )
+        if spec.selfMutating || spec.countsPress {
+            harness.pressCountingButtonHandles.append(buttonHandle)
+        }
     }
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return window
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return windowToken
 }
 
 @Suite("QSemanticClickTests")
@@ -190,20 +199,21 @@ struct QSemanticClickTests {
     func validSemanticTargetResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "valid-\(suffix)", title: "Press Me", enabled: true, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let (evidence, snapshot) = try await QBridgeAccessibility.shared.clickElement(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "valid-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "valid-\(suffix)", title: nil
         )
         #expect(!evidence.isEmpty)
         #expect(snapshot.identifier == "valid-\(suffix)")
         #expect(snapshot.isEnabled == true)
-        #expect(harness.pressCount == 1)
+        #expect(try await harness.pressCount() == 1)
     }
 
     // MARK: - 3. Zero matches -> fail closed
@@ -213,22 +223,23 @@ struct QSemanticClickTests {
     func zeroMatchesFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "present-\(suffix)", title: "Present", enabled: true, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.clickElement(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "does-not-exist-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "does-not-exist-\(suffix)", title: nil
             )
             Issue.record("Expected .noMatchingElement")
         } catch let error as QAXInteractionError {
             #expect(error == .noMatchingElement)
         }
-        #expect(harness.pressCount == 0)
+        #expect(try await harness.pressCount() == 0)
     }
 
     // MARK: - 4. Ambiguous matches -> fail closed, never guess
@@ -238,23 +249,24 @@ struct QSemanticClickTests {
     func ambiguousMatchesFailClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "dup-\(suffix)", title: "First", enabled: true, selfMutating: false, countsPress: true),
             (identifier: "dup-\(suffix)", title: "Second", enabled: true, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.clickElement(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "dup-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "dup-\(suffix)", title: nil
             )
             Issue.record("Expected .ambiguousTarget")
         } catch let error as QAXInteractionError {
             #expect(error == .ambiguousTarget(count: 2))
         }
-        #expect(harness.pressCount == 0)
+        #expect(try await harness.pressCount() == 0)
     }
 
     // MARK: - 5. Disabled element -> fail safely
@@ -264,22 +276,23 @@ struct QSemanticClickTests {
     func disabledElementFailsSafely() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "disabled-\(suffix)", title: "Disabled", enabled: false, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         do {
             _ = try await QBridgeAccessibility.shared.clickElement(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "disabled-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "disabled-\(suffix)", title: nil
             )
             Issue.record("Expected .targetDisabled")
         } catch let error as QAXInteractionError {
             #expect(error == .targetDisabled)
         }
-        #expect(harness.pressCount == 0)
+        #expect(try await harness.pressCount() == 0)
     }
 
     // MARK: - 6. Missing application -> fail safely
@@ -381,11 +394,12 @@ struct QSemanticClickTests {
     func denyBlocksClick() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "deny-target-\(suffix)", title: "Deny Target", enabled: true, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -398,7 +412,7 @@ struct QSemanticClickTests {
                   "actionName": "ui.click_element",
                   "toolFamily": "ui",
                   "description": "Click a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "deny-target-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "deny-target-\(suffix)"}
                 }
               ]
             }
@@ -421,7 +435,7 @@ struct QSemanticClickTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(harness.pressCount == 0)
+        #expect(try await harness.pressCount() == 0)
     }
 
     // MARK: - 11. Allow -> clicks exactly once
@@ -431,11 +445,12 @@ struct QSemanticClickTests {
     func allowClicksExactlyOnce() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "allow-target-\(suffix)", title: "Allow Target", enabled: true, selfMutating: true, countsPress: false)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -448,7 +463,7 @@ struct QSemanticClickTests {
                   "actionName": "ui.click_element",
                   "toolFamily": "ui",
                   "description": "Click a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "allow-target-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "allow-target-\(suffix)"}
                 }
               ]
             }
@@ -471,7 +486,7 @@ struct QSemanticClickTests {
             #expect(Bool(false), "Expected task to complete after approval, got: \(resolved.state)")
             return
         }
-        #expect(harness.pressCount == 1)
+        #expect(try await harness.pressCount() == 1)
     }
 
     // MARK: - 12. Approval for action A cannot authorize action B
@@ -537,11 +552,12 @@ struct QSemanticClickTests {
     func abandonedApprovalNeverExecutes() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let harness = QClickTestHarness(uniqueSuffix: suffix)
-        let window = makeTestWindow(harness: harness, buttons: [
+        try await makeTestWindow(in: fixture, harness: harness, buttons: [
             (identifier: "abandon-target-\(suffix)", title: "Abandon Target", enabled: true, selfMutating: false, countsPress: true)
         ])
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -554,7 +570,7 @@ struct QSemanticClickTests {
                   "actionName": "ui.click_element",
                   "toolFamily": "ui",
                   "description": "Click a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "abandon-target-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "abandon-target-\(suffix)"}
                 }
               ]
             }
@@ -576,7 +592,7 @@ struct QSemanticClickTests {
         // Deliberately never call resolveApproval — simulates the user abandoning/cancelling the
         // prompt. No grant may exist for this identity, and the target must never be pressed.
         #expect(QApprovalCoordinator.shared.consumeGrantIfPresent(fingerprint: identity.stepFingerprint) == false)
-        #expect(harness.pressCount == 0)
+        #expect(try await harness.pressCount() == 0)
     }
 
     // MARK: - 15 & 16. Post-click observation; verification never fabricates success
@@ -589,11 +605,12 @@ struct QSemanticClickTests {
         // 15: self-mutating button — a real, observable AX identity change after press.
         do {
             let suffix = UUID().uuidString
+            let fixture = try await PaceAXFixture.launch()
+            defer { fixture.stop() }
             let harness = QClickTestHarness(uniqueSuffix: suffix)
-            let window = makeTestWindow(harness: harness, buttons: [
+            try await makeTestWindow(in: fixture, harness: harness, buttons: [
                 (identifier: "toggle-target-\(suffix)", title: "Toggle Target", enabled: true, selfMutating: true, countsPress: false)
             ])
-            defer { window.close() }
             try? await Task.sleep(nanoseconds: 100_000_000)
 
             let mockModel = MockAutonomousModelProvider()
@@ -606,7 +623,7 @@ struct QSemanticClickTests {
                       "actionName": "ui.click_element",
                       "toolFamily": "ui",
                       "description": "Click a semantically-identified element",
-                      "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "toggle-target-\(suffix)"}
+                      "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "toggle-target-\(suffix)"}
                     }
                   ]
                 }
@@ -630,7 +647,7 @@ struct QSemanticClickTests {
                 #expect(Bool(false), "Expected completion with a genuine observed state change, got: \(resolved.state)")
                 return
             }
-            #expect(harness.pressCount == 1)
+            #expect(try await harness.pressCount() == 1)
             #expect(summary.localizedCaseInsensitiveContains("state changed") || summary.localizedCaseInsensitiveContains("no longer resolvable"))
         }
 
@@ -638,11 +655,12 @@ struct QSemanticClickTests {
         // Verification must fail (not fabricate success) even though dispatch itself worked.
         do {
             let suffix = UUID().uuidString
+            let fixture = try await PaceAXFixture.launch()
+            defer { fixture.stop() }
             let harness = QClickTestHarness(uniqueSuffix: suffix)
-            let window = makeTestWindow(harness: harness, buttons: [
+            try await makeTestWindow(in: fixture, harness: harness, buttons: [
                 (identifier: "static-target-\(suffix)", title: "Static Target", enabled: true, selfMutating: false, countsPress: true)
             ])
-            defer { window.close() }
             try? await Task.sleep(nanoseconds: 100_000_000)
 
             let mockModel = MockAutonomousModelProvider()
@@ -655,7 +673,7 @@ struct QSemanticClickTests {
                       "actionName": "ui.click_element",
                       "toolFamily": "ui",
                       "description": "Click a semantically-identified element",
-                      "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "static-target-\(suffix)"}
+                      "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "static-target-\(suffix)"}
                     }
                   ]
                 }
@@ -679,7 +697,7 @@ struct QSemanticClickTests {
             }
             // The press itself DID happen — the failure is a verification-evidence failure, not a
             // dispatch failure. This is exactly the "successful press != goal success" distinction.
-            #expect(harness.pressCount == 1)
+            #expect(try await harness.pressCount() == 1)
         }
     }
 

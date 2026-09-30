@@ -17,6 +17,9 @@
 //    - Verified via closed-loop independent re-observation
 //    - Level 2 — requires explicit single-use user approval bound to execution identity
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -24,65 +27,26 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - AppKit Fixtures
 
-@MainActor
-private final class QSegmentedControlContainerFixtureView: NSView {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXSegmentedControl")
-    }
-}
+// (Class moved to PaceAXFixtureHost/FixtureCustomKinds.swift, built there as kind
+// "custom:QSegmentedControlContainerFixtureView", with one approved addition: isAccessibilityElement() == true.)
 
-@MainActor
-private final class QDisallowedRadioGroupContainerFixtureView: NSView {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRadioGroup")
-    }
-}
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QDisallowedRadioGroupContainerFixtureView".)
 
-@MainActor
-private final class QSegmentItemFixtureButton: NSButton {
-    private let customRole: String
-    private let customSubrole: String?
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QSegmentItemFixtureButton".)
 
-    init(role: String = "AXRadioButton", subrole: String? = nil, isSelected: Bool = false) {
-        self.customRole = role
-        self.customSubrole = subrole
-        super.init(frame: .zero)
-        self.state = isSelected ? .on : .off
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: customRole)
-    }
-
-    override func accessibilitySubrole() -> NSAccessibility.Subrole? {
-        customSubrole.map { NSAccessibility.Subrole(rawValue: $0) }
-    }
-
-    override func isAccessibilitySelected() -> Bool {
-        state == .on
-    }
-
-    override func isAccessibilityEnabled() -> Bool {
-        isEnabled
-    }
-
-    override func setAccessibilitySelected(_ accessibilitySelected: Bool) {
-        state = accessibilitySelected ? .on : .off
-    }
-}
-
-@MainActor
+/// Builds the same window, `QSegmentedControlContainerFixtureView` and `QSegmentItemFixtureButton`
+/// segments (both moved verbatim into PaceAXFixtureHost/FixtureCustomKinds.swift) the in-process
+/// helper built — geometry, container identifier/label, and each segment's role, subrole,
+/// selection, identifier, label/title and enabled state — inside the out-of-process fixture.
+/// Returns the fixture window token, the container's fixture handle, and each segment's handle.
+@discardableResult
 private func makeSegmentedControlWindow(
+    in fixture: PaceAXFixture,
     controlIdentifier: String? = "seg.viewmode",
     controlTitle: String? = "View Mode",
     windowTitle: String = "QSegSelectionWindow",
@@ -91,39 +55,46 @@ private func makeSegmentedControlWindow(
         ("seg.icons", "Icons", false, true, "AXRadioButton", nil),
         ("seg.columns", "Columns", false, false, "AXRadioButton", nil)
     ]
-) -> (window: NSWindow, container: QSegmentedControlContainerFixtureView, items: [QSegmentItemFixtureButton]) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 200),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, container: String, items: [String]) {
+    let windowToken = try await fixture.createWindow(title: windowTitle, width: 400, height: 200, styles: ["titled", "closable"])
+    let containerHandle = "segmented-container-\(UUID().uuidString)"
+    // An absent controlIdentifier means no AX identifier at all, exactly as before (an empty
+    // identifier is NSView's default).
+    try await fixture.addControl(
+        kind: "custom:QSegmentedControlContainerFixtureView",
+        identifier: containerHandle,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 50, width: 360, height: 40),
+        properties: ["accessibilityIdentifier": controlIdentifier ?? ""]
     )
-    window.animationBehavior = .none
-    window.title = windowTitle
-
-    let container = QSegmentedControlContainerFixtureView(frame: NSRect(x: 20, y: 50, width: 360, height: 40))
-    if let controlIdentifier = controlIdentifier {
-        container.setAccessibilityIdentifier(controlIdentifier)
-    }
     if let controlTitle = controlTitle {
-        container.setAccessibilityLabel(controlTitle)
+        try await fixture.setAccessibility(containerHandle, "label", controlTitle)
     }
-    window.contentView?.addSubview(container)
 
-    var itemButtons: [QSegmentItemFixtureButton] = []
+    var itemHandles: [String] = []
     for (idx, seg) in segments.enumerated() {
-        let btn = QSegmentItemFixtureButton(role: seg.role, subrole: seg.subrole, isSelected: seg.isSelected)
-        btn.frame = NSRect(x: idx * 100, y: 0, width: 90, height: 35)
-        btn.setAccessibilityIdentifier(seg.id)
-        btn.setAccessibilityLabel(seg.title)
-        btn.setAccessibilityTitle(seg.title)
-        btn.isEnabled = seg.isEnabled
-        container.addSubview(btn)
-        itemButtons.append(btn)
+        let itemHandle = "\(seg.id)#\(idx)-\(containerHandle)"
+        var properties: [String: Any] = [
+            "customRole": seg.role,
+            "customIsSelected": seg.isSelected,
+            "accessibilityIdentifier": seg.id,
+            "isEnabled": seg.isEnabled
+        ]
+        if let subrole = seg.subrole { properties["customSubrole"] = subrole }
+        try await fixture.addControl(
+            kind: "custom:QSegmentItemFixtureButton",
+            identifier: itemHandle,
+            parentIdentifier: containerHandle,
+            frame: NSRect(x: idx * 100, y: 0, width: 90, height: 35),
+            properties: properties
+        )
+        try await fixture.setAccessibility(itemHandle, "label", seg.title)
+        try await fixture.setAccessibility(itemHandle, "title", seg.title)
+        itemHandles.append(itemHandle)
     }
 
-    window.makeKeyAndOrderFront(nil)
-    return (window, container, itemButtons)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, containerHandle, itemHandles)
 }
 
 // MARK: - Test Suite
@@ -244,13 +215,15 @@ struct QSemanticSegmentedControlSelectionTests {
 
     @Test("7. Missing match criteria (no segmentIdentifier and no segmentTitle) fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_segmented_control_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select segment",
             parameters: [
-                "applicationName": currentProcessAppName
+                "applicationName": fixture.applicationName
             ]
         )
         let res = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-3"))
@@ -260,13 +233,15 @@ struct QSemanticSegmentedControlSelectionTests {
 
     @Test("8. Disallowed container role (AXRadioGroup) fails closed")
     func disallowedContainerRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_segmented_control_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select segment",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXRadioGroup",
                 "segmentTitle": "Icons"
             ]
@@ -278,13 +253,15 @@ struct QSemanticSegmentedControlSelectionTests {
 
     @Test("9. Deselection (desiredSelected: false) is unsupported and fails closed")
     func deselectionUnsupportedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_segmented_control_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select segment",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "segmentTitle": "Icons",
                 "desiredSelected": "false"
             ]
@@ -296,13 +273,15 @@ struct QSemanticSegmentedControlSelectionTests {
 
     @Test("10. Invalid desiredSelected parameter fails closed")
     func invalidDesiredSelectedFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.select_segmented_control_item",
             toolFamily: "ui",
             riskLevel: .level2UserApproval,
             literalAction: "Select segment",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "segmentTitle": "Icons",
                 "desiredSelected": "maybe"
             ]
@@ -327,19 +306,17 @@ struct QSemanticSegmentedControlSelectionTests {
     func directSegmentRejectsTabButtonSubrole() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.tabctrl",
-                controlTitle: "Tab Control",
-                windowTitle: "QSegTabTestWindow",
-                segments: [
-                    ("seg.tab1", "Tab1", false, true, "AXRadioButton", "AXTabButton")
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.tabctrl",
+            controlTitle: "Tab Control",
+            windowTitle: "QSegTabTestWindow",
+            segments: [
+                ("seg.tab1", "Tab1", false, true, "AXRadioButton", "AXTabButton")
+            ]
+        )
 
         let req = QActionRequest(
             toolName: "ui.select_segmented_control_item",
@@ -347,7 +324,7 @@ struct QSemanticSegmentedControlSelectionTests {
             riskLevel: .level2UserApproval,
             literalAction: "Select segment",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "controlIdentifier": "seg.tabctrl",
                 "segmentIdentifier": "seg.tab1",
                 "windowTitle": "QSegTabTestWindow"
@@ -451,22 +428,20 @@ struct QSemanticSegmentedControlSelectionTests {
     func alreadySelectedIsIdempotentNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.idemp",
-                controlTitle: "Idempotent Ctrl",
-                windowTitle: "QSegIdempWindow",
-                segments: [
-                    ("seg.active", "ActiveSegment", true, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.idemp",
+            controlTitle: "Idempotent Ctrl",
+            windowTitle: "QSegIdempWindow",
+            segments: [
+                ("seg.active", "ActiveSegment", true, true, "AXRadioButton", nil)
+            ]
+        )
 
         let outcome = try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.idemp",
             controlTitle: "Idempotent Ctrl",
@@ -486,23 +461,21 @@ struct QSemanticSegmentedControlSelectionTests {
     func disabledSegmentIsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.disabledctrl",
-                controlTitle: "Disabled Ctrl",
-                windowTitle: "QSegDisabledWindow",
-                segments: [
-                    ("seg.dis", "DisabledSegment", false, false, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.disabledctrl",
+            controlTitle: "Disabled Ctrl",
+            windowTitle: "QSegDisabledWindow",
+            segments: [
+                ("seg.dis", "DisabledSegment", false, false, "AXRadioButton", nil)
+            ]
+        )
 
         await #expect(throws: QAXInteractionError.self) {
             try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-                applicationName: currentProcessAppName,
+                applicationName: fixture.applicationName,
                 role: "AXSegmentedControl",
                 controlIdentifier: "seg.disabledctrl",
                 controlTitle: "Disabled Ctrl",
@@ -519,24 +492,22 @@ struct QSemanticSegmentedControlSelectionTests {
     func duplicateTitleAmbiguityFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.dupctrl",
-                controlTitle: "Dup Ctrl",
-                windowTitle: "QSegDupWindow",
-                segments: [
-                    ("seg.1", "SameTitle", false, true, "AXRadioButton", nil),
-                    ("seg.2", "SameTitle", false, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.dupctrl",
+            controlTitle: "Dup Ctrl",
+            windowTitle: "QSegDupWindow",
+            segments: [
+                ("seg.1", "SameTitle", false, true, "AXRadioButton", nil),
+                ("seg.2", "SameTitle", false, true, "AXRadioButton", nil)
+            ]
+        )
 
         await #expect(throws: QAXInteractionError.self) {
             try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-                applicationName: currentProcessAppName,
+                applicationName: fixture.applicationName,
                 role: "AXSegmentedControl",
                 controlIdentifier: "seg.dupctrl",
                 controlTitle: "Dup Ctrl",
@@ -553,25 +524,23 @@ struct QSemanticSegmentedControlSelectionTests {
     func identifierTitleMismatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.mismatchctrl",
-                controlTitle: "Mismatch Ctrl",
-                windowTitle: "QSegMismatchWindow",
-                segments: [
-                    ("seg.first", "FirstTitle", false, true, "AXRadioButton", nil),
-                    ("seg.second", "SecondTitle", false, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.mismatchctrl",
+            controlTitle: "Mismatch Ctrl",
+            windowTitle: "QSegMismatchWindow",
+            segments: [
+                ("seg.first", "FirstTitle", false, true, "AXRadioButton", nil),
+                ("seg.second", "SecondTitle", false, true, "AXRadioButton", nil)
+            ]
+        )
 
         // seg.first paired with SecondTitle -> mismatch
         await #expect(throws: QAXInteractionError.self) {
             try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-                applicationName: currentProcessAppName,
+                applicationName: fixture.applicationName,
                 role: "AXSegmentedControl",
                 controlIdentifier: "seg.mismatchctrl",
                 controlTitle: "Mismatch Ctrl",
@@ -760,31 +729,21 @@ struct QSemanticSegmentedControlSelectionTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSSegmentedControl) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 500, height: 350),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            let segControl = NSSegmentedControl(labels: ["List", "Icons", "Columns"], trackingMode: .selectOne, target: nil, action: nil)
-            segControl.selectedSegment = 0
-            segControl.setAccessibilityLabel("View Mode Control")
-            window.contentView?.addSubview(segControl)
-            window.title = "QSegWindow-2AQ"
-            window.makeKeyAndOrderFront(nil)
-            return (window, segControl)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // A real, native NSSegmentedControl (labels List/Icons/Columns, first segment selected,
+        // AX label "View Mode Control") in a titled/closable/resizable window, inside the fixture.
+        let windowToken = try await fixture.createWindow(title: "QSegWindow-2AQ", width: 500, height: 350, styles: ["titled", "closable", "resizable"])
+        let segControl = "native-segmented-\(UUID().uuidString)"
+        try await fixture.addControl(
+            kind: "segmentedControl", identifier: segControl, windowToken: windowToken,
+            properties: ["segments": ["List", "Icons", "Columns"], "selectedSegment": 0, "accessibilityIdentifier": ""]
+        )
+        try await fixture.setAccessibility(segControl, "label", "View Mode Control")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let outcome = try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: nil,
             controlTitle: "View Mode Control",
@@ -804,22 +763,20 @@ struct QSemanticSegmentedControlSelectionTests {
     func targetResolutionWithIdentifierOnly() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.idonly",
-                controlTitle: "ID Only Ctrl",
-                windowTitle: "QSegIdOnlyWindow",
-                segments: [
-                    ("seg.target.id", "SomeTitle", true, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.idonly",
+            controlTitle: "ID Only Ctrl",
+            windowTitle: "QSegIdOnlyWindow",
+            segments: [
+                ("seg.target.id", "SomeTitle", true, true, "AXRadioButton", nil)
+            ]
+        )
 
         let outcome = try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.idonly",
             controlTitle: "ID Only Ctrl",
@@ -838,22 +795,20 @@ struct QSemanticSegmentedControlSelectionTests {
     func targetResolutionWithTitleOnly() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.titleonly",
-                controlTitle: "Title Only Ctrl",
-                windowTitle: "QSegTitleOnlyWindow",
-                segments: [
-                    ("seg.some.id", "TargetTitleOnly", true, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.titleonly",
+            controlTitle: "Title Only Ctrl",
+            windowTitle: "QSegTitleOnlyWindow",
+            segments: [
+                ("seg.some.id", "TargetTitleOnly", true, true, "AXRadioButton", nil)
+            ]
+        )
 
         let outcome = try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.titleonly",
             controlTitle: "Title Only Ctrl",
@@ -872,22 +827,20 @@ struct QSemanticSegmentedControlSelectionTests {
     func targetSegmentWithAXButtonRoleIsAllowed() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.btnctrl",
-                controlTitle: "Button Segment Ctrl",
-                windowTitle: "QSegBtnWindow",
-                segments: [
-                    ("seg.btn1", "ButtonSeg", true, true, "AXButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.btnctrl",
+            controlTitle: "Button Segment Ctrl",
+            windowTitle: "QSegBtnWindow",
+            segments: [
+                ("seg.btn1", "ButtonSeg", true, true, "AXButton", nil)
+            ]
+        )
 
         let outcome = try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.btnctrl",
             controlTitle: "Button Segment Ctrl",
@@ -904,10 +857,12 @@ struct QSemanticSegmentedControlSelectionTests {
     @Test("29. Missing window fails closed with AX_NO_MATCHING_ELEMENT")
     func missingWindowFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
 
         await #expect(throws: QAXInteractionError.self) {
             try await QBridgeAccessibility.shared.selectSegmentedControlItem(
-                applicationName: currentProcessAppName,
+                applicationName: fixture.applicationName,
                 role: "AXSegmentedControl",
                 controlIdentifier: "seg.ctrl",
                 controlTitle: "Ctrl",
@@ -924,22 +879,20 @@ struct QSemanticSegmentedControlSelectionTests {
     func observeSelectionEvidenceReturnsResolved() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.obs",
-                controlTitle: "Obs Ctrl",
-                windowTitle: "QSegObsWindow",
-                segments: [
-                    ("seg.obs.item", "ObsItem", true, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.obs",
+            controlTitle: "Obs Ctrl",
+            windowTitle: "QSegObsWindow",
+            segments: [
+                ("seg.obs.item", "ObsItem", true, true, "AXRadioButton", nil)
+            ]
+        )
 
         let evidence = await QBridgeAccessibility.shared.observeSegmentedControlSelectionEvidence(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.obs",
             controlTitle: "Obs Ctrl",
@@ -972,19 +925,17 @@ struct QSemanticSegmentedControlSelectionTests {
     func recoveryManagerVerifiesLiveFixture() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = await MainActor.run {
-            makeSegmentedControlWindow(
-                controlIdentifier: "seg.rec",
-                controlTitle: "Rec Ctrl",
-                windowTitle: "QSegRecWindow",
-                segments: [
-                    ("seg.rec.item", "RecItem", true, true, "AXRadioButton", nil)
-                ]
-            )
-        }
-        defer {
-            Task { @MainActor in window.orderOut(nil) }
-        }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
+            controlIdentifier: "seg.rec",
+            controlTitle: "Rec Ctrl",
+            windowTitle: "QSegRecWindow",
+            segments: [
+                ("seg.rec.item", "RecItem", true, true, "AXRadioButton", nil)
+            ]
+        )
 
         let store = try QDurableTaskStore(inMemory: true)
         let recoveryManager = QTaskRecoveryManager(store: store)
@@ -1006,7 +957,7 @@ struct QSemanticSegmentedControlSelectionTests {
             literalAction: "Select segment",
             targetResources: [],
             arguments: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSegmentedControl",
                 "controlIdentifier": "seg.rec",
                 "controlTitle": "Rec Ctrl",
@@ -1064,7 +1015,10 @@ struct QSemanticSegmentedControlSelectionTests {
     func closedLoopVerificationMatchesLiveFixture() async throws {
         guard AXIsProcessTrusted() else { return }
 
-        let (window, _, _) = makeSegmentedControlWindow(
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeSegmentedControlWindow(
+            in: fixture,
             controlIdentifier: "seg.vermatch",
             controlTitle: "Ver Match Ctrl",
             windowTitle: "QSegVerMatchWindow",
@@ -1072,12 +1026,9 @@ struct QSemanticSegmentedControlSelectionTests {
                 ("seg.vm.item", "VMItem", true, true, "AXRadioButton", nil)
             ]
         )
-        defer {
-            window.orderOut(nil)
-        }
 
         let strategy = QVerificationStrategy.axSegmentedControlSelectionMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             controlIdentifier: "seg.vermatch",
             controlTitle: "Ver Match Ctrl",

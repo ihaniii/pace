@@ -12,6 +12,9 @@
 //  mirroring the exact convention every prior semantic AX test suite in this codebase already
 //  established. See docs/PHASE_2O_SEMANTIC_ELEMENT_FOCUS.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX focus writes against AppKit's own text fields crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -21,52 +24,39 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeTextFieldWindow(identifier: String) -> (window: NSWindow, fieldA: NSTextField, fieldB: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 120),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementFocusTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-    let fieldA = NSTextField(frame: NSRect(x: 20, y: 70, width: 240, height: 24))
-    fieldA.setAccessibilityIdentifier(identifier)
-    let fieldB = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    fieldB.setAccessibilityIdentifier("\(identifier)-other")
-    contentView.addSubview(fieldA)
-    contentView.addSubview(fieldB)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, fieldA, fieldB)
+/// Two real NSTextFields in a titled window, built inside the out-of-process PaceAXFixtureHost
+/// (never in this XCTest host) with the same geometry and identifiers the in-process helper used.
+/// Returns the fixture window token and the two fields' fixture handles (also their AX identifiers).
+private func makeTextFieldWindow(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, fieldA: String, fieldB: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementFocusTestFixture", width: 300, height: 120, styles: ["titled"])
+    try await fixture.addControl(kind: "textField", identifier: identifier, windowToken: windowToken, frame: NSRect(x: 20, y: 70, width: 240, height: 24))
+    try await fixture.addControl(kind: "textField", identifier: "\(identifier)-other", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24))
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier, "\(identifier)-other")
 }
 
-@MainActor
-private func makeButtonWindow(identifier: String) -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementFocusTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let button = NSButton(frame: NSRect(x: 20, y: 20, width: 120, height: 24))
-    button.title = "Press Me"
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+/// A real NSButton in a titled window, built inside the out-of-process PaceAXFixtureHost exactly
+/// like `makeTextFieldWindow`.
+private func makeButtonWindow(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementFocusTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(kind: "button", identifier: identifier, windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 120, height: 24), properties: ["title": "Press Me"])
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+/// Makes the fixture app the ACTIVE application, so the field it has made first responder can hold
+/// SYSTEM-WIDE focus: AXUIElementCreateSystemWide + kAXFocusedUIElement only ever reports the active
+/// app's focused element, and ui.focus_element deliberately never activates the target app itself.
+/// Used only by tests whose stated precondition is that the target holds systemwide focus.
+/// Confirms activation from the fixture's own NSApp.isActive (bounded); if activation never lands,
+/// the test continues and its own assertions fail loudly — this never skips or returns early.
+private func activateFixtureApplication(_ fixture: PaceAXFixture) async throws {
+    try await fixture.applicationOperation("activate")
+    NSRunningApplication(processIdentifier: fixture.processIdentifier)?.activate()
+    for _ in 0..<30 {
+        if try await fixture.applicationOperation("state").isActive { return }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+    }
 }
 
 @Suite("QSemanticElementFocusTests")
@@ -123,16 +113,18 @@ struct QSemanticElementFocusTests {
 
     @Test("4/5. Missing target criteria fails closed with a deterministic error")
     func missingCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.focusElement(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: nil, title: nil
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Focus element",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTextField"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTextField"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-criteria"))
         #expect(result.success == false)
@@ -141,6 +133,8 @@ struct QSemanticElementFocusTests {
 
     @Test("5b. Missing applicationName/role parameters are rejected before any resolution attempt")
     func missingParametersRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingApp = QActionRequest(
             toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Focus element", parameters: ["role": "AXTextField", "identifier": "x"]
@@ -151,7 +145,7 @@ struct QSemanticElementFocusTests {
 
         let missingRole = QActionRequest(
             toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval,
-            literalAction: "Focus element", parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            literalAction: "Focus element", parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let missingRoleResult = try await QExecutionService.shared.executeAction(missingRole, context: QTaskContext(taskId: "t-missing-role"))
         #expect(missingRoleResult.success == false)
@@ -173,10 +167,12 @@ struct QSemanticElementFocusTests {
 
     @Test("7/8/9. AXStaticText, AXImage, AXGroup, and a wholly unrecognized role are all rejected for focus")
     func nonFocusableRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXStaticText", "AXImage", "AXGroup", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedFocusRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.focusElement(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -184,19 +180,23 @@ struct QSemanticElementFocusTests {
 
     @Test("9b. AXSecureTextField is rejected for focus, consistent with every other AX interaction capability's blanket exclusion of that role")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedFocusRole("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.focusElement(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
 
     @Test("9c. AXPopUpButton and AXComboBox — read-allowlisted elsewhere but deliberately NOT focus-allowlisted in this phase — are rejected")
     func deliberatelyDeferredRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for role in ["AXPopUpButton", "AXComboBox"] {
             await #expect(throws: QAXInteractionError.disallowedFocusRole(role)) {
                 _ = try await QBridgeAccessibility.shared.focusElement(
-                    applicationName: currentProcessAppName, role: role, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: role, identifier: "whatever", title: nil
                 )
             }
         }
@@ -209,19 +209,20 @@ struct QSemanticElementFocusTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, _) = makeTextFieldWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, _) = try await makeTextFieldWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
         _ = fieldA
 
         let outcome = try await QBridgeAccessibility.shared.focusElement(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "present-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "present-\(suffix)", title: nil
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.focusElement(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "absent-\(suffix)", title: nil
             )
         }
 
@@ -239,24 +240,24 @@ struct QSemanticElementFocusTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let fieldA = NSTextField(frame: NSRect(x: 20, y: 70, width: 240, height: 24))
-        fieldA.setAccessibilityIdentifier("dup-field-\(suffix)")
-        let fieldB = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        fieldB.setAccessibilityIdentifier("dup-field-\(suffix)")
-        contentView.addSubview(fieldA)
-        contentView.addSubview(fieldB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real text fields that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "textField", identifier: "dup-field-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 70, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-field-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "textField", identifier: "dup-field-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-field-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.focusElement(
-                applicationName: currentProcessAppName, role: "AXTextField", identifier: "dup-field-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTextField", identifier: "dup-field-\(suffix)", title: nil
             )
         }
     }
@@ -284,21 +285,23 @@ struct QSemanticElementFocusTests {
     func alreadyFocusedIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, _) = makeTextFieldWindow(identifier: "noop-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldA)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, _) = try await makeTextFieldWindow(in: fixture, identifier: "noop-\(suffix)")
+        try await fixture.perform(fieldA, "makeFirstResponderInWindow")
+        try await activateFixtureApplication(fixture)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // First call actually focuses it (or confirms it's already focused as a side effect of
         // makeFirstResponder above) — either is a legitimate real-fixture outcome.
         let first = try await QBridgeAccessibility.shared.focusElement(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil
         )
         _ = first
 
         // Second call MUST be idempotent: the target is now definitely already focused.
         let second = try await QBridgeAccessibility.shared.focusElement(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "noop-\(suffix)", title: nil
         )
         // .alreadyFocused is the ONLY branch in focusElement's implementation that returns
         // without an intervening AXUIElementSetAttributeValue call — structurally proving no
@@ -353,9 +356,10 @@ struct QSemanticElementFocusTests {
     func denyBlocksFocusElement() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, fieldB) = makeTextFieldWindow(identifier: "deny-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldB)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, fieldB) = try await makeTextFieldWindow(in: fixture, identifier: "deny-\(suffix)")
+        try await fixture.perform(fieldB, "makeFirstResponderInWindow")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -368,7 +372,7 @@ struct QSemanticElementFocusTests {
                   "actionName": "ui.focus_element",
                   "toolFamily": "ui",
                   "description": "Focus a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "deny-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "deny-\(suffix)"}
                 }
               ]
             }
@@ -513,9 +517,10 @@ struct QSemanticElementFocusTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, fieldB) = makeTextFieldWindow(identifier: "predispatch-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldB)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, fieldB) = try await makeTextFieldWindow(in: fixture, identifier: "predispatch-\(suffix)")
+        try await fixture.perform(fieldB, "makeFirstResponderInWindow")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -528,7 +533,7 @@ struct QSemanticElementFocusTests {
                   "actionName": "ui.focus_element",
                   "toolFamily": "ui",
                   "description": "Focus a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "predispatch-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "predispatch-\(suffix)"}
                 }
               ]
             }
@@ -543,7 +548,7 @@ struct QSemanticElementFocusTests {
         _ = try await runtime.submitIntent(prompt: "Focus the field")
 
         let evidence = await QBridgeAccessibility.shared.observeFocusedElementIdentity(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "predispatch-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "predispatch-\(suffix)", title: nil
         )
         guard case .notFocused = evidence else {
             #expect(Bool(false), "Expected the target to NOT be focused before approval, got: \(evidence)")
@@ -557,9 +562,11 @@ struct QSemanticElementFocusTests {
     func allowFocusesFieldAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, fieldB) = makeTextFieldWindow(identifier: "allow-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldB)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, fieldB) = try await makeTextFieldWindow(in: fixture, identifier: "allow-\(suffix)")
+        try await fixture.perform(fieldB, "makeFirstResponderInWindow")
+        try await activateFixtureApplication(fixture)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -572,7 +579,7 @@ struct QSemanticElementFocusTests {
                   "actionName": "ui.focus_element",
                   "toolFamily": "ui",
                   "description": "Focus a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "allow-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "allow-\(suffix)"}
                 }
               ]
             }
@@ -598,7 +605,7 @@ struct QSemanticElementFocusTests {
         #expect(!summary.isEmpty)
 
         let evidence = await QBridgeAccessibility.shared.observeFocusedElementIdentity(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "allow-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "allow-\(suffix)", title: nil
         )
         guard case .focused = evidence else {
             #expect(Bool(false), "Expected the target to be genuinely focused after approval, got: \(evidence)")
@@ -614,17 +621,18 @@ struct QSemanticElementFocusTests {
     func verificationFailsWhenNotFocused() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, fieldB) = makeTextFieldWindow(identifier: "mismatch-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldB) // focus a DIFFERENT field than the one we verify
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, fieldB) = try await makeTextFieldWindow(in: fixture, identifier: "mismatch-\(suffix)")
+        try await fixture.perform(fieldB, "makeFirstResponderInWindow") // focus a DIFFERENT field than the one we verify
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let strategy = QVerificationStrategy.axElementIsFocused(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTextField",
             matchIdentifier: "mismatch-\(suffix)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXTextField identifier=mismatch-\(suffix) label=none"
+            targetIdentity: "application=\(fixture.applicationName) role=AXTextField identifier=mismatch-\(suffix) label=none"
         )
         let result = QActionResult(actionId: "verify-mismatch-focus", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -635,12 +643,14 @@ struct QSemanticElementFocusTests {
 
     @Test("25. An unresolvable target after the focus change fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axElementIsFocused(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTextField",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXTextField identifier=vanished label=none"
+            targetIdentity: "application=\(fixture.applicationName) role=AXTextField identifier=vanished label=none"
         )
         let result = QActionResult(actionId: "verify-vanished-focus", success: true, summary: "n/a")
         let request = QActionRequest(toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -650,15 +660,17 @@ struct QSemanticElementFocusTests {
 
     @Test("26. A successful AXUIElementSetAttributeValue call alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         // Constructs a fabricated "successful" QActionResult (exactly what executeFocusElement
         // always returns after a dispatched attempt) and confirms verification alone decides the
         // outcome — it does not special-case or trust result.success.
         let strategy = QVerificationStrategy.axElementIsFocused(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTextField",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXTextField identifier=insufficient label=none"
+            targetIdentity: "application=\(fixture.applicationName) role=AXTextField identifier=insufficient label=none"
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-focus", success: true, summary: "Focus change attempted. Independent closed-loop verification pending.")
         let request = QActionRequest(toolName: "ui.focus_element", toolFamily: "ui", riskLevel: .level2UserApproval, literalAction: "n/a")
@@ -673,9 +685,11 @@ struct QSemanticElementFocusTests {
     func recoveryRecognizesAlreadyFocusedAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, _) = makeTextFieldWindow(identifier: "recovered-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldA)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, _) = try await makeTextFieldWindow(in: fixture, identifier: "recovered-\(suffix)")
+        try await fixture.perform(fieldA, "makeFirstResponderInWindow")
+        try await activateFixtureApplication(fixture)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -688,7 +702,7 @@ struct QSemanticElementFocusTests {
         let uncertainStep = QDurablePlanStepSnapshot(
             stepId: "step-uncertain-focus", index: 0, actionName: "ui.focus_element", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Focus field",
-            targetResources: [], arguments: ["applicationName": currentProcessAppName, "role": "AXTextField", "identifier": "recovered-\(suffix)"],
+            targetResources: [], arguments: ["applicationName": fixture.applicationName, "role": "AXTextField", "identifier": "recovered-\(suffix)"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -816,9 +830,11 @@ struct QSemanticElementFocusTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, fieldA, fieldB) = makeTextFieldWindow(identifier: "safe-evidence-\(suffix)")
-        defer { window.close() }
-        window.makeFirstResponder(fieldB)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, fieldA, fieldB) = try await makeTextFieldWindow(in: fixture, identifier: "safe-evidence-\(suffix)")
+        try await fixture.perform(fieldB, "makeFirstResponderInWindow")
+        try await activateFixtureApplication(fixture)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -831,7 +847,7 @@ struct QSemanticElementFocusTests {
                   "actionName": "ui.focus_element",
                   "toolFamily": "ui",
                   "description": "Focus a semantically-identified element",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTextField", "identifier": "safe-evidence-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTextField", "identifier": "safe-evidence-\(suffix)"}
                 }
               ]
             }

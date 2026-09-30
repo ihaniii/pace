@@ -44,7 +44,9 @@ final class MockAutonomousModelProvider: QStructuredModelProvider, @unchecked Se
 
         if !structuredPlansToReturn.isEmpty {
             let jsonString = structuredPlansToReturn.removeFirst()
-            return try QModelPlanParser.parse(rawText: jsonString, taskId: task.taskId, taskPrompt: task.intent)
+            // Same session as the task, exactly as QModelRouter parses real model output; otherwise
+            // the plan (and its plan_<id> memory record) lands in the parser's "default" session.
+            return try QModelPlanParser.parse(rawText: jsonString, taskId: task.taskId, taskPrompt: task.intent, sessionId: task.sessionId)
         }
 
         // Default: Open Calculator plan

@@ -27,6 +27,9 @@
 //  codebase already established. See docs/PHASE_2BW_SEMANTIC_ELEMENT_VALUE_DESCRIPTION.md for the
 //  full contract, including this phase's honest E2E findings.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -34,34 +37,31 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
 /// A genuine, real, live `NSSlider` — the exact same fixture shape `ui.read_element_range`'s/
 /// `ui.read_element_allowed_values`'s own real E2E tests already established as proven-working
 /// for resolving a real `AXSlider` by identifier.
-@MainActor
-private func makeSliderWindow(identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100) -> (window: NSWindow, slider: NSSlider) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeSliderWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeSliderWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: Double, minValue: Double = 0, maxValue: Double = 100
+) async throws -> (window: String, slider: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementValueDescriptionReadTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "slider",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["minValue": minValue, "maxValue": maxValue, "doubleValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementValueDescriptionReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let slider = NSSlider(value: value, minValue: minValue, maxValue: maxValue, target: nil, action: nil)
-    slider.frame = NSRect(x: 20, y: 20, width: 240, height: 24)
-    slider.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(slider)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, slider)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ValueDescriptionMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -188,9 +188,11 @@ struct QSemanticElementValueDescriptionReadTests {
     @MainActor
     func secureFieldRejectedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -200,13 +202,14 @@ struct QSemanticElementValueDescriptionReadTests {
     func wrongRoleFailsClosedRealTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "wrongrole-\(suffix)", value: 10)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeSliderWindow(in: fixture, identifier: "wrongrole-\(suffix)", value: 10)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.disallowedReadRole("AXTable")) {
             _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "wrongrole-\(suffix)", title: nil
             )
         }
     }
@@ -214,9 +217,11 @@ struct QSemanticElementValueDescriptionReadTests {
     @Test("7. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: nil, title: nil
             )
         }
     }
@@ -236,13 +241,14 @@ struct QSemanticElementValueDescriptionReadTests {
     func missingTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeSliderWindow(identifier: "present-\(suffix)", value: 10)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeSliderWindow(in: fixture, identifier: "present-\(suffix)", value: 10)
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: "Absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: "Absent-\(suffix)", title: nil
             )
         }
     }
@@ -253,26 +259,17 @@ struct QSemanticElementValueDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupSlider-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let sliderA = NSSlider(value: 10, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderA.frame = NSRect(x: 10, y: 10, width: 150, height: 24)
-        sliderA.setAccessibilityIdentifier(sharedIdentifier)
-        let sliderB = NSSlider(value: 20, minValue: 0, maxValue: 100, target: nil, action: nil)
-        sliderB.frame = NSRect(x: 10, y: 100, width: 150, height: 24)
-        sliderB.setAccessibilityIdentifier(sharedIdentifier)
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-        container.addSubview(sliderA)
-        container.addSubview(sliderB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(kind: "slider", identifier: "inline-sliderA", windowToken: windowToken, frame: NSRect(x: 10, y: 10, width: 150, height: 24), properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 10.0, "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.addControl(kind: "slider", identifier: "inline-sliderB", windowToken: windowToken, frame: NSRect(x: 10, y: 100, width: 150, height: 24), properties: ["minValue": 0.0, "maxValue": 100.0, "doubleValue": 20.0, "accessibilityIdentifier": sharedIdentifier, "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-                applicationName: currentProcessAppName, role: "AXSlider", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXSlider", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -368,9 +365,10 @@ struct QSemanticElementValueDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "DurableSlider-\(suffix)"
-        let (window, slider) = makeSliderWindow(identifier: sentinelIdentifier, value: 10, minValue: 0, maxValue: 100)
-        slider.setAccessibilityValueDescription("Deep Blue")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: sentinelIdentifier, value: 10, minValue: 0, maxValue: 100)
+        try await fixture.setAccessibility(slider, "valueDescription", "Deep Blue")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -383,7 +381,7 @@ struct QSemanticElementValueDescriptionReadTests {
                   "actionName": "ui.read_element_value_description",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's value description",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -409,7 +407,7 @@ struct QSemanticElementValueDescriptionReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_value_description" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("25. Audit records for this capability never contain anything beyond bounded semantic UI metadata")
@@ -418,9 +416,10 @@ struct QSemanticElementValueDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sentinelIdentifier = "AuditSlider-\(suffix)"
-        let (window, slider) = makeSliderWindow(identifier: sentinelIdentifier, value: 10, minValue: 0, maxValue: 100)
-        slider.setAccessibilityValueDescription("Deep Blue")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: sentinelIdentifier, value: 10, minValue: 0, maxValue: 100)
+        try await fixture.setAccessibility(slider, "valueDescription", "Deep Blue")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -433,7 +432,7 @@ struct QSemanticElementValueDescriptionReadTests {
                   "actionName": "ui.read_element_value_description",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's value description",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXSlider", "identifier": "\(sentinelIdentifier)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXSlider", "identifier": "\(sentinelIdentifier)"}
                 }
               ]
             }
@@ -495,19 +494,20 @@ struct QSemanticElementValueDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, slider) = makeSliderWindow(identifier: identifier, value: 10, minValue: 0, maxValue: 100)
-        slider.setAccessibilityValueDescription("Deep Blue")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: identifier, value: 10, minValue: 0, maxValue: 100)
+        try await fixture.setAccessibility(slider, "valueDescription", "Deep Blue")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementValueDescription(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementValueDescription(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: identifier, title: nil
         )
         #expect(first?.valueDescription == second?.valueDescription)
-        #expect(slider.doubleValue == 10)
+        #expect(try await fixture.double(slider, "doubleValue") == 10)
     }
 
     @Test("28. No raw AXUIElement reference is ever persisted — structural proof: QAXElementValueDescriptionMetadata's stored properties are String?/String only, no AXUIElement-typed field exists anywhere in the declaration")
@@ -526,15 +526,16 @@ struct QSemanticElementValueDescriptionReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "NoMutate-\(suffix)"
-        let (window, slider) = makeSliderWindow(identifier: identifier, value: 42, minValue: 0, maxValue: 100)
-        slider.setAccessibilityValueDescription("Deep Blue")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: identifier, value: 42, minValue: 0, maxValue: 100)
+        try await fixture.setAccessibility(slider, "valueDescription", "Deep Blue")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementValueDescription(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: identifier, title: nil
         )
-        #expect(slider.doubleValue == 42)
+        #expect(try await fixture.double(slider, "doubleValue") == 42)
     }
 
     @Test("30. Observing an element's value description never authorizes ui.set_text_value/ui.set_slider_value/ui.step_incrementor/ui.set_element_state — the authorization paths are entirely disjoint")
@@ -685,26 +686,27 @@ struct QSemanticElementValueDescriptionReadTests {
         }
         let suffix = UUID().uuidString
         let identifier = "e2e-valuedesc-\(suffix)"
-        let (window, slider) = makeSliderWindow(identifier: identifier, value: 25, minValue: 0, maxValue: 100)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, slider) = try await makeSliderWindow(in: fixture, identifier: identifier, value: 25, minValue: 0, maxValue: 100)
 
         // Force a deterministic, known value via the real, declared AppKit accessor
         // (accessibilityValueDescription, NSAccessibilityProtocols.h) — the third capability this
         // session found with a genuine forced-value round-trip path for its exact attribute
         // (after ui.read_table_dimensions, Phase 2BU, and ui.read_element_allowed_values, Phase
         // 2BV).
-        slider.setAccessibilityValueDescription("Deep Blue")
-        #expect(slider.accessibilityValueDescription() == "Deep Blue")
+        try await fixture.setAccessibility(slider, "valueDescription", "Deep Blue")
+        #expect(try await fixture.optionalString(slider, "accessibility:valueDescription") == "Deep Blue")
 
-        defer { window.close() }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementValueDescription(
-            applicationName: currentProcessAppName, role: "AXSlider", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXSlider", identifier: identifier, title: nil
         )
 
         #expect(metadata?.valueDescription == "Deep Blue")
-        #expect(metadata?.applicationName == currentProcessAppName)
+        #expect(metadata?.applicationName == fixture.applicationName)
         // The read never mutated the fixture's own current value.
-        #expect(slider.doubleValue == 25)
+        #expect(try await fixture.double(slider, "doubleValue") == 25)
     }
 }

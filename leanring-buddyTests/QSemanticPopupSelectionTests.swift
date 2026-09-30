@@ -13,6 +13,9 @@
 //  codebase already established. See docs/PHASE_2P_SEMANTIC_POPUP_SELECTION.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -22,35 +25,28 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
+/// A real NSPopUpButton with the given items and selection in a titled window, built inside the
+/// out-of-process PaceAXFixtureHost (never in this XCTest host) with the same geometry the
+/// in-process helper used. Returns the fixture window token and the pop-up's fixture handle (also
+/// its AX identifier).
 private func makePopUpButtonWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     items: [String],
     selectedIndex: Int = 0
-) -> (window: NSWindow, popup: NSPopUpButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, popup: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticPopupSelectionTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "popUpButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 200, height: 24),
+        properties: ["items": items, "indexOfSelectedItem": selectedIndex]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticPopupSelectionTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let popup = NSPopUpButton(frame: NSRect(x: 20, y: 20, width: 200, height: 24))
-    popup.addItems(withTitles: items)
-    popup.selectItem(at: selectedIndex)
-    popup.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(popup)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, popup)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticPopupSelectionTests")
 struct QSemanticPopupSelectionTests {
@@ -106,16 +102,18 @@ struct QSemanticPopupSelectionTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: nil, title: nil, itemTitle: "PNG"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: nil, title: nil, itemTitle: "PNG"
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.select_popup_item", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select popup item",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXPopUpButton", "itemTitle": "PNG"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXPopUpButton", "itemTitle": "PNG"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria"))
         #expect(result.success == false)
@@ -124,16 +122,18 @@ struct QSemanticPopupSelectionTests {
 
     @Test("6/7. Missing/empty itemTitle fails closed with a deterministic error")
     func missingItemTitleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "x", title: nil, itemTitle: ""
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "x", title: nil, itemTitle: ""
             )
         }
 
         let missingRequest = QActionRequest(
             toolName: "ui.select_popup_item", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select popup item",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXPopUpButton", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXPopUpButton", "identifier": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-item-title"))
         #expect(missingResult.success == false)
@@ -142,7 +142,7 @@ struct QSemanticPopupSelectionTests {
         let emptyRequest = QActionRequest(
             toolName: "ui.select_popup_item", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Select popup item",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXPopUpButton", "identifier": "x", "itemTitle": ""]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXPopUpButton", "identifier": "x", "itemTitle": ""]
         )
         let emptyResult = try await QExecutionService.shared.executeAction(emptyRequest, context: QTaskContext(taskId: "t-empty-item-title"))
         #expect(emptyResult.success == false)
@@ -158,28 +158,32 @@ struct QSemanticPopupSelectionTests {
 
     @Test("9. AXComboBox is explicitly rejected — deliberately never allowlisted for this phase")
     func comboBoxRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedPopupRole("AXComboBox")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXComboBox", identifier: "whatever", title: nil, itemTitle: "PNG"
+                applicationName: fixture.applicationName, role: "AXComboBox", identifier: "whatever", title: nil, itemTitle: "PNG"
             )
         }
     }
 
     @Test("10/11. AXButton (a role other capabilities accept) and a wholly unrecognized role are both rejected for popup selection")
     func unrelatedAndUnknownRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedPopupRole("AXButton")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "whatever", title: nil, itemTitle: "PNG"
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "whatever", title: nil, itemTitle: "PNG"
             )
         }
         await #expect(throws: QAXInteractionError.disallowedPopupRole("AXMenuButton")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXMenuButton", identifier: "whatever", title: nil, itemTitle: "PNG"
+                applicationName: fixture.applicationName, role: "AXMenuButton", identifier: "whatever", title: nil, itemTitle: "PNG"
             )
         }
         await #expect(throws: QAXInteractionError.disallowedPopupRole("AXMadeUpRole99")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, itemTitle: "PNG"
+                applicationName: fixture.applicationName, role: "AXMadeUpRole99", identifier: "whatever", title: nil, itemTitle: "PNG"
             )
         }
     }
@@ -191,18 +195,19 @@ struct QSemanticPopupSelectionTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "present-\(suffix)", items: ["PNG", "JPEG", "TIFF"])
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makePopUpButtonWindow(in: fixture, identifier: "present-\(suffix)", items: ["PNG", "JPEG", "TIFF"])
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectPopupItem(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "present-\(suffix)", title: nil, itemTitle: "JPEG"
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "present-\(suffix)", title: nil, itemTitle: "JPEG"
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "absent-\(suffix)", title: nil, itemTitle: "JPEG"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "absent-\(suffix)", title: nil, itemTitle: "JPEG"
             )
         }
 
@@ -220,26 +225,22 @@ struct QSemanticPopupSelectionTests {
     func ambiguousPopupTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let popupA = NSPopUpButton(frame: NSRect(x: 20, y: 70, width: 200, height: 24))
-        popupA.addItems(withTitles: ["PNG", "JPEG"])
-        popupA.setAccessibilityIdentifier("dup-popup-\(suffix)")
-        let popupB = NSPopUpButton(frame: NSRect(x: 20, y: 20, width: 200, height: 24))
-        popupB.addItems(withTitles: ["PNG", "JPEG"])
-        popupB.setAccessibilityIdentifier("dup-popup-\(suffix)")
-        contentView.addSubview(popupA)
-        contentView.addSubview(popupB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real pop-up buttons that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        for (handleSuffix, popupFrame) in [("A", NSRect(x: 20, y: 70, width: 200, height: 24)), ("B", NSRect(x: 20, y: 20, width: 200, height: 24))] {
+            try await fixture.addControl(
+                kind: "popUpButton", identifier: "dup-popup-\(suffix)-\(handleSuffix)", windowToken: windowToken,
+                frame: popupFrame, properties: ["items": ["PNG", "JPEG"], "accessibilityIdentifier": "dup-popup-\(suffix)"]
+            )
+        }
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "dup-popup-\(suffix)", title: nil, itemTitle: "JPEG"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "dup-popup-\(suffix)", title: nil, itemTitle: "JPEG"
             )
         }
     }
@@ -267,16 +268,17 @@ struct QSemanticPopupSelectionTests {
     func exactItemLabelResolves() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "exact-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "exact-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectPopupItem(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "exact-\(suffix)", title: nil, itemTitle: "JPEG"
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "exact-\(suffix)", title: nil, itemTitle: "JPEG"
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.requestedItemTitle == "JPEG")
-        #expect(popup.titleOfSelectedItem == "JPEG")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "JPEG")
     }
 
     @Test("18/19. A substring or fuzzy-cased variant of a real item label is never accepted as a match")
@@ -284,18 +286,19 @@ struct QSemanticPopupSelectionTests {
     func nonExactItemVariantsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "variant-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makePopUpButtonWindow(in: fixture, identifier: "variant-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.menuItemNotFound("PN")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "variant-\(suffix)", title: nil, itemTitle: "PN"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "variant-\(suffix)", title: nil, itemTitle: "PN"
             )
         }
         await #expect(throws: QAXInteractionError.menuItemNotFound("png")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "variant-\(suffix)", title: nil, itemTitle: "png"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "variant-\(suffix)", title: nil, itemTitle: "png"
             )
         }
     }
@@ -305,20 +308,19 @@ struct QSemanticPopupSelectionTests {
     func duplicateItemLabelsRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "dupitem-\(suffix)", items: ["Same", "Other"], selectedIndex: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "dupitem-\(suffix)", items: ["Same", "Other"], selectedIndex: 1)
         // NSPopUpButton normally de-duplicates item titles by appending a suffix on
         // addItem(withTitle:) collision, so a genuine AX-level duplicate-title scenario is added
         // directly via NSMenuItem, mirroring how QSemanticMenuSelectionTests constructs its own
         // duplicate-item fixture.
-        if let menu = (window.contentView?.subviews.first { $0 is NSPopUpButton } as? NSPopUpButton)?.menu {
-            menu.addItem(withTitle: "Same", action: nil, keyEquivalent: "")
-        }
+        try await fixture.set(popup, "appendMenuItemWithTitle", "Same")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "dupitem-\(suffix)", title: nil, itemTitle: "Same"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "dupitem-\(suffix)", title: nil, itemTitle: "Same"
             )
         }
     }
@@ -328,13 +330,14 @@ struct QSemanticPopupSelectionTests {
     func missingItemRejected() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "noitem-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makePopUpButtonWindow(in: fixture, identifier: "noitem-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.menuItemNotFound("GIF")) {
             _ = try await QBridgeAccessibility.shared.selectPopupItem(
-                applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "noitem-\(suffix)", title: nil, itemTitle: "GIF"
+                applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "noitem-\(suffix)", title: nil, itemTitle: "GIF"
             )
         }
     }
@@ -346,13 +349,14 @@ struct QSemanticPopupSelectionTests {
     func alreadySelectedItemIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "noop-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "noop-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
-        #expect(popup.titleOfSelectedItem == "JPEG")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "JPEG")
 
         let outcome = try await QBridgeAccessibility.shared.selectPopupItem(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "noop-\(suffix)", title: nil, itemTitle: "JPEG"
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "noop-\(suffix)", title: nil, itemTitle: "JPEG"
         )
         // .alreadySelected is the ONLY branch in selectPopupItem's implementation that returns
         // without an intervening AXUIElementPerformAction press sequence — structurally proving
@@ -361,7 +365,7 @@ struct QSemanticPopupSelectionTests {
         // .alreadyDesired, focusElement's .alreadyFocused).
         #expect(outcome.changeKind == .alreadySelected)
         #expect(outcome.previousValue == "JPEG")
-        #expect(popup.titleOfSelectedItem == "JPEG") // unchanged — proves no press occurred
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "JPEG") // unchanged — proves no press occurred
     }
 
     // MARK: - 24. Approval required, never dispatches silently
@@ -409,8 +413,9 @@ struct QSemanticPopupSelectionTests {
     func denyBlocksSelectPopupItem() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "deny-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "deny-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -423,7 +428,7 @@ struct QSemanticPopupSelectionTests {
                   "actionName": "ui.select_popup_item",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified popup item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "deny-\(suffix)", "itemTitle": "JPEG"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "deny-\(suffix)", "itemTitle": "JPEG"}
                 }
               ]
             }
@@ -446,7 +451,7 @@ struct QSemanticPopupSelectionTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(popup.titleOfSelectedItem == "PNG")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "PNG")
     }
 
     // MARK: - 26. Persisted / expiry-equivalent approval never self-authorizes
@@ -557,8 +562,9 @@ struct QSemanticPopupSelectionTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "predispatch-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "predispatch-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -571,7 +577,7 @@ struct QSemanticPopupSelectionTests {
                   "actionName": "ui.select_popup_item",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified popup item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "predispatch-\(suffix)", "itemTitle": "JPEG"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "predispatch-\(suffix)", "itemTitle": "JPEG"}
                 }
               ]
             }
@@ -584,7 +590,7 @@ struct QSemanticPopupSelectionTests {
             endpointName: "semantic-popup-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Select the item")
-        #expect(popup.titleOfSelectedItem == "PNG")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "PNG")
     }
 
     @Test("30/31/32. Approving the request selects the item exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -592,8 +598,9 @@ struct QSemanticPopupSelectionTests {
     func allowSelectsItemAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "allow-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "allow-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -606,7 +613,7 @@ struct QSemanticPopupSelectionTests {
                   "actionName": "ui.select_popup_item",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified popup item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "allow-\(suffix)", "itemTitle": "TIFF"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "allow-\(suffix)", "itemTitle": "TIFF"}
                 }
               ]
             }
@@ -633,7 +640,7 @@ struct QSemanticPopupSelectionTests {
         // Execution happens entirely inside executeSelectPopupItem, invoked only after the
         // approval grant is consumed — resolution (collectMatches) is therefore always fresh,
         // never a reference held from before approval. Real, observed outcome:
-        #expect(popup.titleOfSelectedItem == "TIFF")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "TIFF")
     }
 
     // MARK: - 33. Changed popup between approval and execution fails closed (fresh-resolution proof)
@@ -659,17 +666,18 @@ struct QSemanticPopupSelectionTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "verify-match-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "verify-match-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectPopupItem(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "verify-match-\(suffix)", title: nil, itemTitle: "JPEG"
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "verify-match-\(suffix)", title: nil, itemTitle: "JPEG"
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axPopupValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXPopUpButton",
             matchIdentifier: "verify-match-\(suffix)",
             matchTitle: nil,
@@ -687,17 +695,18 @@ struct QSemanticPopupSelectionTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "verify-mismatch-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "verify-mismatch-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.selectPopupItem(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "verify-mismatch-\(suffix)", title: nil, itemTitle: "JPEG"
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "verify-mismatch-\(suffix)", title: nil, itemTitle: "JPEG"
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axPopupValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXPopUpButton",
             matchIdentifier: "verify-mismatch-\(suffix)",
             matchTitle: nil,
@@ -712,12 +721,14 @@ struct QSemanticPopupSelectionTests {
 
     @Test("36. An unresolvable/unreadable target after the selection fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axPopupValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXPopUpButton",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXPopUpButton identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXPopUpButton identifier=vanished label=none",
             requestedItemTitle: "PNG"
         )
         let result = QActionResult(actionId: "verify-vanished-popup", success: true, summary: "n/a")
@@ -728,12 +739,14 @@ struct QSemanticPopupSelectionTests {
 
     @Test("37. A successful AX press sequence alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axPopupValueMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXPopUpButton",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXPopUpButton identifier=insufficient label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXPopUpButton identifier=insufficient label=none",
             requestedItemTitle: "PNG"
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-popup", success: true, summary: "Popup selection attempted. Independent closed-loop verification pending.")
@@ -749,8 +762,9 @@ struct QSemanticPopupSelectionTests {
     func recoveryRecognizesAlreadySelectedAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "recovered-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "recovered-\(suffix)", items: ["PNG", "JPEG"], selectedIndex: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -764,7 +778,7 @@ struct QSemanticPopupSelectionTests {
             stepId: "step-uncertain-popup", index: 0, actionName: "ui.select_popup_item", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Select JPEG",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXPopUpButton", "identifier": "recovered-\(suffix)", "itemTitle": "JPEG"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXPopUpButton", "identifier": "recovered-\(suffix)", "itemTitle": "JPEG"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -894,8 +908,9 @@ struct QSemanticPopupSelectionTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makePopUpButtonWindow(identifier: "safe-evidence-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePopUpButtonWindow(in: fixture, identifier: "safe-evidence-\(suffix)", items: ["PNG", "JPEG", "TIFF"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -908,7 +923,7 @@ struct QSemanticPopupSelectionTests {
                   "actionName": "ui.select_popup_item",
                   "toolFamily": "ui",
                   "description": "Select a semantically-identified popup item",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "safe-evidence-\(suffix)", "itemTitle": "TIFF"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "safe-evidence-\(suffix)", "itemTitle": "TIFF"}
                 }
               ]
             }
@@ -976,11 +991,12 @@ struct QSemanticPopupSelectionTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, popup) = makePopUpButtonWindow(identifier: "e2e-\(suffix)", items: ["PNG", "JPEG", "TIFF", "BMP"], selectedIndex: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, popup) = try await makePopUpButtonWindow(in: fixture, identifier: "e2e-\(suffix)", items: ["PNG", "JPEG", "TIFF", "BMP"], selectedIndex: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(popup.titleOfSelectedItem != "BMP")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") != "BMP")
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -992,7 +1008,7 @@ struct QSemanticPopupSelectionTests {
                   "actionName": "ui.select_popup_item",
                   "toolFamily": "ui",
                   "description": "Select BMP from the format popup",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXPopUpButton", "identifier": "e2e-\(suffix)", "itemTitle": "BMP"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXPopUpButton", "identifier": "e2e-\(suffix)", "itemTitle": "BMP"}
                 }
               ]
             }
@@ -1018,9 +1034,9 @@ struct QSemanticPopupSelectionTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(popup.titleOfSelectedItem == "BMP")
+        #expect(try await fixture.string(popup, "titleOfSelectedItem") == "BMP")
         let evidence = await QBridgeAccessibility.shared.observePopupValueEvidence(
-            applicationName: currentProcessAppName, role: "AXPopUpButton", identifier: "e2e-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXPopUpButton", identifier: "e2e-\(suffix)", title: nil
         )
         guard case .resolved(let currentValue) = evidence else {
             #expect(Bool(false), "Expected the popup to remain resolvable with a readable value, got: \(evidence)")

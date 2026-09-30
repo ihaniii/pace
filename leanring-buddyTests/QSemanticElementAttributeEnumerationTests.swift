@@ -21,6 +21,9 @@
 //  already established. See docs/PHASE_2BL_SEMANTIC_ELEMENT_ATTRIBUTE_ENUMERATION.md for the
 //  full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -28,53 +31,49 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
-@MainActor
-private func makeButtonWindow(identifier: String, title: String) -> (window: NSWindow, button: NSButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeButtonWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeButtonWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, title: String
+) async throws -> (window: String, button: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementAttributesTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "button",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 32),
+        properties: ["title": title, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementAttributesTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let button = NSButton(frame: NSRect(x: 20, y: 20, width: 240, height: 32))
-    button.title = title
-    button.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(button)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, button)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
-@MainActor
-private func makeTextFieldWindow(identifier: String, value: String) -> (window: NSWindow, field: NSTextField) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 300, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+/// Fixture-backed replacement for the in-process `makeTextFieldWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
+private func makeTextFieldWindow(
+    in fixture: PaceAXFixture,
+    identifier: String, value: String
+) async throws -> (window: String, field: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementAttributesTestFixture", width: 300, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "textField",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 240, height: 24),
+        properties: ["stringValue": value, "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementAttributesTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
-    let field = NSTextField(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-    field.stringValue = value
-    field.isEditable = true
-    field.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(field)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, field)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementAttributesMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -154,12 +153,13 @@ struct QSemanticElementAttributeEnumerationTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "attrs-\(suffix)", title: "Submit")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "attrs-\(suffix)", title: "Submit")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let attributes = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "attrs-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "attrs-\(suffix)", title: nil
         )
         #expect(attributes.attributeNames.contains("AXRole"))
     }
@@ -190,17 +190,18 @@ struct QSemanticElementAttributeEnumerationTests {
     func exactElementMatchSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "byid-\(suffix)", title: "ByTitleButton-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "byid-\(suffix)", title: "ByTitleButton-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let byIdentifier = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "byid-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "byid-\(suffix)", title: nil
         )
         #expect(byIdentifier.attributeNames.contains("AXRole"))
 
         let byTitle = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: nil, title: "ByTitleButton-\(suffix)"
+            applicationName: fixture.applicationName, role: "AXButton", identifier: nil, title: "ByTitleButton-\(suffix)"
         )
         #expect(byTitle.attributeNames.contains("AXRole"))
     }
@@ -212,13 +213,14 @@ struct QSemanticElementAttributeEnumerationTests {
     func zeroElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "present-\(suffix)", title: "Present")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeButtonWindow(in: fixture, identifier: "present-\(suffix)", title: "Present")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.listElementAttributes(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -230,26 +232,17 @@ struct QSemanticElementAttributeEnumerationTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let buttonA = NSButton(frame: NSRect(x: 20, y: 20, width: 240, height: 32))
-        buttonA.title = "Dup"
-        buttonA.setAccessibilityIdentifier("dup-attrs-\(suffix)")
-        let buttonB = NSButton(frame: NSRect(x: 20, y: 60, width: 240, height: 32))
-        buttonB.title = "Dup"
-        buttonB.setAccessibilityIdentifier("dup-attrs-\(suffix)")
-        contentView.addSubview(buttonA)
-        contentView.addSubview(buttonB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 32), properties: ["title": "Dup", "accessibilityIdentifier": "dup-attrs-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "button", identifier: "inline-buttonB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 32), properties: ["title": "Dup", "accessibilityIdentifier": "dup-attrs-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listElementAttributes(
-                applicationName: currentProcessAppName, role: "AXButton", identifier: "dup-attrs-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXButton", identifier: "dup-attrs-\(suffix)", title: nil
             )
         }
     }
@@ -258,10 +251,12 @@ struct QSemanticElementAttributeEnumerationTests {
 
     @Test("7. Disallowed roles are rejected before any AX search is even attempted — QAXElementReadRolePolicy reused verbatim, not broadened")
     func unsupportedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea"] {
             await #expect(throws: QAXInteractionError.disallowedReadRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.listElementAttributes(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -269,9 +264,11 @@ struct QSemanticElementAttributeEnumerationTests {
 
     @Test("7b. AXSecureTextField is rejected before any AX search, mirroring ui.read_element_value's/ui.list_element_actions' identical secure-field precedent")
     func secureFieldRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.secureFieldReadDenied("AXSecureTextField")) {
             _ = try await QBridgeAccessibility.shared.listElementAttributes(
-                applicationName: currentProcessAppName, role: "AXSecureTextField", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXSecureTextField", identifier: "whatever", title: nil
             )
         }
     }
@@ -283,16 +280,17 @@ struct QSemanticElementAttributeEnumerationTests {
     func standardAttributesEnumerated() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "standard-\(suffix)", title: "Standard")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "standard-\(suffix)", title: "Standard")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let attributes = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "standard-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "standard-\(suffix)", title: nil
         )
         #expect(attributes.attributeNames.contains("AXRole"))
         #expect(attributes.role == "AXButton")
-        #expect(attributes.applicationName == currentProcessAppName)
+        #expect(attributes.applicationName == fixture.applicationName)
     }
 
     // MARK: - 9. Zero attributes (structural)
@@ -381,14 +379,15 @@ struct QSemanticElementAttributeEnumerationTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, field) = makeTextFieldWindow(identifier: "nomutate-\(suffix)", value: "unchanged")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, field) = try await makeTextFieldWindow(in: fixture, identifier: "nomutate-\(suffix)", value: "unchanged")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(field.stringValue == "unchanged")
+        #expect(try await fixture.string(field, "stringValue") == "unchanged")
     }
 
     // MARK: - 19. No approval request is created; discovered attribute names never authorize a value read
@@ -442,8 +441,9 @@ struct QSemanticElementAttributeEnumerationTests {
     func individualAttributeNamesNotPersistedDurably() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "durable-\(suffix)", title: "Message")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "durable-\(suffix)", title: "Message")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -456,7 +456,7 @@ struct QSemanticElementAttributeEnumerationTests {
                   "actionName": "ui.list_element_attributes",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's supported attribute names",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -492,8 +492,9 @@ struct QSemanticElementAttributeEnumerationTests {
     func individualAttributeNamesNotInAuditRecords() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeButtonWindow(identifier: "audit-\(suffix)", title: "Message")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeButtonWindow(in: fixture, identifier: "audit-\(suffix)", title: "Message")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -506,7 +507,7 @@ struct QSemanticElementAttributeEnumerationTests {
                   "actionName": "ui.list_element_attributes",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified element's supported attribute names",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXButton", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXButton", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -664,21 +665,21 @@ struct QSemanticElementAttributeEnumerationTests {
         }
         let suffix = UUID().uuidString
 
-        let (buttonWindow, button) = makeButtonWindow(identifier: "e2e-button-\(suffix)", title: "Standard")
-        defer { buttonWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (buttonWindow, button) = try await makeButtonWindow(in: fixture, identifier: "e2e-button-\(suffix)", title: "Standard")
         let buttonAttributes = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXButton", identifier: "e2e-button-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXButton", identifier: "e2e-button-\(suffix)", title: nil
         )
         #expect(buttonAttributes.attributeNames.contains("AXRole"))
-        #expect(button.title == "Standard") // provably unchanged — no mutation occurred
+        #expect(try await fixture.string(button, "title") == "Standard") // provably unchanged — no mutation occurred
 
-        let (fieldWindow, field) = makeTextFieldWindow(identifier: "e2e-field-\(suffix)", value: "unchanged-value")
-        defer { fieldWindow.close() }
+        let (fieldWindow, field) = try await makeTextFieldWindow(in: fixture, identifier: "e2e-field-\(suffix)", value: "unchanged-value")
         try? await Task.sleep(nanoseconds: 150_000_000)
         let fieldAttributes = try await QBridgeAccessibility.shared.listElementAttributes(
-            applicationName: currentProcessAppName, role: "AXTextField", identifier: "e2e-field-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTextField", identifier: "e2e-field-\(suffix)", title: nil
         )
         #expect(fieldAttributes.attributeNames.contains("AXRole"))
-        #expect(field.stringValue == "unchanged-value") // provably unchanged — no mutation, no value read
+        #expect(try await fixture.string(field, "stringValue") == "unchanged-value") // provably unchanged — no mutation, no value read
     }
 }

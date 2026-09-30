@@ -29,6 +29,9 @@
 //  codebase already established. See docs/PHASE_2CF_SEMANTIC_DISCLOSURE_LEVEL.md for the full
 //  contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads against AppKit's own controls crash, deadlock, or return inconsistent trees.
+//
 
 import Testing
 import AppKit
@@ -36,52 +39,44 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXRow` — the same role-override mechanism `QSemanticOutlineRowSelectionTests`'s own
-/// `AXRow` fixtures already establish as proven-working, not a mock or simulation. Its disclosure
-/// level is forced via the real, declared `setAccessibilityDisclosureLevel(_:)`/
-/// `accessibilityDisclosureLevel()` AppKit accessor pair (`NSAccessibilityProtocols.h`,
-/// `API_AVAILABLE(macos(10.10))`) directly on the instance — the same method-pair-not-property
-/// bridging pattern `ui.read_element_help_text`'s `setAccessibilityHelp`/`accessibilityHelp()`
-/// already established as proven-working — no subclass override of its own is needed.
-@MainActor
-private final class QDisclosureLevelRowFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        NSAccessibility.Role(rawValue: "AXRow")
-    }
-}
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXRow` — the same role-override mechanism `QSemanticOutlineRowSelectionTests`'s own
+// `AXRow` fixtures already establish as proven-working, not a mock or simulation. Its disclosure
+// level is forced via the real, declared `setAccessibilityDisclosureLevel(_:)`/
+// `accessibilityDisclosureLevel()` AppKit accessor pair (`NSAccessibilityProtocols.h`,
+// `API_AVAILABLE(macos(10.10))`) directly on the instance — the same method-pair-not-property
+// bridging pattern `ui.read_element_help_text`'s `setAccessibilityHelp`/`accessibilityHelp()`
+// already established as proven-working — no subclass override of its own is needed.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QDisclosureLevelRowFixtureButton".)
 
-@MainActor
+/// Fixture-backed replacement for the in-process `makeDisclosureLevelRowWindow`: the same window (title,
+/// size, styles) and control (kind, frame, properties, accessibility overrides), built inside
+/// the out-of-process PaceAXFixtureHost, never in this XCTest host. Returns the fixture window
+/// token and the control's fixture handle (also its AX identifier).
+@discardableResult
 private func makeDisclosureLevelRowWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     disclosureLevel: Int? = nil
-) -> (window: NSWindow, row: QDisclosureLevelRowFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, row: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticElementDisclosureLevelReadTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "custom:QDisclosureLevelRowFixtureButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 160, height: 24),
+        properties: ["title": "Node", "detachAction": true]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticElementDisclosureLevelReadTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let row = QDisclosureLevelRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 160, height: 24))
-    row.title = "Node"
-    row.setAccessibilityIdentifier(identifier)
     if let disclosureLevel {
-        row.setAccessibilityDisclosureLevel(disclosureLevel)
+        try await fixture.setAccessibility(identifier, "disclosureLevel", disclosureLevel)
     }
-    contentView.addSubview(row)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, row)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 private final class ElementDisclosureLevelMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -163,12 +158,13 @@ struct QSemanticElementDisclosureLevelReadTests {
     func nonZeroDisclosureLevelReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "nested-\(suffix)", disclosureLevel: 2)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureLevelRowWindow(in: fixture, identifier: "nested-\(suffix)", disclosureLevel: 2)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "nested-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "nested-\(suffix)", title: nil
         )
         #expect(metadata.disclosureLevel == 2)
     }
@@ -180,12 +176,13 @@ struct QSemanticElementDisclosureLevelReadTests {
     func zeroDisclosureLevelReportedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "toplevel-\(suffix)", disclosureLevel: 0)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureLevelRowWindow(in: fixture, identifier: "toplevel-\(suffix)", disclosureLevel: 0)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "toplevel-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "toplevel-\(suffix)", title: nil
         )
         #expect(metadata.disclosureLevel == 0)
     }
@@ -233,13 +230,14 @@ struct QSemanticElementDisclosureLevelReadTests {
     func missingElementFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeDisclosureLevelRowWindow(in: fixture, identifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -251,24 +249,17 @@ struct QSemanticElementDisclosureLevelReadTests {
     func ambiguousElementMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 120))
-        let rowA = QDisclosureLevelRowFixtureButton(frame: NSRect(x: 20, y: 20, width: 240, height: 24))
-        rowA.setAccessibilityIdentifier("dup-disclosure-\(suffix)")
-        let rowB = QDisclosureLevelRowFixtureButton(frame: NSRect(x: 20, y: 60, width: 240, height: 24))
-        rowB.setAccessibilityIdentifier("dup-disclosure-\(suffix)")
-        contentView.addSubview(rowA)
-        contentView.addSubview(rowB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 120, styles: ["titled"])
+        try await fixture.addControl(kind: "custom:QDisclosureLevelRowFixtureButton", identifier: "inline-rowA", windowToken: windowToken, frame: NSRect(x: 20, y: 20, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-disclosure-\(suffix)", "detachAction": true])
+        try await fixture.addControl(kind: "custom:QDisclosureLevelRowFixtureButton", identifier: "inline-rowB", windowToken: windowToken, frame: NSRect(x: 20, y: 60, width: 240, height: 24), properties: ["accessibilityIdentifier": "dup-disclosure-\(suffix)", "detachAction": true])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: "dup-disclosure-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: "dup-disclosure-\(suffix)", title: nil
             )
         }
     }
@@ -301,10 +292,12 @@ struct QSemanticElementDisclosureLevelReadTests {
 
     @Test("14. Disallowed roles are rejected before any AX search is even attempted — QAXOutlineRowRolePolicy (the SAME dedicated AXRow policy ui.select_outline_row already uses) reused verbatim, not broadened")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXWindow", "AXImage", "AXGroup", "AXScrollArea", "AXButton", "AXTextField"] {
             await #expect(throws: QAXInteractionError.disallowedOutlineRowRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil
                 )
             }
         }
@@ -324,16 +317,17 @@ struct QSemanticElementDisclosureLevelReadTests {
         // No subrole override at all — a genuinely unqualified AXRow, exactly the case
         // ui.select_outline_row's own dedicated fixture proves gets refused at ITS subrole gate.
         // This capability has no such gate: the read proceeds to the AX call itself.
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "unqualified-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureLevelRowWindow(in: fixture, identifier: "unqualified-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         // Does not throw disallowedOutlineRowRole/targetNotAnOutlineRow/outlineContextUnavailable —
         // the read reaches the AX call and returns a genuine (here, explicitly-set) result.
         let metadata = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "unqualified-\(suffix)", title: nil
         )
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     // MARK: - Malformed / unexpected AXError
@@ -411,14 +405,15 @@ struct QSemanticElementDisclosureLevelReadTests {
     func neverMutates() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, row) = makeDisclosureLevelRowWindow(identifier: "nomutate-\(suffix)", disclosureLevel: 3)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, row) = try await makeDisclosureLevelRowWindow(in: fixture, identifier: "nomutate-\(suffix)", disclosureLevel: 3)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(row.accessibilityDisclosureLevel() == 3)
+        #expect(try await fixture.int(row, "accessibility:disclosureLevel") == 3)
     }
 
     @Test("22. An uncertain in-flight disclosure-level-read step fails closed to pending, and recovery never replays or persists any disclosure-level value that could be treated as standing authorization")
@@ -471,8 +466,9 @@ struct QSemanticElementDisclosureLevelReadTests {
     func evidenceOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "durable-\(suffix)", disclosureLevel: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureLevelRowWindow(in: fixture, identifier: "durable-\(suffix)", disclosureLevel: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -485,7 +481,7 @@ struct QSemanticElementDisclosureLevelReadTests {
                   "actionName": "ui.read_element_disclosure_level",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified outline row's disclosure level",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -511,7 +507,7 @@ struct QSemanticElementDisclosureLevelReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_element_disclosure_level" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability contain only permitted structural metadata — no arbitrary window/document content ever appears")
@@ -519,8 +515,9 @@ struct QSemanticElementDisclosureLevelReadTests {
     func auditOnlyContainsPermittedMetadata() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureLevelRowWindow(identifier: "audit-\(suffix)", disclosureLevel: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureLevelRowWindow(in: fixture, identifier: "audit-\(suffix)", disclosureLevel: 1)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -533,7 +530,7 @@ struct QSemanticElementDisclosureLevelReadTests {
                   "actionName": "ui.read_element_disclosure_level",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified outline row's disclosure level",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXRow", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXRow", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -565,18 +562,19 @@ struct QSemanticElementDisclosureLevelReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let identifier = "Repeat-\(suffix)"
-        let (window, row) = makeDisclosureLevelRowWindow(identifier: identifier, disclosureLevel: 1)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, row) = try await makeDisclosureLevelRowWindow(in: fixture, identifier: identifier, disclosureLevel: 1)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let first = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: identifier, title: nil
         )
         let second = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: identifier, title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: identifier, title: nil
         )
         #expect(first.disclosureLevel == second.disclosureLevel)
-        #expect(row.accessibilityDisclosureLevel() == 1)
+        #expect(try await fixture.int(row, "accessibility:disclosureLevel") == 1)
     }
 
     // MARK: - Verification
@@ -707,10 +705,12 @@ struct QSemanticElementDisclosureLevelReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_element_disclosure_level exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_disclosure_level", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read disclosure level", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-disclosure-level"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -730,10 +730,12 @@ struct QSemanticElementDisclosureLevelReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_element_disclosure_level", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read disclosure level",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-disclosure-level"))
         #expect(result.success == false)
@@ -743,16 +745,18 @@ struct QSemanticElementDisclosureLevelReadTests {
     @Test("Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-                applicationName: currentProcessAppName, role: "AXRow", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXRow", identifier: nil, title: nil
             )
         }
 
         let req = QActionRequest(
             toolName: "ui.read_element_disclosure_level", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read disclosure level",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXRow"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXRow"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria-disclosure-level"))
         #expect(result.success == false)
@@ -780,25 +784,25 @@ struct QSemanticElementDisclosureLevelReadTests {
         }
         let suffix = UUID().uuidString
 
-        let (nestedWindow, nestedRow) = makeDisclosureLevelRowWindow(identifier: "e2e-nested-\(suffix)", disclosureLevel: 3)
-        defer { nestedWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (nestedWindow, nestedRow) = try await makeDisclosureLevelRowWindow(in: fixture, identifier: "e2e-nested-\(suffix)", disclosureLevel: 3)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let nestedMetadata = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-nested-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-nested-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        #expect(nestedMetadata.disclosureLevel == nestedRow.accessibilityDisclosureLevel())
+        #expect(nestedMetadata.disclosureLevel == (try await fixture.int(nestedRow, "accessibility:disclosureLevel")))
         #expect(nestedMetadata.disclosureLevel == 3)
 
-        let (topLevelWindow, topLevelRow) = makeDisclosureLevelRowWindow(identifier: "e2e-toplevel-\(suffix)", disclosureLevel: 0)
-        defer { topLevelWindow.close() }
+        let (topLevelWindow, topLevelRow) = try await makeDisclosureLevelRowWindow(in: fixture, identifier: "e2e-toplevel-\(suffix)", disclosureLevel: 0)
         try? await Task.sleep(nanoseconds: 200_000_000)
         let topLevelMetadata = try await QBridgeAccessibility.shared.readElementDisclosureLevel(
-            applicationName: currentProcessAppName, role: "AXRow", identifier: "e2e-toplevel-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXRow", identifier: "e2e-toplevel-\(suffix)", title: nil
         )
-        #expect(topLevelMetadata.disclosureLevel == topLevelRow.accessibilityDisclosureLevel())
+        #expect(topLevelMetadata.disclosureLevel == (try await fixture.int(topLevelRow, "accessibility:disclosureLevel")))
         #expect(topLevelMetadata.disclosureLevel == 0)
     }
 }

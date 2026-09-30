@@ -14,6 +14,9 @@
 //  established. See docs/PHASE_2Q_SEMANTIC_DISCLOSURE_TOGGLE.md for the full contract, including
 //  the empirical fixture finding documented there.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX presses against AppKit's own controls crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -23,57 +26,46 @@ import ApplicationServices
 
 // MARK: - Test-only AppKit fixtures
 
-/// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
-/// role `AXDisclosureTriangle` via the standard `NSAccessibility` protocol override mechanism —
-/// the same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed
-/// by a real on-screen `NSButton` configured as a `.pushOnPushOff` toggle, so its `kAXValueAttribute`
-/// is reported automatically by AppKit's built-in accessibility bridging (0 = off, 1 = on) —
-/// exactly the same underlying mechanism `QAXElementStateRolePolicy`'s `AXCheckBox` already relies
-/// on, since a checkbox is fundamentally the same toggle-button shape with a different bezel.
-///
-/// Empirical note (see docs/PHASE_2Q_SEMANTIC_DISCLOSURE_TOGGLE.md's Known limitations): a
-/// genuine `NSOutlineView` row disclosure control was considered as the fixture instead, but its
-/// internal disclosure button has no accessible way to attach a settable `AXIdentifier` — every
-/// capability in this codebase requires exact identifier/title-based semantic targeting, never
-/// coordinate/index-based targeting, so an untaggable internal control cannot serve as a fixture
-/// for this specific resolution contract regardless of its authentic role. This custom control is
-/// the honest, rigorous alternative: a real, live, identifiable AXUIElement that genuinely reports
-/// the exact role under test.
-@MainActor
-private final class QDisclosureTriangleFixtureButton: NSButton {
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        .disclosureTriangle
-    }
-}
+// A minimal, genuinely-real AXUIElement fixture that authentically self-reports Accessibility
+// role `AXDisclosureTriangle` via the standard `NSAccessibility` protocol override mechanism —
+// the same mechanism every custom-AX-role AppKit control uses, not a mock or simulation. Backed
+// by a real on-screen `NSButton` configured as a `.pushOnPushOff` toggle, so its `kAXValueAttribute`
+// is reported automatically by AppKit's built-in accessibility bridging (0 = off, 1 = on) —
+// exactly the same underlying mechanism `QAXElementStateRolePolicy`'s `AXCheckBox` already relies
+// on, since a checkbox is fundamentally the same toggle-button shape with a different bezel.
+//
+// Empirical note (see docs/PHASE_2Q_SEMANTIC_DISCLOSURE_TOGGLE.md's Known limitations): a
+// genuine `NSOutlineView` row disclosure control was considered as the fixture instead, but its
+// internal disclosure button has no accessible way to attach a settable `AXIdentifier` — every
+// capability in this codebase requires exact identifier/title-based semantic targeting, never
+// coordinate/index-based targeting, so an untaggable internal control cannot serve as a fixture
+// for this specific resolution contract regardless of its authentic role. This custom control is
+// the honest, rigorous alternative: a real, live, identifiable AXUIElement that genuinely reports
+// the exact role under test.
+//
+// (Class moved verbatim to PaceAXFixtureHost/FixtureCustomKinds.swift; built there as kind
+// "custom:QDisclosureTriangleFixtureButton".)
 
-@MainActor
+/// Builds the same window and `QDisclosureTriangleFixtureButton` (moved verbatim into
+/// PaceAXFixtureHost/FixtureCustomKinds.swift) the in-process helper built — geometry,
+/// .pushOnPushOff button type, initial state, empty title, identifier — inside the out-of-process
+/// fixture. Returns the fixture window token and the triangle's fixture handle (also its AX
+/// identifier).
 private func makeDisclosureTriangleWindow(
+    in fixture: PaceAXFixture,
     identifier: String,
     initiallyExpanded: Bool
-) -> (window: NSWindow, triangle: QDisclosureTriangleFixtureButton) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 200, height: 80),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, triangle: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticDisclosureToggleTestFixture", width: 200, height: 80, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "custom:QDisclosureTriangleFixtureButton",
+        identifier: identifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 20, y: 20, width: 24, height: 24),
+        properties: ["buttonType": "pushOnPushOff", "state": (initiallyExpanded ? NSControl.StateValue.on : NSControl.StateValue.off).rawValue, "title": ""]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticDisclosureToggleTestFixture"
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
-    let triangle = QDisclosureTriangleFixtureButton(frame: NSRect(x: 20, y: 20, width: 24, height: 24))
-    triangle.setButtonType(.pushOnPushOff)
-    triangle.state = initiallyExpanded ? .on : .off
-    triangle.title = ""
-    triangle.setAccessibilityIdentifier(identifier)
-    contentView.addSubview(triangle)
-    window.contentView = contentView
-    window.makeKeyAndOrderFront(nil)
-    return (window, triangle)
-}
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, identifier)
 }
 
 @Suite("QSemanticDisclosureToggleTests")
@@ -130,16 +122,18 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("4/5. Missing/empty target criteria fails closed with a deterministic error")
     func missingTargetCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.toggleDisclosure(
-                applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: nil, title: nil, desiredState: .expanded
+                applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: nil, title: nil, desiredState: .expanded
             )
         }
 
         let request = QActionRequest(
             toolName: "ui.toggle_disclosure", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Toggle disclosure",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXDisclosureTriangle", "desiredState": "expanded"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXDisclosureTriangle", "desiredState": "expanded"]
         )
         let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-missing-target-criteria"))
         #expect(result.success == false)
@@ -148,10 +142,12 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("6/7. Missing/invalid desiredState fails closed with a deterministic error")
     func missingOrInvalidDesiredStateFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let missingRequest = QActionRequest(
             toolName: "ui.toggle_disclosure", toolFamily: "ui", riskLevel: .level2UserApproval,
             literalAction: "Toggle disclosure",
-            parameters: ["applicationName": currentProcessAppName, "role": "AXDisclosureTriangle", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXDisclosureTriangle", "identifier": "x"]
         )
         let missingResult = try await QExecutionService.shared.executeAction(missingRequest, context: QTaskContext(taskId: "t-missing-desired-state"))
         #expect(missingResult.success == false)
@@ -161,7 +157,7 @@ struct QSemanticDisclosureToggleTests {
             let request = QActionRequest(
                 toolName: "ui.toggle_disclosure", toolFamily: "ui", riskLevel: .level2UserApproval,
                 literalAction: "Toggle disclosure",
-                parameters: ["applicationName": currentProcessAppName, "role": "AXDisclosureTriangle", "identifier": "x", "desiredState": invalid]
+                parameters: ["applicationName": fixture.applicationName, "role": "AXDisclosureTriangle", "identifier": "x", "desiredState": invalid]
             )
             let result = try await QExecutionService.shared.executeAction(request, context: QTaskContext(taskId: "t-invalid-desired-state"))
             #expect(result.success == false, "Invalid desiredState '\(invalid)' must be rejected — exact 'expanded'/'collapsed' only.")
@@ -178,10 +174,12 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("9/10/11/12/13. AXButton, AXCheckBox, AXRadioButton, AXPopUpButton, AXComboBox, and a wholly unrecognized role are all rejected for disclosure toggle — this capability is never broadened to generic buttons")
     func nonDisclosureRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for disallowedRole in ["AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXComboBox", "AXGroup", "AXStaticText", "AXOutline", "AXMadeUpRole99"] {
             await #expect(throws: QAXInteractionError.disallowedDisclosureRole(disallowedRole)) {
                 _ = try await QBridgeAccessibility.shared.toggleDisclosure(
-                    applicationName: currentProcessAppName, role: disallowedRole, identifier: "whatever", title: nil, desiredState: .expanded
+                    applicationName: fixture.applicationName, role: disallowedRole, identifier: "whatever", title: nil, desiredState: .expanded
                 )
             }
         }
@@ -194,18 +192,19 @@ struct QSemanticDisclosureToggleTests {
     func validMissingAndWrongApplicationTarget() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "present-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, _) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "present-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "present-\(suffix)", title: nil, desiredState: .expanded
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "present-\(suffix)", title: nil, desiredState: .expanded
         )
         #expect(!outcome.targetIdentity.isEmpty)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.toggleDisclosure(
-                applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "absent-\(suffix)", title: nil, desiredState: .expanded
+                applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "absent-\(suffix)", title: nil, desiredState: .expanded
             )
         }
 
@@ -223,28 +222,22 @@ struct QSemanticDisclosureToggleTests {
     func ambiguousTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 200, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        let triangleA = QDisclosureTriangleFixtureButton(frame: NSRect(x: 20, y: 70, width: 24, height: 24))
-        triangleA.setButtonType(.pushOnPushOff)
-        triangleA.title = ""
-        triangleA.setAccessibilityIdentifier("dup-triangle-\(suffix)")
-        let triangleB = QDisclosureTriangleFixtureButton(frame: NSRect(x: 20, y: 20, width: 24, height: 24))
-        triangleB.setButtonType(.pushOnPushOff)
-        triangleB.title = ""
-        triangleB.setAccessibilityIdentifier("dup-triangle-\(suffix)")
-        contentView.addSubview(triangleA)
-        contentView.addSubview(triangleB)
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real disclosure triangles that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 200, height: 120, styles: ["titled"])
+        for (handleSuffix, triangleFrame) in [("A", NSRect(x: 20, y: 70, width: 24, height: 24)), ("B", NSRect(x: 20, y: 20, width: 24, height: 24))] {
+            try await fixture.addControl(
+                kind: "custom:QDisclosureTriangleFixtureButton", identifier: "dup-triangle-\(suffix)-\(handleSuffix)", windowToken: windowToken,
+                frame: triangleFrame, properties: ["buttonType": "pushOnPushOff", "title": "", "accessibilityIdentifier": "dup-triangle-\(suffix)"]
+            )
+        }
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.toggleDisclosure(
-                applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "dup-triangle-\(suffix)", title: nil, desiredState: .expanded
+                applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "dup-triangle-\(suffix)", title: nil, desiredState: .expanded
             )
         }
     }
@@ -272,12 +265,13 @@ struct QSemanticDisclosureToggleTests {
     func collapsedStateRecognized() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "collapsed-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "collapsed-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let evidence = await QBridgeAccessibility.shared.observeDisclosureStateEvidence(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "collapsed-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "collapsed-\(suffix)", title: nil
         )
         guard case .resolved(let currentState) = evidence else {
             #expect(Bool(false), "Expected a resolvable state, got: \(evidence)")
@@ -291,12 +285,13 @@ struct QSemanticDisclosureToggleTests {
     func expandedStateRecognized() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "expanded-\(suffix)", initiallyExpanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "expanded-\(suffix)", initiallyExpanded: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let evidence = await QBridgeAccessibility.shared.observeDisclosureStateEvidence(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "expanded-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "expanded-\(suffix)", title: nil
         )
         guard case .resolved(let currentState) = evidence else {
             #expect(Bool(false), "Expected a resolvable state, got: \(evidence)")
@@ -307,8 +302,10 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("21. An unresolvable target's state observation is .targetUnavailable, never coerced into a default state")
     func unresolvableTargetStateIsUnavailable() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let evidence = await QBridgeAccessibility.shared.observeDisclosureStateEvidence(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "vanished-\(UUID().uuidString)", title: nil
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "vanished-\(UUID().uuidString)", title: nil
         )
         guard case .targetUnavailable = evidence else {
             #expect(Bool(false), "Expected .targetUnavailable for an unresolvable target, got: \(evidence)")
@@ -334,12 +331,13 @@ struct QSemanticDisclosureToggleTests {
     func alreadyDesiredStateIsNoOp() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "noop-\(suffix)", initiallyExpanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "noop-\(suffix)", initiallyExpanded: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "noop-\(suffix)", title: nil, desiredState: .expanded
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "noop-\(suffix)", title: nil, desiredState: .expanded
         )
         // .alreadyDesired is the ONLY branch in toggleDisclosure's implementation that returns
         // without an intervening AXUIElementPerformAction press — structurally proving no
@@ -349,17 +347,16 @@ struct QSemanticDisclosureToggleTests {
         #expect(outcome.changeKind == .alreadyDesired)
         #expect(outcome.previousState == .expanded)
         #expect(outcome.currentState == .expanded)
-        #expect(triangle.state == .on) // unchanged — proves no press occurred
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .on) // unchanged — proves no press occurred
 
         // Also prove the reverse direction's idempotency.
-        let (window2, triangle2) = makeDisclosureTriangleWindow(identifier: "noop2-\(suffix)", initiallyExpanded: false)
-        defer { window2.close() }
+        let (window2, triangle2) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "noop2-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
         let outcome2 = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "noop2-\(suffix)", title: nil, desiredState: .collapsed
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "noop2-\(suffix)", title: nil, desiredState: .collapsed
         )
         #expect(outcome2.changeKind == .alreadyDesired)
-        #expect(triangle2.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle2, "state")) == .off)
     }
 
     // MARK: - 26/27. Mutation: collapsed -> expanded, expanded -> collapsed
@@ -369,17 +366,18 @@ struct QSemanticDisclosureToggleTests {
     func collapsedToExpandedMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "c2e-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "c2e-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "c2e-\(suffix)", title: nil, desiredState: .expanded
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "c2e-\(suffix)", title: nil, desiredState: .expanded
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousState == .collapsed)
         #expect(outcome.currentState == .expanded)
-        #expect(triangle.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .on)
     }
 
     @Test("27. A real expanded disclosure triangle is toggled to collapsed via AXUIElementPerformAction only")
@@ -387,17 +385,18 @@ struct QSemanticDisclosureToggleTests {
     func expandedToCollapsedMutation() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "e2c-\(suffix)", initiallyExpanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "e2c-\(suffix)", initiallyExpanded: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "e2c-\(suffix)", title: nil, desiredState: .collapsed
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "e2c-\(suffix)", title: nil, desiredState: .collapsed
         )
         #expect(outcome.changeKind == .changed)
         #expect(outcome.previousState == .expanded)
         #expect(outcome.currentState == .collapsed)
-        #expect(triangle.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .off)
     }
 
     // MARK: - 28. Approval required, never dispatches silently
@@ -445,8 +444,9 @@ struct QSemanticDisclosureToggleTests {
     func denyBlocksToggleDisclosure() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "deny-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "deny-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -459,7 +459,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Toggle a semantically-identified disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "deny-\(suffix)", "desiredState": "expanded"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "deny-\(suffix)", "desiredState": "expanded"}
                 }
               ]
             }
@@ -482,7 +482,7 @@ struct QSemanticDisclosureToggleTests {
             #expect(Bool(false), "Expected task to fail after denial, got: \(resolved.state)")
             return
         }
-        #expect(triangle.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .off)
     }
 
     // MARK: - 30. Persisted / expiry-equivalent approval never self-authorizes
@@ -593,8 +593,9 @@ struct QSemanticDisclosureToggleTests {
     func noDispatchBeforeApproval() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "predispatch-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "predispatch-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -607,7 +608,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Toggle a semantically-identified disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "predispatch-\(suffix)", "desiredState": "expanded"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "predispatch-\(suffix)", "desiredState": "expanded"}
                 }
               ]
             }
@@ -620,7 +621,7 @@ struct QSemanticDisclosureToggleTests {
             endpointName: "semantic-disclosure-predispatch-\(UUID().uuidString)"
         )
         _ = try await runtime.submitIntent(prompt: "Expand the section")
-        #expect(triangle.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .off)
     }
 
     @Test("34/35/36. Approving the request toggles the triangle exactly once, re-resolving the target fresh (never reusing a stale reference), and completes with real, closed-loop AX verification")
@@ -628,8 +629,9 @@ struct QSemanticDisclosureToggleTests {
     func allowTogglesTriangleAndVerifies() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "allow-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "allow-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -642,7 +644,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Toggle a semantically-identified disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "allow-\(suffix)", "desiredState": "expanded"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "allow-\(suffix)", "desiredState": "expanded"}
                 }
               ]
             }
@@ -669,7 +671,7 @@ struct QSemanticDisclosureToggleTests {
         // Execution happens entirely inside executeToggleDisclosure, invoked only after the
         // approval grant is consumed — resolution (collectMatches) is therefore always fresh,
         // never a reference held from before approval. Real, observed outcome:
-        #expect(triangle.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .on)
     }
 
     // MARK: - 37. State drift between the two internal reads surrounding dispatch fails closed (documented)
@@ -694,17 +696,18 @@ struct QSemanticDisclosureToggleTests {
     func verificationSucceedsOnMatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "verify-match-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "verify-match-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "verify-match-\(suffix)", title: nil, desiredState: .expanded
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "verify-match-\(suffix)", title: nil, desiredState: .expanded
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axDisclosureStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXDisclosureTriangle",
             matchIdentifier: "verify-match-\(suffix)",
             matchTitle: nil,
@@ -722,17 +725,18 @@ struct QSemanticDisclosureToggleTests {
     func verificationFailsOnMismatch() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "verify-mismatch-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "verify-mismatch-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let outcome = try await QBridgeAccessibility.shared.toggleDisclosure(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "verify-mismatch-\(suffix)", title: nil, desiredState: .expanded
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "verify-mismatch-\(suffix)", title: nil, desiredState: .expanded
         )
         #expect(outcome.changeKind == .changed)
 
         let strategy = QVerificationStrategy.axDisclosureStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXDisclosureTriangle",
             matchIdentifier: "verify-mismatch-\(suffix)",
             matchTitle: nil,
@@ -747,12 +751,14 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("40. An unresolvable target after the toggle fails verification rather than assuming success")
     func unresolvableTargetAfterDispatchFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axDisclosureStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXDisclosureTriangle",
             matchIdentifier: "vanished-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXDisclosureTriangle identifier=vanished label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXDisclosureTriangle identifier=vanished label=none",
             desiredState: .expanded
         )
         let result = QActionResult(actionId: "verify-vanished-disclosure", success: true, summary: "n/a")
@@ -763,12 +769,14 @@ struct QSemanticDisclosureToggleTests {
 
     @Test("41. A successful AX press alone is not treated as proof of completion — verification is independent")
     func mutationSuccessAloneIsInsufficient() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let strategy = QVerificationStrategy.axDisclosureStateMatchesDesired(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXDisclosureTriangle",
             matchIdentifier: "insufficient-\(UUID().uuidString)",
             matchTitle: nil,
-            targetIdentity: "application=\(currentProcessAppName) role=AXDisclosureTriangle identifier=insufficient label=none",
+            targetIdentity: "application=\(fixture.applicationName) role=AXDisclosureTriangle identifier=insufficient label=none",
             desiredState: .expanded
         )
         let fabricatedSuccess = QActionResult(actionId: "verify-insufficient-disclosure", success: true, summary: "Disclosure toggle attempted. Independent closed-loop verification pending.")
@@ -784,8 +792,9 @@ struct QSemanticDisclosureToggleTests {
     func recoveryRecognizesAlreadyDesiredAsComplete() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "recovered-\(suffix)", initiallyExpanded: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "recovered-\(suffix)", initiallyExpanded: true)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let store = try QDurableTaskStore(inMemory: true)
@@ -799,7 +808,7 @@ struct QSemanticDisclosureToggleTests {
             stepId: "step-uncertain-disclosure", index: 0, actionName: "ui.toggle_disclosure", toolFamily: "ui",
             riskLevel: "level2UserApproval", literalAction: "Expand section",
             targetResources: [],
-            arguments: ["applicationName": currentProcessAppName, "role": "AXDisclosureTriangle", "identifier": "recovered-\(suffix)", "desiredState": "expanded"],
+            arguments: ["applicationName": fixture.applicationName, "role": "AXDisclosureTriangle", "identifier": "recovered-\(suffix)", "desiredState": "expanded"],
             state: "running"
         )
         let planSnapshot = QDurablePlanSnapshot(
@@ -929,8 +938,9 @@ struct QSemanticDisclosureToggleTests {
     func realRunLeavesOnlySafeEvidence() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _) = makeDisclosureTriangleWindow(identifier: "safe-evidence-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeDisclosureTriangleWindow(in: fixture, identifier: "safe-evidence-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -943,7 +953,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Toggle a semantically-identified disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "safe-evidence-\(suffix)", "desiredState": "expanded"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "safe-evidence-\(suffix)", "desiredState": "expanded"}
                 }
               ]
             }
@@ -1011,11 +1021,12 @@ struct QSemanticDisclosureToggleTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, triangle) = makeDisclosureTriangleWindow(identifier: "e2e-\(suffix)", initiallyExpanded: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (window, triangle) = try await makeDisclosureTriangleWindow(in: fixture, identifier: "e2e-\(suffix)", initiallyExpanded: false)
         try? await Task.sleep(nanoseconds: 150_000_000)
 
-        #expect(triangle.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .off)
 
         let mockModel = MockAutonomousModelProvider()
         mockModel.structuredPlansToReturn = [
@@ -1027,7 +1038,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Expand the disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "e2e-\(suffix)", "desiredState": "expanded"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "e2e-\(suffix)", "desiredState": "expanded"}
                 }
               ]
             }
@@ -1053,9 +1064,9 @@ struct QSemanticDisclosureToggleTests {
 
         // Authoritative postcondition, confirmed independently of whatever the plan execution
         // itself observed.
-        #expect(triangle.state == .on)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .on)
         let expandedEvidence = await QBridgeAccessibility.shared.observeDisclosureStateEvidence(
-            applicationName: currentProcessAppName, role: "AXDisclosureTriangle", identifier: "e2e-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXDisclosureTriangle", identifier: "e2e-\(suffix)", title: nil
         )
         guard case .resolved(let expandedState) = expandedEvidence else {
             #expect(Bool(false), "Expected the triangle to remain resolvable with a readable value, got: \(expandedEvidence)")
@@ -1074,7 +1085,7 @@ struct QSemanticDisclosureToggleTests {
                   "actionName": "ui.toggle_disclosure",
                   "toolFamily": "ui",
                   "description": "Collapse the disclosure triangle",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXDisclosureTriangle", "identifier": "e2e-\(suffix)", "desiredState": "collapsed"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXDisclosureTriangle", "identifier": "e2e-\(suffix)", "desiredState": "collapsed"}
                 }
               ]
             }
@@ -1096,6 +1107,6 @@ struct QSemanticDisclosureToggleTests {
             #expect(Bool(false), "Expected reverse-direction task to complete, got: \(resolvedReverse.state)")
             return
         }
-        #expect(triangle.state == .off)
+        #expect(NSControl.StateValue(rawValue: try await fixture.int(triangle, "state")) == .off)
     }
 }
