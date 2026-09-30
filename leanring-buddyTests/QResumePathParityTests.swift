@@ -226,6 +226,56 @@ struct QResumePathParityTests {
         #expect(!(try events(store, task.taskId, .evidenceEvaluated)).isEmpty)
     }
 
+    @Test("An approval-grant resume persists the executed plan, so the approved step's durable verifiedEvidence is not left at the pre-approval snapshot")
+    func approvalGrantResumePersistsExecutedStepEvidence() async throws {
+        // Deterministic stand-in for the real-hardware Calculator E2E
+        // (QSemanticClickTests.realMacOSE2ESemanticClickOnCalculator), which can only reach its
+        // durable-evidence assertion when the test host has Accessibility permission and a real
+        // Calculator window.
+        // ui.set_text_value is approval-gated, and because MockExecutionProvider returns no
+        // hash/length outputData, QPlanExecutor falls back to its default custom-check
+        // verification — so the step genuinely completes with verified evidence without touching
+        // any real AX target.
+        let store = try QDurableTaskStore(inMemory: true)
+        let model = RecordingDecisionAwareModelProvider()
+        model.structuredPlansToReturn = [
+            """
+            {
+              "taskPrompt": "Set the field value",
+              "steps": [
+                {
+                  "actionName": "ui.set_text_value",
+                  "toolFamily": "ui",
+                  "description": "Set a semantically-identified text field's value",
+                  "parameters": {"applicationName": "Finder", "role": "AXTextField", "identifier": "SomeField", "value": "hello"}
+                }
+              ]
+            }
+            """
+        ]
+        let runtime = QCoreRuntime(modelProvider: model, executionProvider: MockExecutionProvider(), durableStore: store, endpointName: "rp-evidence-\(UUID().uuidString)")
+        let task = try await runtime.submitIntent(prompt: "Set the field value")
+        guard case .awaitingApproval(let approval) = task.state else {
+            Issue.record("expected .awaitingApproval, got \(task.state)")
+            return
+        }
+
+        // Before approval, the durable snapshot correctly holds the halted step with no result yet.
+        let planIdBeforeApproval = try #require(try store.getTask(taskId: task.taskId)?.currentPlanId)
+        let haltedStep = try #require(try store.getPlan(planId: planIdBeforeApproval)?.steps.first)
+        #expect(haltedStep.verifiedEvidence == nil)
+
+        let resolved = try await runtime.resolveApproval(taskId: task.taskId, approvalId: approval.id, decision: .approved)
+        #expect(resolved.state.isTerminal)
+
+        let planIdAfterApproval = try #require(try store.getTask(taskId: task.taskId)?.currentPlanId)
+        let executedStep = try #require(
+            try store.getPlan(planId: planIdAfterApproval)?.steps.first(where: { $0.actionName == "ui.set_text_value" })
+        )
+        #expect(executedStep.state == "completed")
+        #expect(!(executedStep.verifiedEvidence ?? "").isEmpty)
+    }
+
     // MARK: - Authorities and existing behaviour are unaffected
 
     @Test("Existing recovery behaviour is unchanged: a mid-flight multi-step recovery still resumes from the pending step and completes")
