@@ -15,6 +15,9 @@
 //  Raw radio item contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -22,9 +25,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class RadioGroupItemEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -156,13 +156,15 @@ struct QSemanticRadioGroupItemEnumerationTests {
 
     @Test("6. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_radio_group_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List radio items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXRadioGroup"
             ]
         )
@@ -173,6 +175,8 @@ struct QSemanticRadioGroupItemEnumerationTests {
 
     @Test("7. Disallowed roles (e.g. AXTable, AXButton, AXGroup, AXWindow, AXTabGroup) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXTabGroup", "AXRow", "AXPopUpButton"] {
             let req = QActionRequest(
                 toolName: "ui.list_radio_group_items",
@@ -180,7 +184,7 @@ struct QSemanticRadioGroupItemEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List radio items",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "title": "Alignment"
                 ]
@@ -216,13 +220,15 @@ struct QSemanticRadioGroupItemEnumerationTests {
 
     @Test("9. Non-existent radio group target fails closed")
     func nonExistentRadioGroupTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_radio_group_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List radio items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXRadioGroup",
                 "title": "QNoSuchRadioGroup-2AI-\(UUID().uuidString)"
             ]
@@ -400,44 +406,35 @@ struct QSemanticRadioGroupItemEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSStackView) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
+        // Built inside the out-of-process PaceAXFixtureHost with the same 400x300 titled/closable
+        // window and the same plain, vertical 380x280 NSStackView holding three arranged radio
+        // buttons (Small on, Medium off, Large off — no target/action, no AX identifier), with
+        // the same AX role override (AXRadioGroup), AX identifier and AX label the in-process setup
+        // used. The stack view overrides nothing else, exactly as before.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "stackView",
+            identifier: "QTestRadioGroup-2AI",
+            windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+            properties: ["orientation": "vertical"]
+        )
+        for (radioHandle, radioTitle, radioState) in [("radio-small", "Small", 1), ("radio-medium", "Medium", 0), ("radio-large", "Large", 0)] {
+            try await fixture.addControl(
+                kind: "radio",
+                identifier: radioHandle,
+                parentIdentifier: "QTestRadioGroup-2AI",
+                properties: ["title": radioTitle, "state": radioState, "accessibilityIdentifier": "", "detachAction": true]
             )
-            window.animationBehavior = .none
-            let stackView = NSStackView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-            stackView.orientation = .vertical
-
-            let radio1 = NSButton(radioButtonWithTitle: "Small", target: nil, action: nil)
-            radio1.state = .on
-            let radio2 = NSButton(radioButtonWithTitle: "Medium", target: nil, action: nil)
-            radio2.state = .off
-            let radio3 = NSButton(radioButtonWithTitle: "Large", target: nil, action: nil)
-            radio3.state = .off
-
-            stackView.addArrangedSubview(radio1)
-            stackView.addArrangedSubview(radio2)
-            stackView.addArrangedSubview(radio3)
-
-            stackView.setAccessibilityRole(.radioGroup)
-            stackView.setAccessibilityIdentifier("QTestRadioGroup-2AI")
-            stackView.setAccessibilityLabel("Size Selection")
-            window.contentView?.addSubview(stackView)
-            window.makeKeyAndOrderFront(nil)
-            return (window, stackView)
         }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        try await fixture.setAccessibility("QTestRadioGroup-2AI", "role", "AXRadioGroup")
+        try await fixture.setAccessibility("QTestRadioGroup-2AI", "label", "Size Selection")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listRadioGroupItems(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXRadioGroup",
             identifier: "QTestRadioGroup-2AI",
             title: nil

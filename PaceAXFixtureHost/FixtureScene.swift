@@ -51,7 +51,7 @@ final class FixtureScene: NSObject {
     static let supportedControlKinds: Set<String> = [
         "button", "checkbox", "radio", "textField", "label", "secureTextField", "searchField",
         "textView", "slider", "stepper", "popUpButton", "comboBox", "segmentedControl",
-        "tabView", "scrollView", "splitView", "view", "tableView"
+        "tabView", "scrollView", "splitView", "view", "tableView", "stackView"
     ]
 
     private static let buttonTypesByName: [String: NSButton.ButtonType] = [
@@ -60,6 +60,12 @@ final class FixtureScene: NSObject {
         "momentaryPushIn": .momentaryPushIn,
         "switch": .switch,
         "radio": .radio
+    ]
+
+    private static let splitViewDividerStylesByName: [String: NSSplitView.DividerStyle] = [
+        "thick": .thick,
+        "thin": .thin,
+        "paneSplitter": .paneSplitter
     ]
 
     private static let windowStyleMasksByName: [String: NSWindow.StyleMask] = [
@@ -234,12 +240,17 @@ final class FixtureScene: NSObject {
         // like in-process helpers that built an element only to hand it to an accessibility
         // relationship (for example row-header elements that live in no window).
         let isDetached = properties["detached"] as? Bool == true
+        // "asWindowContentView": the control REPLACES the window's content view — exactly
+        // `window.contentView = control` in the migrated helpers — instead of being added to it.
+        let isWindowContentView = properties["asWindowContentView"] as? Bool == true
         let containerView: NSView?
         let slotWindowToken: String
+        var windowWhoseContentViewIsReplaced: NSWindow?
         if isDetached {
             containerView = nil
             slotWindowToken = "detached"
         } else if let parentIdentifier {
+            guard !isWindowContentView else { throw FixtureSceneError.invalidValue(key: "asWindowContentView") }
             guard let parentView = viewsByIdentifier[parentIdentifier] else { throw FixtureSceneError.unknownIdentifier(parentIdentifier) }
             containerView = try childContainer(of: parentView, parentIdentifier: parentIdentifier, properties: properties)
             slotWindowToken = "parent:\(parentIdentifier)"
@@ -247,7 +258,12 @@ final class FixtureScene: NSObject {
             guard let windowTokenOrIdentifier else { throw FixtureSceneError.missingParameter("windowToken or parentIdentifier") }
             guard let window = window(forTokenOrIdentifier: windowTokenOrIdentifier),
                   let contentView = window.contentView else { throw FixtureSceneError.unknownIdentifier(windowTokenOrIdentifier) }
-            containerView = contentView
+            if isWindowContentView {
+                containerView = nil
+                windowWhoseContentViewIsReplaced = window
+            } else {
+                containerView = contentView
+            }
             slotWindowToken = windowTokenOrIdentifier
         }
 
@@ -271,7 +287,15 @@ final class FixtureScene: NSObject {
         // the same unless the test asks for a different one — which is how a test builds two
         // controls that deliberately share one AX identifier (ambiguous-target tests).
         registeredView.setAccessibilityIdentifier(properties["accessibilityIdentifier"] as? String ?? identifier)
-        containerView?.addSubview(viewAddedToContainer)
+        if let windowWhoseContentViewIsReplaced {
+            windowWhoseContentViewIsReplaced.contentView = viewAddedToContainer
+        } else if let stackView = containerView as? NSStackView {
+            // Children of a stack view are arranged subviews — exactly `addArrangedSubview(_:)`
+            // in the migrated helpers.
+            stackView.addArrangedSubview(viewAddedToContainer)
+        } else {
+            containerView?.addSubview(viewAddedToContainer)
+        }
         viewsByIdentifier[identifier] = registeredView
         handlesByViewObject[ObjectIdentifier(registeredView)] = identifier
         if let identifierAfterPress = properties["onPressSetAccessibilityIdentifier"] as? String {
@@ -283,7 +307,7 @@ final class FixtureScene: NSObject {
 
         // Every remaining property goes through the same allowlist the "set" command uses,
         // so creation-time and later mutations can never diverge.
-        let creationOnlyKeys: Set<String> = ["hasVerticalScroller", "detachAction", "testIndex", "buttonType", "customRole", "customSubrole", "customIsSelected", "accessibilityIdentifier", "inScrollView", "onPressSetAccessibilityIdentifier", "onPressSetTitle", "hasHorizontalScroller", "scrollerStyle", "documentWidth", "title", "items", "segments", "tabs", "minValue", "maxValue", "documentHeight", "paneCount", "isVertical", "paneIndex", "tabIndex", "detached", "columns", "columnTitles", "columnWidths", "includeHeader"]
+        let creationOnlyKeys: Set<String> = ["hasVerticalScroller", "detachAction", "testIndex", "buttonType", "customRole", "customSubrole", "customIsSelected", "accessibilityIdentifier", "inScrollView", "onPressSetAccessibilityIdentifier", "onPressSetTitle", "hasHorizontalScroller", "scrollerStyle", "documentWidth", "title", "items", "segments", "tabs", "minValue", "maxValue", "documentHeight", "paneCount", "isVertical", "paneIndex", "tabIndex", "detached", "columns", "columnTitles", "columnWidths", "includeHeader", "tabIdentifiers", "dividerStyle", "paneWidths", "paneIdentifiers", "asWindowContentView", "orientation"]
         for (key, value) in properties where !creationOnlyKeys.contains(key) {
             try setValue(value, forKey: key, identifier: identifier)
         }
@@ -385,8 +409,14 @@ final class FixtureScene: NSObject {
             return (segmentedControl, segmentedControl)
         case "tabView":
             let tabView = NSTabView(frame: frame)
-            for tabLabel in properties["tabs"] as? [String] ?? [] {
-                let tabViewItem = NSTabViewItem(identifier: tabLabel)
+            // "tabIdentifiers" gives each NSTabViewItem its own identifier, separate from its
+            // label, exactly as `NSTabViewItem(identifier:)` + `.label =` in the migrated helpers.
+            // Without it each tab's identifier is its label, as before.
+            let tabLabels = properties["tabs"] as? [String] ?? []
+            let tabIdentifiers = properties["tabIdentifiers"] as? [String] ?? tabLabels
+            guard tabIdentifiers.count == tabLabels.count else { throw FixtureSceneError.invalidValue(key: "tabIdentifiers") }
+            for (tabLabel, tabIdentifier) in zip(tabLabels, tabIdentifiers) {
+                let tabViewItem = NSTabViewItem(identifier: tabIdentifier)
                 tabViewItem.label = tabLabel
                 tabViewItem.view = NSView(frame: .zero)
                 tabView.addTabViewItem(tabViewItem)
@@ -434,6 +464,32 @@ final class FixtureScene: NSObject {
         case "splitView":
             let splitView = NSSplitView(frame: frame)
             splitView.isVertical = properties["isVertical"] as? Bool ?? true
+            if let dividerStyleName = properties["dividerStyle"] as? String {
+                guard let dividerStyle = Self.splitViewDividerStylesByName[dividerStyleName] else {
+                    throw FixtureSceneError.invalidValue(key: "dividerStyle")
+                }
+                splitView.dividerStyle = dividerStyle
+            }
+            if let paneWidths = properties["paneWidths"] as? [Double] {
+                // Explicit panes, built exactly as the migrated helpers built theirs: one plain
+                // NSView per width, laid out left to right at the split view's full height, each
+                // with its AX identifier from "paneIdentifiers" when given — and no
+                // adjustSubviews() call, which those helpers never made.
+                let paneIdentifiers = properties["paneIdentifiers"] as? [String] ?? []
+                guard paneIdentifiers.isEmpty || paneIdentifiers.count == paneWidths.count else {
+                    throw FixtureSceneError.invalidValue(key: "paneIdentifiers")
+                }
+                var paneOriginX: CGFloat = 0
+                for (paneIndex, paneWidth) in paneWidths.enumerated() {
+                    let pane = NSView(frame: NSRect(x: paneOriginX, y: 0, width: CGFloat(paneWidth), height: frame.height))
+                    if paneIndex < paneIdentifiers.count {
+                        pane.setAccessibilityIdentifier(paneIdentifiers[paneIndex])
+                    }
+                    splitView.addArrangedSubview(pane)
+                    paneOriginX += CGFloat(paneWidth)
+                }
+                return (splitView, splitView)
+            }
             let paneCount = properties["paneCount"] as? Int ?? 2
             for _ in 0..<max(paneCount, 2) {
                 splitView.addArrangedSubview(NSView(frame: .zero))
@@ -443,6 +499,17 @@ final class FixtureScene: NSObject {
         case "view":
             let containerView = NSView(frame: frame)
             return (containerView, containerView)
+        case "stackView":
+            // A plain NSStackView (vertical unless "orientation" is "horizontal"). It overrides no
+            // NSAccessibility method, so whether it is an accessibility element is AppKit's own
+            // decision — exactly as with the in-process NSStackView it replaces.
+            let stackView = NSStackView(frame: frame)
+            switch properties["orientation"] as? String ?? "vertical" {
+            case "vertical": stackView.orientation = .vertical
+            case "horizontal": stackView.orientation = .horizontal
+            default: throw FixtureSceneError.invalidValue(key: "orientation")
+            }
+            return (stackView, stackView)
         default:
             throw FixtureSceneError.unknownControlKind(kind)
         }
@@ -479,7 +546,7 @@ final class FixtureScene: NSObject {
         nextDefaultControlSlotByWindowToken[slotKey] = slotIndex + 1
         let height: CGFloat
         switch kind {
-        case "textView", "tabView", "scrollView", "splitView", "view", "tableView": height = 120
+        case "textView", "tabView", "scrollView", "splitView", "view", "tableView", "stackView": height = 120
         default: height = 26
         }
         return NSRect(x: 20, y: 20 + CGFloat(slotIndex) * 34, width: 220, height: height)

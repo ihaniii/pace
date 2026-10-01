@@ -19,6 +19,9 @@
 //  Raw incrementor contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -26,9 +29,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class IncrementorEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -172,6 +172,8 @@ struct QSemanticIncrementorEnumerationTests {
 
     @Test("6. Disallowed roles (e.g. AXTable, AXButton, AXGroup, AXWindow, AXToolbar, AXSheet, AXSlider) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXToolbar", "AXSheet", "AXSplitGroup", "AXTabGroup", "AXSlider"] {
             let req = QActionRequest(
                 toolName: "ui.list_incrementors",
@@ -179,7 +181,7 @@ struct QSemanticIncrementorEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List incrementors",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole
                 ]
             )
@@ -224,13 +226,15 @@ struct QSemanticIncrementorEnumerationTests {
 
     @Test("9. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_incrementors",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List incrementors",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXIncrementor",
                 "windowTitle": "QNoSuchWindow-2BA-\(UUID().uuidString)"
             ]
@@ -242,13 +246,15 @@ struct QSemanticIncrementorEnumerationTests {
 
     @Test("10. Non-existent incrementor target with specific filter returns empty collection")
     func nonExistentIncrementorTargetReturnsEmpty() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_incrementors",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List incrementors",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXIncrementor",
                 "incrementorTitle": "QNoSuchIncrementor-2BA-\(UUID().uuidString)"
             ]
@@ -496,40 +502,27 @@ struct QSemanticIncrementorEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSStepper) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            window.title = "QIncrementorWindow-2BA"
-
-            let stepper = NSStepper(frame: NSRect(x: 20, y: 20, width: 19, height: 27))
-            stepper.minValue = 1.0
-            stepper.maxValue = 100.0
-            stepper.increment = 5.0
-            stepper.doubleValue = 25.0
-            stepper.setAccessibilityIdentifier("test.stepper.zoom")
-            stepper.setAccessibilityTitle("Zoom Stepper")
-
-            let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-            contentView.addSubview(stepper)
-            window.contentView = contentView
-            window.makeKeyAndOrderFront(nil)
-
-            return (window, stepper)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 400x300 titled/closable/
+        // resizable window, title, stepper frame, min/max, increment, value, AX identifier and AX
+        // title the in-process setup used (the fixture window's content view is a plain 400x300
+        // NSView, as before). The stepper has no target/action, as before.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "QIncrementorWindow-2BA", width: 400, height: 300, styles: ["titled", "closable", "resizable"])
+        try await fixture.addControl(
+            kind: "stepper",
+            identifier: "test.stepper.zoom",
+            windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 19, height: 27),
+            properties: ["minValue": 1.0, "maxValue": 100.0, "detachAction": true]
+        )
+        try await fixture.set("test.stepper.zoom", "increment", 5.0)
+        try await fixture.set("test.stepper.zoom", "doubleValue", 25.0)
+        try await fixture.setAccessibility("test.stepper.zoom", "title", "Zoom Stepper")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listIncrementors(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: nil,
             identifier: nil,
             title: nil,

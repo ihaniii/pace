@@ -13,6 +13,9 @@
 //  Raw combo box items remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -20,9 +23,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class ComboBoxItemEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -169,6 +169,8 @@ struct QSemanticComboBoxItemEnumerationTests {
 
     @Test("6. Disallowed roles (e.g. AXTable, AXButton, AXGroup, AXWindow, AXToolbar, AXSheet, AXSlider, AXRuler) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXToolbar", "AXSheet", "AXSplitGroup", "AXTabGroup", "AXSlider", "AXRuler"] {
             let req = QActionRequest(
                 toolName: "ui.list_combo_box_items",
@@ -176,7 +178,7 @@ struct QSemanticComboBoxItemEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List combo box items",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "comboBoxTitle": "Font"
                 ]
@@ -189,13 +191,15 @@ struct QSemanticComboBoxItemEnumerationTests {
 
     @Test("7. Missing match criteria (no identifier and no title) fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_combo_box_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List combo box items",
             parameters: [
-                "applicationName": currentProcessAppName
+                "applicationName": fixture.applicationName
             ]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-criteria"))
@@ -225,13 +229,15 @@ struct QSemanticComboBoxItemEnumerationTests {
 
     @Test("9. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_combo_box_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List combo box items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "comboBoxTitle": "Font",
                 "windowTitle": "QNoSuchWindow-2BD-\(UUID().uuidString)"
             ]
@@ -484,10 +490,12 @@ struct QSemanticComboBoxItemEnumerationTests {
     // MARK: - 8. Real macOS E2E & Forbidden API Audit
 
     @Test("19. Real macOS accessibility probe on current application fails gracefully if not trusted")
-    func realMacOSE2EGracefulProbe() async {
+    func realMacOSE2EGracefulProbe() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         do {
             let result = try await QBridgeAccessibility.shared.listComboBoxItems(
-                applicationName: currentProcessAppName,
+                applicationName: fixture.applicationName,
                 title: "NonExistentComboInCurrentProcess"
             )
             #expect(result.itemCount >= 0)

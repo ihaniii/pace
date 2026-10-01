@@ -15,6 +15,9 @@
 //  Raw tab item contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -22,9 +25,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class TabItemEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -144,13 +144,15 @@ struct QSemanticTabItemEnumerationTests {
 
     @Test("3. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_tab_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List tab items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTabGroup"
             ]
         )
@@ -161,6 +163,8 @@ struct QSemanticTabItemEnumerationTests {
 
     @Test("4. Disallowed role (e.g. AXTable, AXButton, AXGroup, AXWindow, AXRadioGroup) is rejected before tree walk")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXRadioGroup", "AXRow", "AXPopUpButton"] {
             let req = QActionRequest(
                 toolName: "ui.list_tab_items",
@@ -168,7 +172,7 @@ struct QSemanticTabItemEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List tab items",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "title": "Project Settings"
                 ]
@@ -204,13 +208,15 @@ struct QSemanticTabItemEnumerationTests {
 
     @Test("6. Non-existent tab group target fails closed")
     func nonExistentTabGroupTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_tab_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List tab items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTabGroup",
                 "title": "QNoSuchTabGroup-2AH-\(UUID().uuidString)"
             ]
@@ -388,41 +394,28 @@ struct QSemanticTabItemEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSTabView) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            let tabView = NSTabView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-            let item1 = NSTabViewItem(identifier: "tab-overview")
-            item1.label = "Overview"
-            let item2 = NSTabViewItem(identifier: "tab-details")
-            item2.label = "Details"
-            let item3 = NSTabViewItem(identifier: "tab-settings")
-            item3.label = "Settings"
-
-            tabView.addTabViewItem(item1)
-            tabView.addTabViewItem(item2)
-            tabView.addTabViewItem(item3)
-
-            tabView.setAccessibilityIdentifier("QTestTabGroup-2AH")
-            tabView.setAccessibilityLabel("Test Tab Group")
-            window.contentView?.addSubview(tabView)
-            window.makeKeyAndOrderFront(nil)
-            return (window, tabView)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 400x300 titled/closable
+        // window, 380x280 tab view, three tabs (identifiers tab-overview/tab-details/tab-settings,
+        // labels Overview/Details/Settings), AX identifier and AX label the in-process setup used.
+        // (The fixture gives each tab an empty content view; the tabs themselves are unchanged.)
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "tabView",
+            identifier: "QTestTabGroup-2AH",
+            windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+            properties: [
+                "tabs": ["Overview", "Details", "Settings"],
+                "tabIdentifiers": ["tab-overview", "tab-details", "tab-settings"]
+            ]
+        )
+        try await fixture.setAccessibility("QTestTabGroup-2AH", "label", "Test Tab Group")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listTabItems(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTabGroup",
             identifier: "QTestTabGroup-2AH",
             title: nil
