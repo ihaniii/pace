@@ -52,7 +52,6 @@ extension FixtureScene {
         case "accessibility:roleDescription": return view.accessibilityRoleDescription() ?? NSNull()
         case "accessibility:rowCount": return view.accessibilityRowCount()
         case "accessibility:columnCount": return view.accessibilityColumnCount()
-        case "accessibility:hasHeader": return view.accessibilityHeader() != nil
         // The header element's class name, or null when there is none — lets a test compare the
         // AppKit-side accessor's presence against the AX read without shipping the object itself.
         case "accessibility:header":
@@ -178,7 +177,6 @@ extension FixtureScene {
         case "isMainWindow": return window.isMainWindow
         case "isFullScreen": return window.styleMask.contains(.fullScreen)
         case "isSheet": return window.isSheet
-        case "hasDefaultButtonCell": return window.defaultButtonCell != nil
         case "hasToolbar": return window.toolbar != nil
         case "isMiniaturizable": return window.styleMask.contains(.miniaturizable)
         case "isResizable": return window.styleMask.contains(.resizable)
