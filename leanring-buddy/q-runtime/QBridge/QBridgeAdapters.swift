@@ -322,6 +322,10 @@ public final class QBridgeAccessibility: QBridgeAccessibilityProtocol, @unchecke
 public enum QAXInteractionError: Error, Equatable, Sendable, CustomStringConvertible {
     case accessibilityPermissionDenied
     case applicationNotAvailable(String)
+    /// Q Security Architecture (F-02): refusing to target Que's own process or bundle identity
+    /// via Accessibility. Que must never use its production QBridge AX execution path to target
+    /// Que itself.
+    case selfTargetingProhibited(String)
     case missingMatchCriteria
     case noMatchingElement
     case ambiguousTarget(count: Int)
@@ -1309,6 +1313,8 @@ public enum QAXInteractionError: Error, Equatable, Sendable, CustomStringConvert
             return "Accessibility permission is not granted."
         case .applicationNotAvailable(let name):
             return "Application '\(name)' is not currently running."
+        case .selfTargetingProhibited(let name):
+            return "Refusing to target Que's own process or bundle identity via Accessibility ('\(name)')."
         case .missingMatchCriteria:
             return "Target must specify an identifier or title to match semantically."
         case .noMatchingElement:
@@ -1759,6 +1765,7 @@ public enum QAXInteractionError: Error, Equatable, Sendable, CustomStringConvert
         switch self {
         case .accessibilityPermissionDenied: return "AX_PERMISSION_DENIED"
         case .applicationNotAvailable: return "AX_APPLICATION_NOT_AVAILABLE"
+        case .selfTargetingProhibited: return "AX_SELF_TARGET_PROHIBITED"
         case .missingMatchCriteria: return "AX_MISSING_MATCH_CRITERIA"
         case .noMatchingElement: return "AX_NO_MATCHING_ELEMENT"
         case .ambiguousTarget: return "AX_AMBIGUOUS_TARGET"
@@ -5665,25 +5672,75 @@ extension QBridgeAccessibility {
     /// key (populated even where kAXTitleAttribute is empty — see docs/PHASE_2H_SEMANTIC_CLICK.md).
     private static let axIdentifierAttributeName = "AXIdentifier"
 
+    /// Q Security Architecture (F-02): Authoritative identity check ensuring Que never targets
+    /// its own process or bundle identity via Accessibility.
+    /// Invariant:
+    /// - A PID match rejects the current process.
+    /// - A bundle identifier match rejects Que's own bundle identity.
+    /// - Display name is NEVER used as a security identity.
+    private static func isSelfBundleIdentifier(_ candidateBundleIdentifier: String) -> Bool {
+        let normalizedCandidateIdentifier = candidateBundleIdentifier.lowercased()
+        if let mainBundleIdentifier = Bundle.main.bundleIdentifier?.lowercased(),
+           !mainBundleIdentifier.isEmpty,
+           normalizedCandidateIdentifier == mainBundleIdentifier {
+            return true
+        }
+        if let currentAppBundleIdentifier = NSRunningApplication.current.bundleIdentifier?.lowercased(),
+           !currentAppBundleIdentifier.isEmpty,
+           normalizedCandidateIdentifier == currentAppBundleIdentifier {
+            return true
+        }
+        return false
+    }
+
+    private static func isSelfTarget(_ runningApplication: NSRunningApplication) -> Bool {
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+        if runningApplication.processIdentifier == currentProcessIdentifier ||
+           runningApplication.processIdentifier == NSRunningApplication.current.processIdentifier {
+            return true
+        }
+        if let candidateAppBundleIdentifier = runningApplication.bundleIdentifier?.lowercased() {
+            if let mainBundleIdentifier = Bundle.main.bundleIdentifier?.lowercased(),
+               !mainBundleIdentifier.isEmpty,
+               candidateAppBundleIdentifier == mainBundleIdentifier {
+                return true
+            }
+            if let currentAppBundleIdentifier = NSRunningApplication.current.bundleIdentifier?.lowercased(),
+               !currentAppBundleIdentifier.isEmpty,
+               candidateAppBundleIdentifier == currentAppBundleIdentifier {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Resolves running applications matching the existing identity contract (case-insensitive
     /// localized name OR case-insensitive bundle identifier).
     /// Enforces the strict Q security invariant:
+    /// - Self-targeting prohibited: throws `QAXInteractionError.selfTargetingProhibited(applicationName)`
     /// - Exactly 1 match: returns the matching NSRunningApplication
     /// - 0 matches: throws `QAXInteractionError.applicationNotAvailable(applicationName)`
-    /// - >1 matches: throws `QAXInteractionError.ambiguousTarget(count: matchingApps.count)`
+    /// - >1 matches: throws `QAXInteractionError.ambiguousTarget(count: matchingApplications.count)`
     /// Never falls back to `.first` when multiple matches exist.
     public static func resolveExactRunningApplication(named applicationName: String) throws -> NSRunningApplication {
-        let matchingApps = NSWorkspace.shared.runningApplications.filter {
-            ($0.localizedName?.caseInsensitiveCompare(applicationName) == .orderedSame) ||
-            ($0.bundleIdentifier?.caseInsensitiveCompare(applicationName) == .orderedSame)
+        if isSelfBundleIdentifier(applicationName) {
+            throw QAXInteractionError.selfTargetingProhibited(applicationName)
         }
-        guard !matchingApps.isEmpty else {
+
+        let matchingApplications = NSWorkspace.shared.runningApplications.filter { runningApplication in
+            (runningApplication.localizedName?.caseInsensitiveCompare(applicationName) == .orderedSame) ||
+            (runningApplication.bundleIdentifier?.caseInsensitiveCompare(applicationName) == .orderedSame)
+        }
+        guard !matchingApplications.isEmpty else {
             throw QAXInteractionError.applicationNotAvailable(applicationName)
         }
-        guard matchingApps.count == 1 else {
-            throw QAXInteractionError.ambiguousTarget(count: matchingApps.count)
+        if matchingApplications.contains(where: { runningApplication in isSelfTarget(runningApplication) }) {
+            throw QAXInteractionError.selfTargetingProhibited(applicationName)
         }
-        return matchingApps[0]
+        guard matchingApplications.count == 1 else {
+            throw QAXInteractionError.ambiguousTarget(count: matchingApplications.count)
+        }
+        return matchingApplications[0]
     }
 
 
