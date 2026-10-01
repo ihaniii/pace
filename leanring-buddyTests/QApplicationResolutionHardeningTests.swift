@@ -26,18 +26,127 @@ struct QApplicationResolutionHardeningTests {
         Bundle.main.bundleIdentifier ?? "com.pace.app"
     }
 
-    // MARK: - 1. Shared Resolver: Single exact match resolves successfully
+    // MARK: - 1. Shared Resolver: Que AX Self-Targeting Prohibited (F-02)
 
-    @Test("1. Single exact matching application resolves successfully by localizedName")
-    func singleExactMatchResolvesByLocalizedName() throws {
-        let app = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessAppName)
-        #expect(app.processIdentifier == NSRunningApplication.current.processIdentifier)
+    @Test("1. Self-targeting by localizedName is prohibited and throws selfTargetingProhibited")
+    func selfTargetingProhibitedByLocalizedName() {
+        #expect(throws: QAXInteractionError.self) {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessAppName)
+        }
+
+        do {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessAppName)
+            Issue.record("Expected selfTargetingProhibited error")
+        } catch let axError as QAXInteractionError {
+            if case .selfTargetingProhibited(let name) = axError {
+                #expect(name == currentProcessAppName)
+                #expect(axError.errorCode == "AX_SELF_TARGET_PROHIBITED")
+                #expect(axError.description.contains("Refusing to target Que's own process or bundle identity"))
+            } else {
+                Issue.record("Expected .selfTargetingProhibited, got: \(axError)")
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
     }
 
-    @Test("2. Single exact matching application resolves successfully by bundleIdentifier")
-    func singleExactMatchResolvesByBundleIdentifier() throws {
-        let app = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessBundleId)
-        #expect(app.processIdentifier == NSRunningApplication.current.processIdentifier)
+    @Test("2. Self-targeting by bundleIdentifier is prohibited and throws selfTargetingProhibited")
+    func selfTargetingProhibitedByBundleIdentifier() {
+        #expect(throws: QAXInteractionError.self) {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessBundleId)
+        }
+
+        do {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: currentProcessBundleId)
+            Issue.record("Expected selfTargetingProhibited error")
+        } catch let axError as QAXInteractionError {
+            if case .selfTargetingProhibited(let name) = axError {
+                #expect(name == currentProcessBundleId)
+                #expect(axError.errorCode == "AX_SELF_TARGET_PROHIBITED")
+                #expect(axError.description.contains("Refusing to target Que's own process or bundle identity"))
+            } else {
+                Issue.record("Expected .selfTargetingProhibited, got: \(axError)")
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("2b. Case-insensitive bundleIdentifier self-targeting rejection")
+    func caseInsensitiveBundleIdentifierSelfTargetingRejection() {
+        let upperBundleId = currentProcessBundleId.uppercased()
+        let lowerBundleId = currentProcessBundleId.lowercased()
+
+        #expect(throws: QAXInteractionError.self) {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: upperBundleId)
+        }
+        #expect(throws: QAXInteractionError.self) {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: lowerBundleId)
+        }
+
+        do {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: upperBundleId)
+            Issue.record("Expected selfTargetingProhibited error for uppercase bundle ID")
+        } catch let axError as QAXInteractionError {
+            if case .selfTargetingProhibited = axError {
+                #expect(axError.errorCode == "AX_SELF_TARGET_PROHIBITED")
+            } else {
+                Issue.record("Expected .selfTargetingProhibited, got: \(axError)")
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - 1b. Shared Resolver: Legitimate external application resolves successfully
+
+    @Test("1c. Legitimate external application resolves successfully by localizedName and bundleIdentifier")
+    func legitimateExternalApplicationResolves() throws {
+        let runningFinderApplication = NSWorkspace.shared.runningApplications.first { application in
+            application.bundleIdentifier == "com.apple.finder"
+        }
+        guard let finderApplication = runningFinderApplication else { return }
+
+        let resolvedByName = try QBridgeAccessibility.resolveExactRunningApplication(named: "Finder")
+        #expect(resolvedByName.processIdentifier == finderApplication.processIdentifier)
+
+        let resolvedByBundle = try QBridgeAccessibility.resolveExactRunningApplication(named: "com.apple.finder")
+        #expect(resolvedByBundle.processIdentifier == finderApplication.processIdentifier)
+    }
+
+    @Test("1d. Negative control: Application name containing 'Pace' or 'Que' is not rejected as self-targeting")
+    func nameContainingPaceOrQueNotRejectedAsSelfTarget() {
+        // Querying an unlaunched application name containing "Pace" or "Que" must fail with
+        // .applicationNotAvailable, NOT .selfTargetingProhibited. This verifies that display
+        // name is NEVER used as a security identity signal.
+        let externalPaceName = "PaceExternalHelper-\(UUID().uuidString)"
+        let externalQueName = "QueThirdParty-\(UUID().uuidString)"
+
+        do {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: externalPaceName)
+            Issue.record("Expected applicationNotAvailable error")
+        } catch let axError as QAXInteractionError {
+            if case .applicationNotAvailable(let name) = axError {
+                #expect(name == externalPaceName)
+            } else {
+                Issue.record("Expected .applicationNotAvailable, got: \(axError) (name must not be used as identity)")
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+
+        do {
+            _ = try QBridgeAccessibility.resolveExactRunningApplication(named: externalQueName)
+            Issue.record("Expected applicationNotAvailable error")
+        } catch let axError as QAXInteractionError {
+            if case .applicationNotAvailable(let name) = axError {
+                #expect(name == externalQueName)
+            } else {
+                Issue.record("Expected .applicationNotAvailable, got: \(axError) (name must not be used as identity)")
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
     }
 
     // MARK: - 2. Shared Resolver: Zero matching applications fails closed
@@ -63,30 +172,30 @@ struct QApplicationResolutionHardeningTests {
         }
     }
 
-    // MARK: - 3. Shared Resolver: Case-insensitivity preserved
+    // MARK: - 3. Shared Resolver: Case-insensitivity preserved for external applications
 
-    @Test("4. Case-insensitive exact matching preserves existing behavior")
-    func caseInsensitiveMatchResolves() throws {
-        let upperName = currentProcessAppName.uppercased()
-        let lowerName = currentProcessAppName.lowercased()
+    @Test("4. Case-insensitive exact matching preserves resolution for external applications")
+    func caseInsensitiveMatchResolvesExternalApplication() throws {
+        let runningFinderApplication = NSWorkspace.shared.runningApplications.first { application in
+            application.bundleIdentifier == "com.apple.finder"
+        }
+        guard let finderApplication = runningFinderApplication else { return }
 
-        let appUpper = try QBridgeAccessibility.resolveExactRunningApplication(named: upperName)
-        let appLower = try QBridgeAccessibility.resolveExactRunningApplication(named: lowerName)
+        let resolvedWithUppercase = try QBridgeAccessibility.resolveExactRunningApplication(named: "FINDER")
+        let resolvedWithLowercase = try QBridgeAccessibility.resolveExactRunningApplication(named: "finder")
 
-        #expect(appUpper.processIdentifier == NSRunningApplication.current.processIdentifier)
-        #expect(appLower.processIdentifier == NSRunningApplication.current.processIdentifier)
+        #expect(resolvedWithUppercase.processIdentifier == finderApplication.processIdentifier)
+        #expect(resolvedWithLowercase.processIdentifier == finderApplication.processIdentifier)
     }
 
     // MARK: - 4. Shared Resolver: Substring and prefix matching rejected
 
     @Test("5. Substring and prefix matching are rejected (fails closed to applicationNotAvailable)")
     func substringMatchingRejected() {
-        guard currentProcessAppName.count > 3 else { return }
-        let prefix = String(currentProcessAppName.prefix(3))
-        // Verify prefix alone does not match if distinct from full name
-        if NSWorkspace.shared.runningApplications.filter({ ($0.localizedName?.caseInsensitiveCompare(prefix) == .orderedSame) }).isEmpty {
+        let testPrefix = "Find"
+        if NSWorkspace.shared.runningApplications.filter({ ($0.localizedName?.caseInsensitiveCompare(testPrefix) == .orderedSame) }).isEmpty {
             #expect(throws: QAXInteractionError.self) {
-                _ = try QBridgeAccessibility.resolveExactRunningApplication(named: prefix)
+                _ = try QBridgeAccessibility.resolveExactRunningApplication(named: testPrefix)
             }
         }
     }
@@ -98,6 +207,14 @@ struct QApplicationResolutionHardeningTests {
         let err = QAXInteractionError.ambiguousTarget(count: 2)
         #expect(err.errorCode == "AX_AMBIGUOUS_TARGET")
         #expect(err.description.contains("2"))
+    }
+
+    @Test("6b. Error contract: selfTargetingProhibited carries target name and AX_SELF_TARGET_PROHIBITED error code")
+    func selfTargetingProhibitedErrorCode() {
+        let err = QAXInteractionError.selfTargetingProhibited("Pace")
+        #expect(err.errorCode == "AX_SELF_TARGET_PROHIBITED")
+        #expect(err.description.contains("Pace"))
+        #expect(err.description.contains("Refusing to target Que's own process or bundle identity"))
     }
 
     // MARK: - 6. Level 3 Capability: app.quit fails closed on ambiguity
