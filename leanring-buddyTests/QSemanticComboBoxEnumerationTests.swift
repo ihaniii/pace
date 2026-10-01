@@ -19,6 +19,9 @@
 //  Raw combo box contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -26,9 +29,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class ComboBoxEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -172,6 +172,8 @@ struct QSemanticComboBoxEnumerationTests {
 
     @Test("6. Disallowed roles (e.g. AXTable, AXButton, AXGroup, AXWindow, AXToolbar, AXSheet, AXSlider, AXIncrementor) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXToolbar", "AXSheet", "AXSplitGroup", "AXTabGroup", "AXSlider", "AXIncrementor"] {
             let req = QActionRequest(
                 toolName: "ui.list_combo_boxes",
@@ -179,7 +181,7 @@ struct QSemanticComboBoxEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List combo boxes",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole
                 ]
             )
@@ -225,13 +227,15 @@ struct QSemanticComboBoxEnumerationTests {
 
     @Test("9. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_combo_boxes",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List combo boxes",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXComboBox",
                 "windowTitle": "QNoSuchWindow-2BB-\(UUID().uuidString)"
             ]
@@ -243,13 +247,15 @@ struct QSemanticComboBoxEnumerationTests {
 
     @Test("10. Non-existent combo box target with specific filter returns empty collection")
     func nonExistentComboBoxTargetReturnsEmpty() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_combo_boxes",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List combo boxes",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXComboBox",
                 "comboBoxTitle": "QNoSuchComboBox-2BB-\(UUID().uuidString)"
             ]
@@ -497,39 +503,27 @@ struct QSemanticComboBoxEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSComboBox) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            window.title = "QComboBoxWindow-2BB"
-
-            let comboBox = NSComboBox(frame: NSRect(x: 20, y: 20, width: 150, height: 26))
-            comboBox.addItems(withObjectValues: ["One", "Two", "Three"])
-            comboBox.selectItem(at: 0)
-            comboBox.stringValue = "One"
-            comboBox.setAccessibilityIdentifier("test.combobox.select")
-            comboBox.setAccessibilityTitle("Number Selector")
-
-            let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-            contentView.addSubview(comboBox)
-            window.contentView = contentView
-            window.makeKeyAndOrderFront(nil)
-
-            return (window, comboBox)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 400x300 titled/closable/
+        // resizable window, title, combo box frame, items, selection, string value, AX identifier
+        // and AX title the in-process setup used (the fixture window's content view is a plain
+        // 400x300 NSView, as before). The combo box has no target/action, as before.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "QComboBoxWindow-2BB", width: 400, height: 300, styles: ["titled", "closable", "resizable"])
+        try await fixture.addControl(
+            kind: "comboBox",
+            identifier: "test.combobox.select",
+            windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 150, height: 26),
+            properties: ["items": ["One", "Two", "Three"], "detachAction": true]
+        )
+        try await fixture.set("test.combobox.select", "indexOfSelectedItem", 0)
+        try await fixture.set("test.combobox.select", "stringValue", "One")
+        try await fixture.setAccessibility("test.combobox.select", "title", "Number Selector")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listComboBoxes(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: nil,
             identifier: nil,
             title: nil,

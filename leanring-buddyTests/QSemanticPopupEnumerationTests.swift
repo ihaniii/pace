@@ -14,6 +14,9 @@
 //  Raw popup contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -21,9 +24,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class PopupEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -137,13 +137,15 @@ struct QSemanticPopupEnumerationTests {
 
     @Test("3. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_popup_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List popup items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXPopUpButton"
             ]
         )
@@ -154,6 +156,8 @@ struct QSemanticPopupEnumerationTests {
 
     @Test("4. Disallowed role (e.g. AXComboBox, AXButton) is rejected before tree walk")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXComboBox", "AXButton", "AXTextField", "AXWindow", "AXMenu"] {
             let req = QActionRequest(
                 toolName: "ui.list_popup_items",
@@ -161,7 +165,7 @@ struct QSemanticPopupEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List popup items",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "title": "Format"
                 ]
@@ -197,13 +201,15 @@ struct QSemanticPopupEnumerationTests {
 
     @Test("6. Non-existent popup button target fails closed")
     func nonExistentPopupTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_popup_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List popup items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXPopUpButton",
                 "title": "QNoSuchPopup-2AD-\(UUID().uuidString)"
             ]
@@ -366,32 +372,25 @@ struct QSemanticPopupEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSPopUpButton) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 300, height: 200),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            let popUp = NSPopUpButton(frame: NSRect(x: 20, y: 50, width: 200, height: 30), pullsDown: false)
-            popUp.addItems(withTitles: ["Item Alpha", "Item Beta", "Item Gamma"])
-            popUp.selectItem(withTitle: "Item Beta")
-            popUp.setAccessibilityIdentifier("QTestPopUp-2AD")
-            popUp.setAccessibilityLabel("Test PopUp Button")
-            window.contentView?.addSubview(popUp)
-            window.makeKeyAndOrderFront(nil)
-            return (window, popUp)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 300x200 titled/closable
+        // window and the same non-pull-down pop-up (frame, three items, "Item Beta" selected — item
+        // index 1 — AX identifier, AX label, no target/action) the in-process setup used.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(width: 300, height: 200, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "popUpButton",
+            identifier: "QTestPopUp-2AD",
+            windowToken: windowToken,
+            frame: NSRect(x: 20, y: 50, width: 200, height: 30),
+            properties: ["items": ["Item Alpha", "Item Beta", "Item Gamma"], "detachAction": true]
+        )
+        try await fixture.set("QTestPopUp-2AD", "indexOfSelectedItem", 1)
+        try await fixture.setAccessibility("QTestPopUp-2AD", "label", "Test PopUp Button")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listPopupItems(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXPopUpButton",
             identifier: "QTestPopUp-2AD",
             title: nil

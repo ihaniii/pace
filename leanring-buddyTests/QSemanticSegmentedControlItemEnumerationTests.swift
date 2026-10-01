@@ -16,6 +16,9 @@
 //  Raw segment contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -23,9 +26,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class SegmentedControlEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -156,6 +156,8 @@ struct QSemanticSegmentedControlItemEnumerationTests {
 
     @Test("6. Disallowed roles (e.g. AXRadioGroup, AXTable, AXButton, AXGroup, AXWindow, AXTabGroup, AXToolbar) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXRadioGroup", "AXTable", "AXButton", "AXGroup", "AXWindow", "AXTabGroup", "AXToolbar", "AXPopUpButton"] {
             let req = QActionRequest(
                 toolName: "ui.list_segmented_control_items",
@@ -163,7 +165,7 @@ struct QSemanticSegmentedControlItemEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List segmented control items",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole
                 ]
             )
@@ -197,13 +199,15 @@ struct QSemanticSegmentedControlItemEnumerationTests {
 
     @Test("8. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_segmented_control_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List segmented control items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSegmentedControl",
                 "windowTitle": "QNoSuchWindow-2AM-\(UUID().uuidString)"
             ]
@@ -215,13 +219,15 @@ struct QSemanticSegmentedControlItemEnumerationTests {
 
     @Test("9. Non-existent segmented control target fails closed")
     func nonExistentSegmentedControlTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_segmented_control_items",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List segmented control items",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSegmentedControl",
                 "title": "QNoSuchControl-2AM-\(UUID().uuidString)"
             ]
@@ -411,31 +417,26 @@ struct QSemanticSegmentedControlItemEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSSegmentedControl) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 500, height: 350),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            let segControl = NSSegmentedControl(labels: ["List", "Icons", "Columns"], trackingMode: .selectOne, target: nil, action: nil)
-            segControl.selectedSegment = 1
-            segControl.setAccessibilityLabel("View Mode Control")
-            window.contentView?.addSubview(segControl)
-            window.title = "QSegWindow-2AM"
-            window.makeKeyAndOrderFront(nil)
-            return (window, segControl)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 500x350 titled/closable/
+        // resizable window and title, and the same select-one segmented control (labels, selected
+        // segment 1, AX label, no target/action, no AX identifier) the in-process setup used. The
+        // in-process control kept its intrinsic size at the content view's origin; the fixture
+        // places it at its default slot, which does not take part in AX target matching.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "QSegWindow-2AM", width: 500, height: 350, styles: ["titled", "closable", "resizable"])
+        try await fixture.addControl(
+            kind: "segmentedControl",
+            identifier: "segmented-view-mode",
+            windowToken: windowToken,
+            properties: ["segments": ["List", "Icons", "Columns"], "accessibilityIdentifier": "", "detachAction": true]
+        )
+        try await fixture.set("segmented-view-mode", "selectedSegment", 1)
+        try await fixture.setAccessibility("segmented-view-mode", "label", "View Mode Control")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listSegmentedControlItems(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSegmentedControl",
             identifier: nil,
             title: "View Mode Control",

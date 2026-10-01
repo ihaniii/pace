@@ -18,6 +18,9 @@
 //  Raw pane contents remain ephemeral in outputData and are never persisted into durable
 //  task snapshots, audit logs, or SQLite WAL memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -25,9 +28,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class SplitPaneEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -168,6 +168,8 @@ struct QSemanticSplitPaneEnumerationTests {
 
     @Test("6. Disallowed roles (e.g. AXTable, AXButton, AXGroup, AXWindow, AXToolbar, AXSplitter) are rejected")
     func disallowedRolesRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXTable", "AXButton", "AXGroup", "AXWindow", "AXToolbar", "AXSplitter", "AXTabGroup", "AXSheet"] {
             let req = QActionRequest(
                 toolName: "ui.list_split_panes",
@@ -175,7 +177,7 @@ struct QSemanticSplitPaneEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List split panes",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole
                 ]
             )
@@ -217,13 +219,15 @@ struct QSemanticSplitPaneEnumerationTests {
 
     @Test("9. Non-existent window target fails closed")
     func nonExistentWindowTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_split_panes",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List split panes",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSplitGroup",
                 "windowTitle": "QNoSuchWindow-2AT-\(UUID().uuidString)"
             ]
@@ -235,13 +239,15 @@ struct QSemanticSplitPaneEnumerationTests {
 
     @Test("10. Non-existent split group target fails closed")
     func nonExistentSplitGroupTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_split_panes",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List split panes",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXSplitGroup",
                 "title": "QNoSuchSplitGroup-2AT-\(UUID().uuidString)"
             ]
@@ -491,40 +497,31 @@ struct QSemanticSplitPaneEnumerationTests {
             return
         }
 
-        let expectation = await MainActor.run { () -> (NSWindow, NSSplitView) in
-            let window = NSWindow(
-                contentRect: NSRect(x: 100, y: 100, width: 600, height: 400),
-                styleMask: [.titled, .closable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window.animationBehavior = .none
-            let splitView = NSSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
-            splitView.isVertical = true
-            splitView.dividerStyle = .thin
-
-            let leftPane = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 400))
-            leftPane.setAccessibilityIdentifier("split.left")
-            let rightPane = NSView(frame: NSRect(x: 200, y: 0, width: 400, height: 400))
-            rightPane.setAccessibilityIdentifier("split.right")
-
-            splitView.addArrangedSubview(leftPane)
-            splitView.addArrangedSubview(rightPane)
-
-            window.contentView = splitView
-            window.title = "QSplitViewWindow-2AT"
-            window.makeKeyAndOrderFront(nil)
-            return (window, splitView)
-        }
-
-        defer {
-            Task { @MainActor in
-                expectation.0.orderOut(nil)
-            }
-        }
+        // Built inside the out-of-process PaceAXFixtureHost with the same 600x400 titled/closable/
+        // resizable window and title, and the same vertical, thin-divider 600x400 split view (no AX
+        // identifier) holding a 200-wide "split.left" pane and a 400-wide "split.right" pane, set
+        // as the window's content view — exactly as the in-process setup did.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let windowToken = try await fixture.createWindow(title: "QSplitViewWindow-2AT", width: 600, height: 400, styles: ["titled", "closable", "resizable"])
+        try await fixture.addControl(
+            kind: "splitView",
+            identifier: "split-view-main",
+            windowToken: windowToken,
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            properties: [
+                "isVertical": true,
+                "dividerStyle": "thin",
+                "paneWidths": [200.0, 400.0],
+                "paneIdentifiers": ["split.left", "split.right"],
+                "asWindowContentView": true,
+                "accessibilityIdentifier": ""
+            ]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
 
         let metadata = try await QBridgeAccessibility.shared.listSplitPanes(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXSplitGroup",
             identifier: nil,
             title: nil,
