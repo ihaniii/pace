@@ -28,6 +28,9 @@
 //  fabricating a pass, mirroring the exact convention every prior semantic AX test suite in this
 //  codebase already established. See docs/PHASE_2CK_SEMANTIC_TABLE_HEADER.md for the full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -35,9 +38,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -45,32 +45,34 @@ private var currentProcessAppName: String {
 /// AXUIElement via default AppKit Accessibility bridging, identical construction family to
 /// `QSemanticTableDimensionsReadTests`' own table fixtures. A real `NSTableHeaderView` is attached
 /// via the genuine, public `headerView` property (no custom `NSAccessibility` override needed).
-@MainActor
+///
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+/// 220x220 titled window filled by the scroll view, single "Name" column, AX identifier and
+/// header-or-no-header choice the in-process helper used (AppKit's default NSTableHeaderView when
+/// included, headerView = nil otherwise); laid out after being shown, as before. Returns the
+/// fixture window token, the table's fixture handle (also its AX identifier) and the same handle
+/// for the scroll view slot, which no test reads.
+@discardableResult
 private func makeTableWithHeader(
+    in fixture: PaceAXFixture,
     tableIdentifier: String,
     includeHeader: Bool = true
-) -> (window: NSWindow, tableView: NSTableView, scrollView: NSScrollView) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 80, y: 80, width: 220, height: 220),
-        styleMask: [.titled],
-        backing: .buffered,
-        defer: false
+) async throws -> (window: String, tableView: String, scrollView: String) {
+    let windowToken = try await fixture.createWindow(title: "QSemanticTableHeaderReadTestFixture", width: 220, height: 220, styles: ["titled"])
+    try await fixture.addControl(
+        kind: "tableView",
+        identifier: tableIdentifier,
+        windowToken: windowToken,
+        frame: NSRect(x: 0, y: 0, width: 220, height: 220),
+        properties: [
+            "columns": ["col1"],
+            "columnTitles": ["Name"],
+            "includeHeader": includeHeader
+        ]
     )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = "QSemanticTableHeaderReadTestFixture"
-    let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 220, height: 220))
-    let tableView = NSTableView(frame: NSRect(x: 0, y: 0, width: 220, height: 220))
-    let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("col1"))
-    column.title = "Name"
-    tableView.addTableColumn(column)
-    tableView.setAccessibilityIdentifier(tableIdentifier)
-    tableView.headerView = includeHeader ? NSTableHeaderView() : nil
-    scrollView.documentView = tableView
-    window.contentView = scrollView
-    window.makeKeyAndOrderFront(nil)
-    tableView.layoutSubtreeIfNeeded()
-    return (window, tableView, scrollView)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    try await fixture.perform(tableIdentifier, "layoutSubtreeIfNeeded")
+    return (windowToken, tableIdentifier, tableIdentifier)
 }
 
 private final class TableHeaderMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -154,12 +156,13 @@ struct QSemanticTableHeaderReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "table-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "table-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "table-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "table-\(suffix)", title: nil
         )
         #expect(reference != nil)
     }
@@ -188,9 +191,11 @@ struct QSemanticTableHeaderReadTests {
     @Test("4. Missing identity (neither identifier nor title) is rejected with AX_MISSING_MATCH_CRITERIA before any AX search")
     func missingIdentityRejected() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.missingMatchCriteria) {
             _ = try await QBridgeAccessibility.shared.readTableHeader(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: nil, title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: nil, title: nil
             )
         }
     }
@@ -202,13 +207,14 @@ struct QSemanticTableHeaderReadTests {
     func zeroTargetMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readTableHeader(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "absent-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "absent-\(suffix)", title: nil
             )
         }
     }
@@ -221,31 +227,26 @@ struct QSemanticTableHeaderReadTests {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
         let sharedIdentifier = "DupTable-\(suffix)"
-        let window = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollA = NSScrollView(frame: NSRect(x: 0, y: 0, width: 140, height: 140))
-        let tableA = NSTableView(frame: NSRect(x: 0, y: 0, width: 140, height: 140))
-        tableA.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("colA")))
-        tableA.setAccessibilityIdentifier(sharedIdentifier)
-        scrollA.documentView = tableA
-        scrollA.frame = NSRect(x: 0, y: 0, width: 140, height: 140)
-        let scrollB = NSScrollView(frame: NSRect(x: 150, y: 0, width: 140, height: 140))
-        let tableB = NSTableView(frame: NSRect(x: 0, y: 0, width: 140, height: 140))
-        tableB.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("colB")))
-        tableB.setAccessibilityIdentifier(sharedIdentifier)
-        scrollB.documentView = tableB
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
-        container.addSubview(scrollA)
-        container.addSubview(scrollB)
-        window.contentView = container
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tables that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 300, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "tableView", identifier: "\(sharedIdentifier)-A", windowToken: windowToken,
+            frame: NSRect(x: 0, y: 0, width: 140, height: 140),
+            properties: ["columns": ["colA"], "accessibilityIdentifier": sharedIdentifier]
+        )
+        try await fixture.addControl(
+            kind: "tableView", identifier: "\(sharedIdentifier)-B", windowToken: windowToken,
+            frame: NSRect(x: 150, y: 0, width: 140, height: 140),
+            properties: ["columns": ["colB"], "accessibilityIdentifier": sharedIdentifier]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readTableHeader(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: sharedIdentifier, title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: sharedIdentifier, title: nil
             )
         }
     }
@@ -274,9 +275,11 @@ struct QSemanticTableHeaderReadTests {
     @Test("9. A disallowed source role fails closed with AX_DISALLOWED_TABLE_ROLE — no new allowlist is introduced")
     func disallowedSourceRoleFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         await #expect(throws: QAXInteractionError.disallowedTableRole("AXOutline")) {
             _ = try await QBridgeAccessibility.shared.readTableHeader(
-                applicationName: currentProcessAppName, role: "AXOutline", identifier: "whatever", title: nil
+                applicationName: fixture.applicationName, role: "AXOutline", identifier: "whatever", title: nil
             )
         }
     }
@@ -294,12 +297,13 @@ struct QSemanticTableHeaderReadTests {
     func headerReferenceExistsResolvesCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "exists-\(suffix)", includeHeader: true)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "exists-\(suffix)", includeHeader: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let reference = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "exists-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "exists-\(suffix)", title: nil
         )
         #expect(reference != nil)
     }
@@ -309,15 +313,16 @@ struct QSemanticTableHeaderReadTests {
     func headerReferenceAbsentDoesNotThrow() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "noheader-\(suffix)", includeHeader: false)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "noheader-\(suffix)", includeHeader: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         // Whatever AppKit's real, honest answer is (nil absence, or a genuine value actually
         // reported by the OS) is accepted here — the CONTRACT under test is that no exception was
         // thrown merely because headerView was never set.
         _ = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "noheader-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "noheader-\(suffix)", title: nil
         )
     }
 
@@ -398,15 +403,16 @@ struct QSemanticTableHeaderReadTests {
     func neverInteractsWithElements() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tableView, _) = makeTableWithHeader(tableIdentifier: "nomutate-\(suffix)")
-        let headerBefore = tableView.headerView
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView, _) = try await makeTableWithHeader(in: fixture, tableIdentifier: "nomutate-\(suffix)")
+        let headerBefore = try await fixture.optionalString(tableView, "headerViewObjectIdentity")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(tableView.headerView === headerBefore)
+        #expect(try await fixture.optionalString(tableView, "headerViewObjectIdentity") == headerBefore)
     }
 
     @Test("22. QPermissionGate.evaluate returns .allow (never .requireApproval) for ui.read_table_header — routed through the real gate, not bypassed")
@@ -456,8 +462,9 @@ struct QSemanticTableHeaderReadTests {
     func rawReferenceMetadataNotPersistedDurably() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "durable-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "durable-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -470,7 +477,7 @@ struct QSemanticTableHeaderReadTests {
                   "actionName": "ui.read_table_header",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified table's header reference",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTable", "identifier": "durable-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTable", "identifier": "durable-\(suffix)"}
                 }
               ]
             }
@@ -496,7 +503,7 @@ struct QSemanticTableHeaderReadTests {
         }
         let stepSnapshot = durablePlan.steps.first(where: { $0.actionName == "ui.read_table_header" })
         #expect(stepSnapshot?.verifiedEvidence?.contains("status=verified") == true)
-        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(currentProcessAppName)") == true)
+        #expect(stepSnapshot?.verifiedEvidence?.contains("application=\(fixture.applicationName)") == true)
     }
 
     @Test("26. Audit records for this capability's verification evidence never contain the header reference's own title/identifier — only conservative presence metadata")
@@ -504,8 +511,9 @@ struct QSemanticTableHeaderReadTests {
     func rawReferenceMetadataNotInAuditRecords() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeTableWithHeader(tableIdentifier: "audit-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "audit-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -518,7 +526,7 @@ struct QSemanticTableHeaderReadTests {
                   "actionName": "ui.read_table_header",
                   "toolFamily": "ui",
                   "description": "Read a semantically-identified table's header reference",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "role": "AXTable", "identifier": "audit-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "role": "AXTable", "identifier": "audit-\(suffix)"}
                 }
               ]
             }
@@ -650,10 +658,12 @@ struct QSemanticTableHeaderReadTests {
 
     @Test("QResourceGuard's generic per-step targetResources validation applies to ui.read_table_header exactly like every other capability")
     func resourceGuardAppliesGenerically() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_table_header", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read table header", targetResources: [],
-            parameters: ["applicationName": currentProcessAppName, "role": "AXTable", "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "role": "AXTable", "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-resource-guard-table-header"))
         #expect(result.summary != "Resource Guard Denied target: ")
@@ -673,10 +683,12 @@ struct QSemanticTableHeaderReadTests {
 
     @Test("Missing required 'role' parameter fails closed")
     func missingRoleFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.read_table_header", toolFamily: "ui", riskLevel: .level0ReadOnly,
             literalAction: "Read table header",
-            parameters: ["applicationName": currentProcessAppName, "identifier": "x"]
+            parameters: ["applicationName": fixture.applicationName, "identifier": "x"]
         )
         let result = try await QExecutionService.shared.executeAction(req, context: QTaskContext(taskId: "t-missing-role-table-header"))
         #expect(result.success == false)
@@ -704,25 +716,25 @@ struct QSemanticTableHeaderReadTests {
         }
         let suffix = UUID().uuidString
 
-        let (headerWindow, headerTable, _) = makeTableWithHeader(tableIdentifier: "e2e-header-\(suffix)", includeHeader: true)
-        defer { headerWindow.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, headerTable, _) = try await makeTableWithHeader(in: fixture, tableIdentifier: "e2e-header-\(suffix)", includeHeader: true)
         try? await Task.sleep(nanoseconds: 250_000_000)
         let headerReference = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "e2e-header-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "e2e-header-\(suffix)", title: nil
         )
         // Genuine AX-path retrieval, cross-validated against the AppKit-side accessor read
         // independently on the same control — never a mock, never a hardcoded assumption about
         // what the AX layer alone would report.
-        let directAccessorHeader = headerTable.accessibilityHeader()
+        let directAccessorHeader = try await fixture.optionalString(headerTable, "accessibility:header")
         #expect((headerReference != nil) == (directAccessorHeader != nil))
 
-        let (noHeaderWindow, _, _) = makeTableWithHeader(tableIdentifier: "e2e-noheader-\(suffix)", includeHeader: false)
-        defer { noHeaderWindow.close() }
+        try await makeTableWithHeader(in: fixture, tableIdentifier: "e2e-noheader-\(suffix)", includeHeader: false)
         try? await Task.sleep(nanoseconds: 200_000_000)
         // A table with no header view is still resolved without throwing — whatever AppKit's own
         // honest answer is (nil absence, or a genuine value it happens to report) is accepted.
         _ = try await QBridgeAccessibility.shared.readTableHeader(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "e2e-noheader-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "e2e-noheader-\(suffix)", title: nil
         )
     }
 }

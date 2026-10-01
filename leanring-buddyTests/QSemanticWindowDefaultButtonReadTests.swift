@@ -22,6 +22,9 @@
 //  codebase already established. See docs/PHASE_2BM_SEMANTIC_WINDOW_DEFAULT_BUTTON.md for the
 //  full contract.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -29,9 +32,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 // MARK: - Test-only AppKit fixtures
 
@@ -39,60 +39,45 @@ private var currentProcessAppName: String {
 /// AppKit Accessibility bridging. `defaultButton`/`cancelButton`, when supplied, are assigned via
 /// `window.defaultButtonCell`/a designated `NSButton` respectively — real public AppKit API, no
 /// custom `NSAccessibility` override needed.
-@MainActor
+/// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host): the same window
+/// (400x150, [.titled, .closable], title, optional AX identifier) and buttons (frames, titles, AX
+/// identifiers) as the in-process helper, with `window.defaultButtonCell` set to the default
+/// button's cell. Like the in-process `NSButton(frame:)`s, the buttons have no action — except,
+/// when `countsDefaultButtonPresses` is true, the default button keeps the fixture's counting
+/// target so a test can prove it was never pressed. Returns the window and button handles.
+@discardableResult
 private func makeWindowWithButtons(
+    in fixture: PaceAXFixture,
     windowTitle: String,
     windowIdentifier: String? = nil,
     defaultButton: (title: String, identifier: String)? = nil,
-    cancelButton: (title: String, identifier: String)? = nil
-) -> (window: NSWindow, defaultButton: NSButton?, cancelButton: NSButton?) {
-    let window = NSWindow(
-        contentRect: NSRect(x: 100, y: 100, width: 400, height: 150),
-        styleMask: [.titled, .closable],
-        backing: .buffered,
-        defer: false
-    )
-    window.isReleasedWhenClosed = false
-    window.animationBehavior = .none
-    window.title = windowTitle
-    if let windowIdentifier {
-        window.setAccessibilityIdentifier(windowIdentifier)
-    }
-    let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 150))
-
-    var defaultButtonView: NSButton?
+    cancelButton: (title: String, identifier: String)? = nil,
+    countsDefaultButtonPresses: Bool = false
+) async throws -> (window: String, defaultButton: String?, cancelButton: String?) {
+    let windowToken = try await fixture.createWindow(identifier: windowIdentifier, title: windowTitle, width: 400, height: 150, styles: ["titled", "closable"])
+    var defaultButtonHandle: String?
     if let defaultButton {
-        let button = NSButton(frame: NSRect(x: 20, y: 20, width: 120, height: 32))
-        button.title = defaultButton.title
-        button.setAccessibilityIdentifier(defaultButton.identifier)
-        contentView.addSubview(button)
-        defaultButtonView = button
+        try await fixture.addControl(
+            kind: "button", identifier: defaultButton.identifier, windowToken: windowToken,
+            frame: NSRect(x: 20, y: 20, width: 120, height: 32),
+            properties: ["title": defaultButton.title, "detachAction": !countsDefaultButtonPresses]
+        )
+        defaultButtonHandle = defaultButton.identifier
     }
-
-    var cancelButtonView: NSButton?
+    var cancelButtonHandle: String?
     if let cancelButton {
-        let button = NSButton(frame: NSRect(x: 160, y: 20, width: 120, height: 32))
-        button.title = cancelButton.title
-        button.setAccessibilityIdentifier(cancelButton.identifier)
-        contentView.addSubview(button)
-        cancelButtonView = button
+        try await fixture.addControl(
+            kind: "button", identifier: cancelButton.identifier, windowToken: windowToken,
+            frame: NSRect(x: 160, y: 20, width: 120, height: 32),
+            properties: ["title": cancelButton.title, "detachAction": true]
+        )
+        cancelButtonHandle = cancelButton.identifier
     }
-
-    window.contentView = contentView
-
-    if let defaultButtonView {
-        window.defaultButtonCell = defaultButtonView.cell as? NSButtonCell
+    if let defaultButtonHandle {
+        try await fixture.set(windowToken, "defaultButton", defaultButtonHandle)
     }
-    // NSWindow has no first-class "cancelButtonCell" property the way it has
-    // defaultButtonCell — kAXCancelButtonAttribute is typically populated by apps via a custom
-    // NSAccessibility override (e.g. accessibilityCancelButton()) rather than a simple NSWindow
-    // property. The cancel-button fixture therefore exercises the "genuinely absent" path
-    // honestly (a plain NSWindow never reports a cancel button) rather than fabricating one —
-    // documented as a known limitation, not silently worked around.
-    _ = cancelButtonView
-
-    window.makeKeyAndOrderFront(nil)
-    return (window, defaultButtonView, cancelButtonView)
+    try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+    return (windowToken, defaultButtonHandle, cancelButtonHandle)
 }
 
 private final class WindowDefaultButtonMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
@@ -174,17 +159,15 @@ struct QSemanticWindowDefaultButtonReadTests {
     func exactApplicationResolutionSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "DefBtnWindow-\(suffix)",
-            defaultButton: (title: "OK", identifier: "ok-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "DefBtnWindow-\(suffix)", defaultButton: (title: "OK", identifier: "ok-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "DefBtnWindow-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "DefBtnWindow-\(suffix)", windowIdentifier: nil
         )
-        #expect(metadata.applicationName == currentProcessAppName)
+        #expect(metadata.applicationName == fixture.applicationName)
     }
 
     // MARK: - Resolution: zero application match
@@ -213,20 +196,18 @@ struct QSemanticWindowDefaultButtonReadTests {
     func exactWindowMatchSucceeds() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "ByTitleWindow-\(suffix)", windowIdentifier: "byid-\(suffix)",
-            defaultButton: (title: "OK", identifier: "ok-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "ByTitleWindow-\(suffix)", windowIdentifier: "byid-\(suffix)", defaultButton: (title: "OK", identifier: "ok-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let byIdentifier = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: nil, windowIdentifier: "byid-\(suffix)"
+            applicationName: fixture.applicationName, windowTitle: nil, windowIdentifier: "byid-\(suffix)"
         )
         #expect(byIdentifier.defaultButton?.title == "OK")
 
         let byTitle = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "ByTitleWindow-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ByTitleWindow-\(suffix)", windowIdentifier: nil
         )
         #expect(byTitle.defaultButton?.title == "OK")
     }
@@ -238,13 +219,14 @@ struct QSemanticWindowDefaultButtonReadTests {
     func zeroWindowMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(windowTitle: "Present-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "Present-\(suffix)")
         try? await Task.sleep(nanoseconds: 100_000_000)
 
         await #expect(throws: QAXInteractionError.noMatchingElement) {
             _ = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-                applicationName: currentProcessAppName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: "Absent-\(suffix)", windowIdentifier: nil
             )
         }
     }
@@ -256,22 +238,19 @@ struct QSemanticWindowDefaultButtonReadTests {
     func ambiguousWindowMatchFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let windowA = NSWindow(contentRect: NSRect(x: 80, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowA.isReleasedWhenClosed = false
-        windowA.animationBehavior = .none
-        windowA.title = "DupWindow-\(suffix)"
-        windowA.makeKeyAndOrderFront(nil)
-        let windowB = NSWindow(contentRect: NSRect(x: 400, y: 80, width: 300, height: 120), styleMask: [.titled], backing: .buffered, defer: false)
-        windowB.isReleasedWhenClosed = false
-        windowB.animationBehavior = .none
-        windowB.title = "DupWindow-\(suffix)"
-        windowB.makeKeyAndOrderFront(nil)
-        defer { windowA.close(); windowB.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real windows sharing one title, built in the fixture exactly as the inline AppKit
+        // block built them ([.titled], 300x120, made key and ordered front).
+        let windowA = try await fixture.createWindow(title: "DupWindow-\(suffix)", width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowA, "makeKeyAndOrderFront")
+        let windowB = try await fixture.createWindow(title: "DupWindow-\(suffix)", width: 300, height: 120, styles: ["titled"])
+        try await fixture.perform(windowB, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-                applicationName: currentProcessAppName, windowTitle: "DupWindow-\(suffix)", windowIdentifier: nil
+                applicationName: fixture.applicationName, windowTitle: "DupWindow-\(suffix)", windowIdentifier: nil
             )
         }
     }
@@ -283,15 +262,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func defaultOnlyCombination() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "DefaultOnly-\(suffix)",
-            defaultButton: (title: "Save", identifier: "save-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "DefaultOnly-\(suffix)", defaultButton: (title: "Save", identifier: "save-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "DefaultOnly-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "DefaultOnly-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton?.title == "Save")
         #expect(metadata.cancelButton == nil) // genuinely absent, not an error
@@ -302,12 +279,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func neitherButtonCombination() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(windowTitle: "NeitherButton-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "NeitherButton-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "NeitherButton-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "NeitherButton-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton == nil)
         #expect(metadata.cancelButton == nil)
@@ -338,15 +316,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func validAXButtonReferenceAccepted() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "ValidRef-\(suffix)",
-            defaultButton: (title: "Continue", identifier: "continue-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "ValidRef-\(suffix)", defaultButton: (title: "Continue", identifier: "continue-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "ValidRef-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "ValidRef-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton?.title == "Continue")
         #expect(metadata.defaultButton?.identifier == "continue-\(suffix)")
@@ -379,15 +355,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func titleExtractedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "TitleTest-\(suffix)",
-            defaultButton: (title: "Proceed", identifier: "proceed-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "TitleTest-\(suffix)", defaultButton: (title: "Proceed", identifier: "proceed-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "TitleTest-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "TitleTest-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton?.title == "Proceed")
     }
@@ -397,15 +371,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func identifierExtractedCorrectly() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "IdTest-\(suffix)",
-            defaultButton: (title: "Proceed", identifier: "proceed-id-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "IdTest-\(suffix)", defaultButton: (title: "Proceed", identifier: "proceed-id-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "IdTest-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "IdTest-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton?.identifier == "proceed-id-\(suffix)")
     }
@@ -478,24 +450,17 @@ struct QSemanticWindowDefaultButtonReadTests {
     func neverPressesButtons() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        final class PressCounter {
-            var count = 0
-            @objc func increment() { count += 1 }
-        }
-        let counter = PressCounter()
-        let (window, defaultButton, _) = makeWindowWithButtons(
-            windowTitle: "NoPress-\(suffix)",
-            defaultButton: (title: "DoNotPress", identifier: "nopress-\(suffix)")
-        )
-        defaultButton?.target = counter
-        defaultButton?.action = #selector(PressCounter.increment)
-        defer { window.close() }
+        // The fixture's own action counter (its target on this default button) replaces the
+        // test-side PressCounter target the in-process version attached.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, defaultButton, _) = try await makeWindowWithButtons(in: fixture, windowTitle: "NoPress-\(suffix)", defaultButton: (title: "DoNotPress", identifier: "nopress-\(suffix)"), countsDefaultButtonPresses: true)
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "NoPress-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "NoPress-\(suffix)", windowIdentifier: nil
         )
-        #expect(counter.count == 0)
+        #expect(try await fixture.intIfPresent(defaultButton, "actionCount") == 0)
     }
 
     @Test("26. QPermissionGate.evaluate returns .allow (never .requireApproval) for ui.read_window_default_button — routed through the real gate, not bypassed")
@@ -543,12 +508,13 @@ struct QSemanticWindowDefaultButtonReadTests {
     func noApplicationActivationOccurs() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(windowTitle: "NoActivate-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "NoActivate-\(suffix)")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         _ = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "NoActivate-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "NoActivate-\(suffix)", windowIdentifier: nil
         )
         // AXUIElementCreateApplication is a pure reference constructor — never activates,
         // focuses, or raises the target application, the same primitive every prior capability
@@ -564,11 +530,9 @@ struct QSemanticWindowDefaultButtonReadTests {
     func rawButtonMetadataNotPersistedDurably() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "DurablePrivacy-\(suffix)",
-            defaultButton: (title: "ConfidentialActionLabel", identifier: "confidential-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "DurablePrivacy-\(suffix)", defaultButton: (title: "ConfidentialActionLabel", identifier: "confidential-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -581,7 +545,7 @@ struct QSemanticWindowDefaultButtonReadTests {
                   "actionName": "ui.read_window_default_button",
                   "toolFamily": "ui",
                   "description": "Read a window's default/cancel button references",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "DurablePrivacy-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "DurablePrivacy-\(suffix)"}
                 }
               ]
             }
@@ -615,11 +579,9 @@ struct QSemanticWindowDefaultButtonReadTests {
     func rawButtonMetadataNotInAuditRecords() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, _, _) = makeWindowWithButtons(
-            windowTitle: "AuditPrivacy-\(suffix)",
-            defaultButton: (title: "SecretButtonLabelForAudit", identifier: "secret-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeWindowWithButtons(in: fixture, windowTitle: "AuditPrivacy-\(suffix)", defaultButton: (title: "SecretButtonLabelForAudit", identifier: "secret-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let mockModel = MockAutonomousModelProvider()
@@ -632,7 +594,7 @@ struct QSemanticWindowDefaultButtonReadTests {
                   "actionName": "ui.read_window_default_button",
                   "toolFamily": "ui",
                   "description": "Read a window's default/cancel button references",
-                  "parameters": {"applicationName": "\(currentProcessAppName)", "title": "AuditPrivacy-\(suffix)"}
+                  "parameters": {"applicationName": "\(fixture.applicationName)", "title": "AuditPrivacy-\(suffix)"}
                 }
               ]
             }
@@ -775,21 +737,19 @@ struct QSemanticWindowDefaultButtonReadTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, defaultButton, _) = makeWindowWithButtons(
-            windowTitle: "E2EDefaultButton-\(suffix)",
-            defaultButton: (title: "Save", identifier: "e2e-save-\(suffix)")
-        )
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, defaultButton, _) = try await makeWindowWithButtons(in: fixture, windowTitle: "E2EDefaultButton-\(suffix)", defaultButton: (title: "Save", identifier: "e2e-save-\(suffix)"))
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.readWindowDefaultButton(
-            applicationName: currentProcessAppName, windowTitle: "E2EDefaultButton-\(suffix)", windowIdentifier: nil
+            applicationName: fixture.applicationName, windowTitle: "E2EDefaultButton-\(suffix)", windowIdentifier: nil
         )
         #expect(metadata.defaultButton?.title == "Save")
         #expect(metadata.defaultButton?.identifier == "e2e-save-\(suffix)")
         // No cancel-button fixture exists on a plain NSWindow — genuine, honest absence.
         #expect(metadata.cancelButton == nil)
         // The button itself remains provably un-pressed / unchanged.
-        #expect(defaultButton?.title == "Save")
+        #expect(try await fixture.stringIfPresent(defaultButton, "title") == "Save")
     }
 }

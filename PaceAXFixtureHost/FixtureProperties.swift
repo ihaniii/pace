@@ -50,6 +50,23 @@ extension FixtureScene {
         case "accessibility:disclosureLevel": return view.accessibilityDisclosureLevel()
         case "accessibility:valueDescription": return view.accessibilityValueDescription() ?? NSNull()
         case "accessibility:roleDescription": return view.accessibilityRoleDescription() ?? NSNull()
+        case "accessibility:rowCount": return view.accessibilityRowCount()
+        case "accessibility:columnCount": return view.accessibilityColumnCount()
+        // The header element's class name, or null when there is none — lets a test compare the
+        // AppKit-side accessor's presence against the AX read without shipping the object itself.
+        case "accessibility:header":
+            return view.accessibilityHeader().map { String(describing: type(of: $0)) } ?? NSNull()
+        // A stable per-object token for the table's current NSTableHeaderView, so a test can
+        // prove the header object was never replaced (the in-process tests compared with ===).
+        case "headerViewObjectIdentity":
+            guard let tableView = view as? NSTableView else { break }
+            return tableView.headerView.map { String(describing: ObjectIdentifier($0)) } ?? NSNull()
+        case "tableColumnCount":
+            guard let tableView = view as? NSTableView else { break }
+            return tableView.tableColumns.count
+        case "tableColumnTitles":
+            guard let tableView = view as? NSTableView else { break }
+            return tableView.tableColumns.map { $0.title }
         case "accessibility:allowedValues":
             return view.accessibilityAllowedValues()?.map { $0.doubleValue } ?? NSNull()
         case "accessibility:servesAsTitleForUIElements":
@@ -94,6 +111,7 @@ extension FixtureScene {
             // The live NSScroller's knob position, or null when AppKit instantiated no vertical
             // scroller (tests branch on that existence, so it must stay observable).
             case "verticalScrollerValue": return scrollView.verticalScroller.map { $0.doubleValue } ?? NSNull()
+            case "horizontalScrollerValue": return scrollView.horizontalScroller.map { $0.doubleValue } ?? NSNull()
             default: break
             }
         }
@@ -159,6 +177,10 @@ extension FixtureScene {
         case "isMainWindow": return window.isMainWindow
         case "isFullScreen": return window.styleMask.contains(.fullScreen)
         case "isSheet": return window.isSheet
+        case "hasToolbar": return window.toolbar != nil
+        case "isMiniaturizable": return window.styleMask.contains(.miniaturizable)
+        case "isResizable": return window.styleMask.contains(.resizable)
+        case "isFullScreenPrimary": return window.collectionBehavior.contains(.fullScreenPrimary)
         case "hasAttachedSheet": return window.attachedSheet != nil
         default: throw FixtureSceneError.unsupportedKey(key: key, target: "window '\(identifier)'")
         }
@@ -177,8 +199,18 @@ extension FixtureScene {
 
     func setValue(_ value: Any, forKey key: String, identifier: String) throws {
         if let window = window(forTokenOrIdentifier: identifier) {
-            guard key == "title" else { throw FixtureSceneError.unsupportedKey(key: key, target: "window '\(identifier)'") }
-            window.title = try requireString(value, key: key)
+            switch key {
+            case "title":
+                window.title = try requireString(value, key: key)
+            case "defaultButton":
+                // Exactly `window.defaultButtonCell = button.cell as? NSButtonCell` for a fixture button.
+                guard let button = viewsByIdentifier[try requireString(value, key: key)] as? NSButton else {
+                    throw FixtureSceneError.invalidValue(key: key)
+                }
+                window.defaultButtonCell = button.cell as? NSButtonCell
+            default:
+                throw FixtureSceneError.unsupportedKey(key: key, target: "window '\(identifier)'")
+            }
             return
         }
         guard let view = viewsByIdentifier[identifier] else { throw FixtureSceneError.unknownIdentifier(identifier) }
@@ -334,6 +366,13 @@ extension FixtureScene {
             window.makeKeyAndOrderFront(nil)
         case "orderFront":
             window.orderFrontRegardless()
+        case "makeMain":
+            window.makeMain()
+        case "installToolbar":
+            // Exactly `window.toolbar = NSToolbar(identifier:)` — a real, empty toolbar.
+            window.toolbar = NSToolbar(identifier: NSToolbar.Identifier("PaceAXFixtureToolbar"))
+        case "addFullScreenPrimaryBehavior":
+            window.collectionBehavior.insert(.fullScreenPrimary)
         case "orderOut":
             window.orderOut(nil)
         case "miniaturize":
@@ -417,6 +456,10 @@ extension FixtureScene {
             targetElement.setAccessibilityLinkedUIElements(try referencedViews(value, key: attribute))
         case "rowHeaderUIElements":
             targetElement.setAccessibilityRowHeaderUIElements(try referencedViews(value, key: attribute))
+        case "rowCount":
+            targetElement.setAccessibilityRowCount(try requireInt(value, key: attribute))
+        case "columnCount":
+            targetElement.setAccessibilityColumnCount(try requireInt(value, key: attribute))
         case "identifier":
             targetElement.setAccessibilityIdentifier(try requireString(value, key: attribute))
         case "customActionNames":
@@ -463,6 +506,10 @@ extension FixtureScene {
             for window in NSApp.windows {
                 _ = window.makeFirstResponder(nil)
             }
+        case "pumpModalSession":
+            // Exactly one non-blocking `NSApp.runModalSession(_:)` pump of the running session,
+            // as the in-process tests did right after beginModalSession(for:).
+            try pumpModalSession()
         case "state":
             break
         default:

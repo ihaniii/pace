@@ -15,6 +15,9 @@
 //  ephemeral in outputData and are never persisted into durable task snapshots, audit logs, or
 //  SQLite WAL memory stores beyond an aggregate count.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -22,9 +25,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class TableColumnEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -133,13 +133,15 @@ struct QSemanticTableColumnEnumerationTests {
 
     @Test("3. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_table_columns",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List table columns",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTable"
             ]
         )
@@ -150,6 +152,8 @@ struct QSemanticTableColumnEnumerationTests {
 
     @Test("4. Disallowed role (e.g. AXOutline, AXButton, AXBrowser) is rejected before tree walk — QAXTableRolePolicy reused verbatim, not forked")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXOutline", "AXButton", "AXTextField", "AXWindow", "AXRow", "AXBrowser", "AXColumn"] {
             let req = QActionRequest(
                 toolName: "ui.list_table_columns",
@@ -157,7 +161,7 @@ struct QSemanticTableColumnEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List table columns",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "title": "Files"
                 ]
@@ -200,13 +204,15 @@ struct QSemanticTableColumnEnumerationTests {
 
     @Test("7. Non-existent table target fails closed (zero matches)")
     func nonExistentTableTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_table_columns",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List table columns",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTable",
                 "title": "QNoSuchTable-2BI-\(UUID().uuidString)"
             ]
@@ -221,33 +227,26 @@ struct QSemanticTableColumnEnumerationTests {
     func ambiguousTableTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-
-        let scrollA = NSScrollView(frame: NSRect(x: 10, y: 10, width: 180, height: 280))
-        let tableA = NSTableView(frame: scrollA.bounds)
-        tableA.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColA")))
-        tableA.setAccessibilityIdentifier("dup-table-\(suffix)")
-        scrollA.documentView = tableA
-        contentView.addSubview(scrollA)
-
-        let scrollB = NSScrollView(frame: NSRect(x: 200, y: 10, width: 180, height: 280))
-        let tableB = NSTableView(frame: scrollB.bounds)
-        tableB.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColB")))
-        tableB.setAccessibilityIdentifier("dup-table-\(suffix)")
-        scrollB.documentView = tableB
-        contentView.addSubview(scrollB)
-
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tables that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "tableView", identifier: "dup-table-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColA"], "accessibilityIdentifier": "dup-table-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "tableView", identifier: "dup-table-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 200, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColB"], "accessibilityIdentifier": "dup-table-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listTableColumns(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "dup-table-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "dup-table-\(suffix)", title: nil
             )
         }
     }
@@ -386,16 +385,17 @@ struct QSemanticTableColumnEnumerationTests {
     func noMutationOccurs() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tableView) = makeTwoColumnTableFixture(identifier: "nomutate-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView) = try await makeTwoColumnTableFixture(in: fixture, identifier: "nomutate-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.listTableColumns(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(tableView.tableColumns.count == 2)
-        #expect(tableView.tableColumns[0].title == "Name")
-        #expect(tableView.tableColumns[1].title == "Date Modified")
+        #expect(try await fixture.int(tableView, "tableColumnCount") == 2)
+        #expect((try await fixture.value(tableView, "tableColumnTitles") as? [String])?[0] == "Name")
+        #expect((try await fixture.value(tableView, "tableColumnTitles") as? [String])?[1] == "Date Modified")
     }
 
     // MARK: - 14. No polling occurs
@@ -587,12 +587,13 @@ struct QSemanticTableColumnEnumerationTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _) = makeTwoColumnTableFixture(identifier: "e2e-columns-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makeTwoColumnTableFixture(in: fixture, identifier: "e2e-columns-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.listTableColumns(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTable",
             identifier: "e2e-columns-\(suffix)",
             title: nil
@@ -605,31 +606,26 @@ struct QSemanticTableColumnEnumerationTests {
 
     // MARK: - Test-only AppKit fixture helper
 
-    @MainActor
-    private func makeTwoColumnTableFixture(identifier: String) -> (window: NSWindow, tableView: NSTableView) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
+    /// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+    /// 400x300 titled/closable window, 380x280 scroll view, two 150-point columns, AX identifier
+    /// and AX label the in-process helper used. Returns the fixture window token and the table's
+    /// fixture handle (also its AX identifier).
+    @discardableResult
+    private func makeTwoColumnTableFixture(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, tableView: String) {
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "tableView",
+            identifier: identifier,
+            windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+            properties: [
+                "columns": ["NameCol", "DateCol"],
+                "columnTitles": ["Name", "Date Modified"],
+                "columnWidths": [150.0, 150.0]
+            ]
         )
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-        let tableView = NSTableView(frame: scrollView.bounds)
-        let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("NameCol"))
-        nameColumn.title = "Name"
-        nameColumn.width = 150
-        let dateColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("DateCol"))
-        dateColumn.title = "Date Modified"
-        dateColumn.width = 150
-        tableView.addTableColumn(nameColumn)
-        tableView.addTableColumn(dateColumn)
-        tableView.setAccessibilityIdentifier(identifier)
-        tableView.setAccessibilityLabel("Test Table")
-        scrollView.documentView = tableView
-        window.contentView?.addSubview(scrollView)
-        window.makeKeyAndOrderFront(nil)
-        return (window, tableView)
+        try await fixture.setAccessibility(identifier, "label", "Test Table")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+        return (windowToken, identifier)
     }
 }

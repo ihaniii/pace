@@ -24,6 +24,9 @@
 //  outputData and is never persisted into durable task snapshots, audit logs, or SQLite WAL memory
 //  stores beyond an aggregate count.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX calls against AppKit's own windows crash on main-queue assertions or deadlock.
+//
 
 import Testing
 import AppKit
@@ -31,9 +34,6 @@ import Foundation
 import ApplicationServices
 @testable import Pace
 
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 private final class TableRowHeaderEnumerationMockExecutionProvider: QExecutionProvider, @unchecked Sendable {
     func executeAction(_ request: QActionRequest, context: QTaskContext) async throws -> QActionResult {
@@ -147,13 +147,15 @@ struct QSemanticTableRowHeaderEnumerationTests {
 
     @Test("3. Missing both identifier and title fails closed")
     func missingMatchCriteriaFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_table_row_headers",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List table row headers",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTable"
             ]
         )
@@ -164,6 +166,8 @@ struct QSemanticTableRowHeaderEnumerationTests {
 
     @Test("4. Disallowed role (e.g. AXOutline, AXButton, AXBrowser) is rejected before tree walk — QAXTableRolePolicy reused verbatim, not forked")
     func disallowedRoleRejected() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         for invalidRole in ["AXOutline", "AXButton", "AXTextField", "AXWindow", "AXRow", "AXBrowser", "AXColumn"] {
             let req = QActionRequest(
                 toolName: "ui.list_table_row_headers",
@@ -171,7 +175,7 @@ struct QSemanticTableRowHeaderEnumerationTests {
                 riskLevel: .level0ReadOnly,
                 literalAction: "List table row headers",
                 parameters: [
-                    "applicationName": currentProcessAppName,
+                    "applicationName": fixture.applicationName,
                     "role": invalidRole,
                     "title": "Files"
                 ]
@@ -214,13 +218,15 @@ struct QSemanticTableRowHeaderEnumerationTests {
 
     @Test("7. Non-existent table target fails closed (zero matches)")
     func nonExistentTableTargetFailsClosed() async throws {
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
         let req = QActionRequest(
             toolName: "ui.list_table_row_headers",
             toolFamily: "ui",
             riskLevel: .level0ReadOnly,
             literalAction: "List table row headers",
             parameters: [
-                "applicationName": currentProcessAppName,
+                "applicationName": fixture.applicationName,
                 "role": "AXTable",
                 "title": "QNoSuchTable-2BZ-\(UUID().uuidString)"
             ]
@@ -235,33 +241,26 @@ struct QSemanticTableRowHeaderEnumerationTests {
     func ambiguousTableTargetFailsClosed() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 400, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
-
-        let scrollA = NSScrollView(frame: NSRect(x: 10, y: 10, width: 180, height: 280))
-        let tableA = NSTableView(frame: scrollA.bounds)
-        tableA.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColA")))
-        tableA.setAccessibilityIdentifier("dup-rh-table-\(suffix)")
-        scrollA.documentView = tableA
-        contentView.addSubview(scrollA)
-
-        let scrollB = NSScrollView(frame: NSRect(x: 200, y: 10, width: 180, height: 280))
-        let tableB = NSTableView(frame: scrollB.bounds)
-        tableB.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ColB")))
-        tableB.setAccessibilityIdentifier("dup-rh-table-\(suffix)")
-        scrollB.documentView = tableB
-        contentView.addSubview(scrollB)
-
-        window.contentView = contentView
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        // Two real tables that deliberately share one AX identifier, inside the fixture.
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled"])
+        try await fixture.addControl(
+            kind: "tableView", identifier: "dup-rh-table-\(suffix)-A", windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColA"], "accessibilityIdentifier": "dup-rh-table-\(suffix)"]
+        )
+        try await fixture.addControl(
+            kind: "tableView", identifier: "dup-rh-table-\(suffix)-B", windowToken: windowToken,
+            frame: NSRect(x: 200, y: 10, width: 180, height: 280),
+            properties: ["columns": ["ColB"], "accessibilityIdentifier": "dup-rh-table-\(suffix)"]
+        )
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
         try? await Task.sleep(nanoseconds: 150_000_000)
 
         await #expect(throws: QAXInteractionError.ambiguousTarget(count: 2)) {
             _ = try await QBridgeAccessibility.shared.listTableRowHeaders(
-                applicationName: currentProcessAppName, role: "AXTable", identifier: "dup-rh-table-\(suffix)", title: nil
+                applicationName: fixture.applicationName, role: "AXTable", identifier: "dup-rh-table-\(suffix)", title: nil
             )
         }
     }
@@ -461,14 +460,15 @@ struct QSemanticTableRowHeaderEnumerationTests {
     func noMutationOccurs() async throws {
         guard AXIsProcessTrusted() else { return }
         let suffix = UUID().uuidString
-        let (window, tableView, forcedRowHeaders) = makeTableWithForcedRowHeadersFixture(identifier: "nomutate-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, tableView, forcedRowHeaders) = try await makeTableWithForcedRowHeadersFixture(in: fixture, identifier: "nomutate-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         _ = try await QBridgeAccessibility.shared.listTableRowHeaders(
-            applicationName: currentProcessAppName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
+            applicationName: fixture.applicationName, role: "AXTable", identifier: "nomutate-\(suffix)", title: nil
         )
-        #expect(tableView.tableColumns.count == 1)
+        #expect(try await fixture.int(tableView, "tableColumnCount") == 1)
         #expect(forcedRowHeaders.count == 2)
     }
 
@@ -664,12 +664,13 @@ struct QSemanticTableRowHeaderEnumerationTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _, forcedRowHeaders) = makeTableWithForcedRowHeadersFixture(identifier: "e2e-rowheaders-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        let (_, _, forcedRowHeaders) = try await makeTableWithForcedRowHeadersFixture(in: fixture, identifier: "e2e-rowheaders-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.listTableRowHeaders(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTable",
             identifier: "e2e-rowheaders-\(suffix)",
             title: nil
@@ -693,12 +694,13 @@ struct QSemanticTableRowHeaderEnumerationTests {
             return
         }
         let suffix = UUID().uuidString
-        let (window, _) = makePlainTableFixtureNoRowHeaders(identifier: "e2e-no-rowheaders-\(suffix)")
-        defer { window.close() }
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await makePlainTableFixtureNoRowHeaders(in: fixture, identifier: "e2e-no-rowheaders-\(suffix)")
         try? await Task.sleep(nanoseconds: 200_000_000)
 
         let metadata = try await QBridgeAccessibility.shared.listTableRowHeaders(
-            applicationName: currentProcessAppName,
+            applicationName: fixture.applicationName,
             role: "AXTable",
             identifier: "e2e-no-rowheaders-\(suffix)",
             title: nil
@@ -712,63 +714,55 @@ struct QSemanticTableRowHeaderEnumerationTests {
 
     // MARK: - Test-only AppKit fixture helpers
 
-    @MainActor
-    private func makeTableWithForcedRowHeadersFixture(identifier: String) -> (window: NSWindow, tableView: NSTableView, forcedRowHeaders: [NSTextField]) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
+    /// Built inside the out-of-process PaceAXFixtureHost (never in this XCTest host) with the same
+    /// 400x300 titled/closable window, 380x280 scroll view, single 300-point "Value" column, AX
+    /// identifier and AX label the in-process helper used, with the same two forced row headers.
+    /// Returns the fixture window token, the table's fixture handle (also its AX identifier) and
+    /// the two row headers' fixture handles.
+    @discardableResult
+    private func makeTableWithForcedRowHeadersFixture(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, tableView: String, forcedRowHeaders: [String]) {
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "tableView",
+            identifier: identifier,
+            windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+            properties: ["columns": ["Col"], "columnTitles": ["Value"], "columnWidths": [300.0]]
         )
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-        let tableView = NSTableView(frame: scrollView.bounds)
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Col"))
-        column.title = "Value"
-        column.width = 300
-        tableView.addTableColumn(column)
-        tableView.setAccessibilityIdentifier(identifier)
-        tableView.setAccessibilityLabel("Test Table With Row Headers")
+        try await fixture.setAccessibility(identifier, "label", "Test Table With Row Headers")
 
         // Real AXRow-role elements, forced as this table's row headers via the genuine, declared
         // NSAccessibilityElement protocol property accessibilityRowHeaderUIElements — the same
         // official `setAccessibility<X>` forcing convention already used since Phase 2BN/2BX,
         // confirmed as a real, declared property in NSAccessibilityProtocols.h
         // ("accessibilityRowHeaderUIElements", API_AVAILABLE(macos(10.10))).
-        let rowHeaderOne = NSTextField(labelWithString: "Row 1")
-        rowHeaderOne.setAccessibilityRole(.row)
-        let rowHeaderTwo = NSTextField(labelWithString: "Row 2")
-        rowHeaderTwo.setAccessibilityRole(.row)
-        tableView.setAccessibilityRowHeaderUIElements([rowHeaderOne, rowHeaderTwo])
+        // Like the in-process originals, the two labels are never added to any view ("detached").
+        let rowHeaderOne = "\(identifier)-row-header-1"
+        let rowHeaderTwo = "\(identifier)-row-header-2"
+        try await fixture.addControl(kind: "label", identifier: rowHeaderOne, properties: ["title": "Row 1", "detached": true])
+        try await fixture.setAccessibility(rowHeaderOne, "role", "AXRow")
+        try await fixture.addControl(kind: "label", identifier: rowHeaderTwo, properties: ["title": "Row 2", "detached": true])
+        try await fixture.setAccessibility(rowHeaderTwo, "role", "AXRow")
+        try await fixture.setAccessibility(identifier, "rowHeaderUIElements", [rowHeaderOne, rowHeaderTwo])
 
-        scrollView.documentView = tableView
-        window.contentView?.addSubview(scrollView)
-        window.makeKeyAndOrderFront(nil)
-        return (window, tableView, [rowHeaderOne, rowHeaderTwo])
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+        return (windowToken, identifier, [rowHeaderOne, rowHeaderTwo])
     }
 
-    @MainActor
-    private func makePlainTableFixtureNoRowHeaders(identifier: String) -> (window: NSWindow, tableView: NSTableView) {
-        let window = NSWindow(
-            contentRect: NSRect(x: 100, y: 100, width: 400, height: 300),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
+    /// Built inside the out-of-process PaceAXFixtureHost with the same window, table, column, AX
+    /// identifier and AX label the in-process helper used, and no row-header relationship.
+    @discardableResult
+    private func makePlainTableFixtureNoRowHeaders(in fixture: PaceAXFixture, identifier: String) async throws -> (window: String, tableView: String) {
+        let windowToken = try await fixture.createWindow(width: 400, height: 300, styles: ["titled", "closable"])
+        try await fixture.addControl(
+            kind: "tableView",
+            identifier: identifier,
+            windowToken: windowToken,
+            frame: NSRect(x: 10, y: 10, width: 380, height: 280),
+            properties: ["columns": ["Col"], "columnTitles": ["Value"], "columnWidths": [300.0]]
         )
-        window.isReleasedWhenClosed = false
-        window.animationBehavior = .none
-        let scrollView = NSScrollView(frame: NSRect(x: 10, y: 10, width: 380, height: 280))
-        let tableView = NSTableView(frame: scrollView.bounds)
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("Col"))
-        column.title = "Value"
-        column.width = 300
-        tableView.addTableColumn(column)
-        tableView.setAccessibilityIdentifier(identifier)
-        tableView.setAccessibilityLabel("Test Table Without Row Headers")
-        scrollView.documentView = tableView
-        window.contentView?.addSubview(scrollView)
-        window.makeKeyAndOrderFront(nil)
-        return (window, tableView)
+        try await fixture.setAccessibility(identifier, "label", "Test Table Without Row Headers")
+        try await fixture.perform(windowToken, "makeKeyAndOrderFront")
+        return (windowToken, identifier)
     }
 }
