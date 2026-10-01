@@ -106,26 +106,29 @@ extension CompanionManager {
     func requestUserApprovalForActionPlan(
         _ actionExecutionPlan: PaceActionExecutionPlan,
         preflightIssues: [PaceToolPreflightIssue] = [],
-        smokeAutoCancelAfter: TimeInterval? = nil
+        smokeAutoCancelAfter: TimeInterval? = nil,
+        approvalModalRunner: ((NSAlert) -> NSApplication.ModalResponse)? = nil
     ) -> Bool {
-        let hasBlockingPreflightIssue = preflightIssues.contains { $0.severity == .blocking }
-        let shouldRequestApproval = hasBlockingPreflightIssue
-            || (
-                requiresActionApproval
-                    && PaceActionApprovalPolicy.requiresExplicitApproval(
-                        for: actionExecutionPlan
-                    )
-            )
-        let approvalRequest = PaceActionApprovalRequest(
+        let requiresApproval = PaceActionApprovalPolicy.requiresExplicitApproval(
+            for: actionExecutionPlan,
+            preflightIssues: preflightIssues
+        )
+
+        // Routine local actions do not require explicit approval popup by product doctrine.
+        guard requiresApproval else {
+            return true
+        }
+
+        // Under Que security doctrine (F-01), model output is untrusted and actions requiring approval
+        // MUST require explicit approval regardless of legacy preference flags (requiresActionApproval).
+        // If approval is required by policy, but a valid approval request cannot be constructed
+        // (e.g. empty or whitespace summary), execution MUST FAIL CLOSED.
+        guard let approvalRequest = PaceActionApprovalRequest(
             approvalSummary: actionExecutionPlan.approvalSummary,
             preflightSummary: PaceToolPreflightIssue.formatForApproval(preflightIssues),
-            requiresActionApproval: shouldRequestApproval
-        )
-        guard let approvalRequest else {
-            return PaceActionApprovalPolicy.shouldExecuteActions(
-                request: nil,
-                decision: .allowOnce
-            )
+            requiresActionApproval: true
+        ) else {
+            return false
         }
 
         let alert = NSAlert()
@@ -137,19 +140,29 @@ extension CompanionManager {
 
         if let smokeAutoCancelAfter {
             DispatchQueue.main.asyncAfter(deadline: .now() + smokeAutoCancelAfter) {
-                NSApp.stopModal(withCode: .alertFirstButtonReturn)
+                alert.buttons.first?.performClick(nil)
+                NSApp.abortModal()
                 alert.window.orderOut(nil)
             }
         }
 
-        NSApp.activate(ignoringOtherApps: true)
+        let response: NSApplication.ModalResponse
+        if let approvalModalRunner {
+            response = approvalModalRunner(alert)
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+            response = alert.runModal()
+        }
+
         let approvalDecision: PaceActionApprovalDecision =
-            alert.runModal() == .alertSecondButtonReturn ? .allowOnce : .cancel
+            response == .alertSecondButtonReturn ? .allowOnce : .cancel
         recordApprovalInterventionOutcome(
             decision: approvalDecision,
             approvalSummary: approvalRequest.approvalSummary
         )
-        return PaceActionApprovalPolicy.shouldExecuteActions(
+        return PaceActionApprovalPolicy.shouldExecutePlan(
+            actionExecutionPlan,
+            preflightIssues: preflightIssues,
             request: approvalRequest,
             decision: approvalDecision
         )
