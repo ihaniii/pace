@@ -15,16 +15,15 @@
 //  enabled, role). Raw menu contents remain ephemeral in outputData and are never persisted
 //  into durable task snapshots, audit logs, or memory stores.
 //
+//  Every live AX target lives in the out-of-process PaceAXFixtureHost (Support/PaceAXFixture.swift),
+//  never in this XCTest host: same-process AX reads of AppKit's own main menu trip main-thread assertions or deadlock.
+//
 
 import Testing
 import AppKit
 import Foundation
 import ApplicationServices
 @testable import Pace
-
-private var currentProcessAppName: String {
-    NSRunningApplication.current.localizedName ?? ProcessInfo.processInfo.processName
-}
 
 @Suite("QSemanticMenuEnumerationTests")
 struct QSemanticMenuEnumerationTests {
@@ -447,7 +446,15 @@ struct QSemanticMenuEnumerationTests {
             return
         }
 
-        let appName = currentProcessAppName
+        // The menu bar now belongs to the out-of-process PaceAXFixtureHost, never this XCTest host:
+        // reading the host's own main menu through AX made AppKit touch it off the main thread
+        // (NSMenu _lockForMainMenuItemArray assertion) and return no menus. The fixture starts with
+        // no main menu, so one ordinary top-level menu holding one enabled item is installed first.
+        let fixture = try await PaceAXFixture.launch()
+        defer { fixture.stop() }
+        try await fixture.installMenu(menuBarTitle: "Fixture Menu", itemTitle: "Fixture Item", itemEnabled: true, countsSelections: false)
+
+        let appName = fixture.applicationName
         let menus = try await QBridgeAccessibility.shared.listMenuItems(applicationName: appName)
         #expect(!menus.isEmpty)
         for menu in menus {
