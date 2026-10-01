@@ -2045,9 +2045,12 @@ extension CompanionManager {
                                         .detectChange(in: accumulatedPlannerText)
                                     {
                                         Task { @MainActor [weak self] in
+                                            let actionPlan = PaceActionExecutionPlan.serial(actions: [
+                                                .composeMail(streamingMailDraftSnapshot.normalizedMailDraft)
+                                            ])
                                             guard let self,
                                                 self.actionExecutor.actionsAreEnabled,
-                                                !self.requiresActionApproval
+                                                !PaceActionApprovalPolicy.requiresExplicitApproval(for: actionPlan)
                                             else {
                                                 return
                                             }
@@ -2061,9 +2064,12 @@ extension CompanionManager {
                                         .detectChange(in: accumulatedPlannerText)
                                     {
                                         Task { @MainActor [weak self] in
+                                            let actionPlan = PaceActionExecutionPlan.serial(actions: [
+                                                .type(streamingFieldChange.typingDelta)
+                                            ])
                                             guard let self,
                                                 self.actionExecutor.actionsAreEnabled,
-                                                !self.requiresActionApproval
+                                                !PaceActionApprovalPolicy.requiresExplicitApproval(for: actionPlan)
                                             else {
                                                 return
                                             }

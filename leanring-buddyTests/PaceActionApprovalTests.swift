@@ -3,6 +3,8 @@
 //  leanring-buddyTests
 //
 
+import AppKit
+import Foundation
 import Testing
 @testable import Pace
 
@@ -202,5 +204,171 @@ struct PaceActionApprovalTests {
             for: actionPlan,
             preflightIssues: preflightIssues
         ))
+    }
+
+    // MARK: - F-01 Legacy Approval Bypass Remediation Tests
+
+    @Test func shouldExecutePlanFailsClosedWhenApprovalRequiredButRequestIsNil() async throws {
+        let approvalRequiredPlans: [PaceActionExecutionPlan] = [
+            .serial(actions: [.runShortcut("Publish")]),
+            .serial(actions: [.downloadFile(PaceFileDownloadRequest(url: URL(string: "https://example.com/payload.sh")!, suggestedFilename: nil))]),
+            .serial(actions: [.type("secret text")]),
+            .serial(actions: [.pressKey(name: "return", modifiers: [])]),
+            .serial(actions: [.setTextValue(PaceSetTextValueRequest(value: "edit", target: .focused))]),
+            .serial(actions: [.editSelectedText(PaceVoiceEditRequest(operation: .shorten))]),
+            .serial(actions: [.composeMail(PaceMailDraft(recipients: ["alex@example.com"], subject: "Hi", body: "Draft"))]),
+            .serial(actions: [.createNote(PaceNoteRequest(title: "Note", body: "Body"))]),
+            .serial(actions: [.mcp(PaceMCPToolCall(serverName: "altic", toolName: "notes_create", arguments: [:]))])
+        ]
+
+        for plan in approvalRequiredPlans {
+            #expect(PaceActionApprovalPolicy.requiresExplicitApproval(for: plan) == true)
+            // Even if an attacker or caller supplies decision: .allowOnce, without a valid approval request it MUST fail closed.
+            #expect(PaceActionApprovalPolicy.shouldExecutePlan(plan, request: nil, decision: .allowOnce) == false)
+            #expect(PaceActionApprovalPolicy.shouldExecutePlan(plan, request: nil, decision: .cancel) == false)
+            #expect(PaceActionApprovalPolicy.shouldExecutePlan(plan, request: nil, decision: nil) == false)
+        }
+    }
+
+    @Test func shouldExecutePlanFailsClosedWhenSummaryIsEmptyOnApprovalRequiredPlan() async throws {
+        let plan = PaceActionExecutionPlan.serial(actions: [.runShortcut("Publish")])
+        #expect(PaceActionApprovalPolicy.requiresExplicitApproval(for: plan) == true)
+
+        let emptySummaryRequest = PaceActionApprovalRequest(
+            approvalSummary: "   ",
+            requiresActionApproval: true
+        )
+        #expect(emptySummaryRequest == nil)
+
+        let shouldExecute = PaceActionApprovalPolicy.shouldExecutePlan(
+            plan,
+            request: emptySummaryRequest,
+            decision: .allowOnce
+        )
+        #expect(shouldExecute == false)
+    }
+
+    @Test func shouldExecutePlanPermitsRoutineLocalActionsWithoutRequest() async throws {
+        let routinePlans: [PaceActionExecutionPlan] = [
+            .serial(actions: [.openApplication("Raycast")]),
+            .serial(actions: [.openURL("https://example.com")]),
+            .serial(actions: [.snapWindow(PaceWindowSnapRequest(position: .left))]),
+            .serial(actions: [.readClipboard]),
+            .serial(actions: [.undoLastMutation]),
+            .serial(actions: [.click(ScreenshotPixelLocation(xInScreenshotPixels: 100, yInScreenshotPixels: 100, screenNumber: 1))]),
+            .serial(actions: [.controlMusic(.playPause)]),
+            .serial(actions: [.openMessages(PaceMessageRequest(recipient: "Alex", text: nil))])
+        ]
+
+        for plan in routinePlans {
+            #expect(PaceActionApprovalPolicy.requiresExplicitApproval(for: plan) == false)
+            // Routine actions do not require approval requests and execute cleanly
+            #expect(PaceActionApprovalPolicy.shouldExecutePlan(plan, request: nil, decision: nil) == true)
+            #expect(PaceActionApprovalPolicy.shouldExecutePlan(plan, request: nil, decision: .allowOnce) == true)
+        }
+    }
+
+    @Test func blockingPreflightIssueFailsClosedWithoutValidApproval() async throws {
+        let routinePlan = PaceActionExecutionPlan.serial(actions: [.openApplication("Raycast")])
+        let blockingIssue = PaceToolPreflightIssue(
+            severity: .blocking,
+            title: "Permission Missing",
+            repairHint: "Grant permission."
+        )
+
+        #expect(PaceActionApprovalPolicy.requiresExplicitApproval(
+            for: routinePlan,
+            preflightIssues: [blockingIssue]
+        ) == true)
+
+        // Without approval request: fails closed
+        #expect(PaceActionApprovalPolicy.shouldExecutePlan(
+            routinePlan,
+            preflightIssues: [blockingIssue],
+            request: nil,
+            decision: .allowOnce
+        ) == false)
+
+        // With valid approval request and allowOnce: permitted
+        let validRequest = try #require(PaceActionApprovalRequest(
+            approvalSummary: routinePlan.approvalSummary,
+            preflightSummary: PaceToolPreflightIssue.formatForApproval([blockingIssue])
+        ))
+        #expect(PaceActionApprovalPolicy.shouldExecutePlan(
+            routinePlan,
+            preflightIssues: [blockingIssue],
+            request: validRequest,
+            decision: .allowOnce
+        ) == true)
+
+        // With valid approval request and cancel: rejected
+        #expect(PaceActionApprovalPolicy.shouldExecutePlan(
+            routinePlan,
+            preflightIssues: [blockingIssue],
+            request: validRequest,
+            decision: .cancel
+        ) == false)
+    }
+
+    @Test @MainActor func companionManagerApprovalGateCannotBeBypassedByRequiresActionApprovalFlag() async throws {
+        let manager = CompanionManager()
+        // Simulate disabling action approval preference
+        manager.requiresActionApproval = false
+
+        // 1. Routine action proceeds without approval popup
+        let routinePlan = PaceActionExecutionPlan.serial(actions: [
+            .openApplication("Safari"),
+            .openURL("https://example.com")
+        ])
+        let routineAllowed = manager.requestUserApprovalForActionPlan(routinePlan)
+        #expect(routineAllowed == true)
+
+        // 2. Risky action (shortcut) MUST NOT bypass approval even when requiresActionApproval == false.
+        // It enters the approval flow, invokes the modal runner, and if cancelled, returns false.
+        var modalPresentedForShortcut = false
+        let shortcutPlan = PaceActionExecutionPlan.serial(actions: [
+            .runShortcut("HarmfulShortcut")
+        ])
+        let shortcutDenied = manager.requestUserApprovalForActionPlan(
+            shortcutPlan,
+            approvalModalRunner: { alert in
+                modalPresentedForShortcut = true
+                #expect(alert.messageText == "Approve Que actions?")
+                return .alertFirstButtonReturn // Cancel
+            }
+        )
+        #expect(modalPresentedForShortcut == true)
+        #expect(shortcutDenied == false)
+
+        // 3. Risky action (keyboard input) MUST NOT bypass approval.
+        var modalPresentedForTyping = false
+        let typePlan = PaceActionExecutionPlan.serial(actions: [
+            .type("injected text")
+        ])
+        let typeAllowed = manager.requestUserApprovalForActionPlan(
+            typePlan,
+            approvalModalRunner: { alert in
+                modalPresentedForTyping = true
+                #expect(alert.messageText == "Approve Que actions?")
+                return .alertSecondButtonReturn // Allow Once
+            }
+        )
+        #expect(modalPresentedForTyping == true)
+        #expect(typeAllowed == true)
+
+        // 4. Empty summary on an approval-required action MUST FAIL CLOSED without modal presentation.
+        var modalPresentedForEmpty = false
+        let emptyPlan = PaceActionExecutionPlan(steps: [])
+        let preflightBlocked = [PaceToolPreflightIssue(severity: .blocking, title: "Blocked", repairHint: "None")]
+        let emptyBlockedAllowed = manager.requestUserApprovalForActionPlan(
+            emptyPlan,
+            preflightIssues: preflightBlocked,
+            approvalModalRunner: { _ in
+                modalPresentedForEmpty = true
+                return .alertSecondButtonReturn
+            }
+        )
+        #expect(modalPresentedForEmpty == false)
+        #expect(emptyBlockedAllowed == false)
     }
 }

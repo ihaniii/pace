@@ -21,7 +21,7 @@ nonisolated struct PaceActionApprovalRequest: Equatable {
     init?(
         approvalSummary: String,
         preflightSummary: String? = nil,
-        requiresActionApproval: Bool
+        requiresActionApproval: Bool = true
     ) {
         let trimmedApprovalSummary = approvalSummary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard requiresActionApproval, !trimmedApprovalSummary.isEmpty else {
@@ -58,6 +58,33 @@ nonisolated enum PaceActionApprovalPolicy {
         }
 
         return actionExecutionPlan.flattenedActions.contains(where: requiresExplicitApproval)
+    }
+
+    /// Evaluates whether an action plan should be permitted to execute, enforcing the fail-closed
+    /// security invariant that actions requiring approval must NEVER execute without explicit approval.
+    ///
+    /// - Parameters:
+    ///   - actionExecutionPlan: The plan to evaluate.
+    ///   - preflightIssues: Any preflight issues associated with the plan.
+    ///   - request: The constructed approval request, or nil if none was constructed.
+    ///   - decision: The approval decision (e.g. .allowOnce, .cancel), or nil if no prompt occurred.
+    /// - Returns: True if execution is permitted; false if blocked/denied.
+    static func shouldExecutePlan(
+        _ actionExecutionPlan: PaceActionExecutionPlan,
+        preflightIssues: [PaceToolPreflightIssue] = [],
+        request: PaceActionApprovalRequest?,
+        decision: PaceActionApprovalDecision?
+    ) -> Bool {
+        if requiresExplicitApproval(for: actionExecutionPlan, preflightIssues: preflightIssues) {
+            // An action requiring approval MUST have a valid request AND an explicit allowOnce decision.
+            // If request is nil (e.g. empty summary or disabled flag), or decision is not allowOnce, FAIL CLOSED.
+            guard request != nil, decision == .allowOnce else {
+                return false
+            }
+            return true
+        }
+        // Routine actions do not require explicit approval by doctrine.
+        return true
     }
 
     static func shouldExecuteActions(
