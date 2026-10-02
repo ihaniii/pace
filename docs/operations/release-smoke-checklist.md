@@ -80,6 +80,27 @@ the development machine at the time this landed. Confirm on real hardware regard
 - [ ] Ask Q to click a button whose label doesn't exist in the current app — it
       reports it cannot find the target rather than clicking the wrong element.
 
+## iPad companion (any release touching PaceCompanionServer / PaceShared / PacePad)
+
+The unit suite substitutes the listener and connection, and the production
+listener refuses to exist in the test host — so real `NWListener`, Bonjour, and
+TLS-PSK behavior is only ever confirmed here, on real hardware.
+
+- [ ] Fresh install (or `defaults delete` of `PaceCompanionServerEnabled`): with
+      "Allow an iPad companion" off, `dns-sd -B _pace-companion._tcp` shows no
+      Pace service and `lsof -nP -iTCP -sTCP:LISTEN` shows no Pace listener.
+- [ ] Turn the companion on with no iPad paired — still no service and no
+      listener until "Pair an iPad" is pressed; the code appears with a
+      countdown and the service appears.
+- [ ] Enter the code on the iPad — the Mac shows the Allow/Deny card and the
+      iPad is not paired until Allow is pressed; Deny leaves it unpaired.
+- [ ] Let a pairing window run out, and separately enter a wrong code 5 times —
+      each closes the window, hides the code, and a later attempt is refused.
+- [ ] With the iPad connected, open several raw TCP connections to the
+      advertised port (`nc <mac> <port>`) — the iPad session stays connected.
+- [ ] Turn the companion off — the iPad disconnects and the service and
+      listener disappear; quit and relaunch — it is still off.
+
 ## Off-device tiers (any release touching planner tiers)
 
 - [ ] With Direct API tier active, run one turn — menu-bar capsule
