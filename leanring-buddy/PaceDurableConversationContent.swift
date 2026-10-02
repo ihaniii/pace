@@ -21,6 +21,11 @@
 //  a plain secret with no credential shape is NOT detected by this policy —
 //  a known limit, to be narrowed by provenance-based gating in a follow-up.
 //
+//  Extracted episodic facts (F-03) follow the same all-or-nothing rule: a fact
+//  with credential-shaped content in any persisted field is dropped whole by
+//  `episodicFactContainsCredentialShapedContent`, enforced at the fact store,
+//  the retrieval index, and the unified memory index.
+//
 //  Transient surfaces are unaffected: speech, the response overlay, the chat
 //  session, PacePad delivery, and the in-session thread window (the next
 //  prompt's context) all keep the original text.
@@ -95,6 +100,33 @@ enum PaceDurableConversationContent {
             lastTurnRecordedAt: snapshot.lastTurnRecordedAt,
             savedAt: snapshot.savedAt
         )
+    }
+
+    /// Whether an extracted episodic fact carries credential-shaped content and
+    /// so must NOT become durable memory. This is the single authoritative
+    /// policy for extracted facts: `PaceEpisodicFactStore.apply`,
+    /// `PaceLocalRetriever.recordEpisodicFacts`, and
+    /// `CompanionManager.upsertUnifiedMemoryFacts` all call it, so a fact that
+    /// reaches any durable sink through a direct API is held to the same rule
+    /// as one arriving through `recordExtractedEpisodicFacts`.
+    ///
+    /// The whole fact is dropped, never partially redacted — the same
+    /// all-or-nothing rule `durableTurn` applies to a conversation turn. Every
+    /// persisted textual field is checked on its own, and the joined forms the
+    /// sinks actually write are checked too, because a credential shape can
+    /// span fields (predicate "password:" + value "<secret>").
+    static func episodicFactContainsCredentialShapedContent(_ fact: PaceEpisodicFact) -> Bool {
+        let retrievalDocument = PaceEpisodicPatternFactExtractor.retrievalDocument(for: fact)
+        let persistedTextsOfFact: [String] = [
+            fact.identifier,
+            fact.subject,
+            fact.predicate,
+            fact.value,
+            fact.sourceTurnId ?? "",
+            retrievalDocument.title,
+            retrievalDocument.text,
+        ] + fact.topicHashtags
+        return persistedTextsOfFact.contains(where: containsCredentialShapedContent)
     }
 
     /// `[<label> withheld from durable memory — <N> chars, sha256=<64 hex>]`

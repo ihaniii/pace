@@ -198,7 +198,7 @@ extension CompanionManager {
             switch outcome {
             case .inserted, .replaced, .appended:
                 return fact
-            case .skippedBecauseOfTombstone:
+            case .skippedBecauseOfTombstone, .rejectedBecauseOfCredentialShapedContent:
                 return nil
             }
         }

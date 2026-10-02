@@ -1097,8 +1097,14 @@ final class PaceLocalRetriever: PaceRetriever {
     }
 
     func recordEpisodicFacts(_ facts: [PaceEpisodicFact]) {
-        guard isSourceEnabled(.episodicMemory), !facts.isEmpty else { return }
-        store.upsertDocuments(facts.map(PaceEpisodicPatternFactExtractor.retrievalDocument(for:)))
+        // Same policy the fact store enforces, re-checked here so a fact
+        // handed straight to the retriever can't reach retrieval-index.json
+        // (and from there the planner's LOCAL CONTEXT) with a credential in it.
+        let durableSafeFacts = facts.filter { fact in
+            !PaceDurableConversationContent.episodicFactContainsCredentialShapedContent(fact)
+        }
+        guard isSourceEnabled(.episodicMemory), !durableSafeFacts.isEmpty else { return }
+        store.upsertDocuments(durableSafeFacts.map(PaceEpisodicPatternFactExtractor.retrievalDocument(for:)))
     }
 
     /// Removes the retrieval document for a fact the user just

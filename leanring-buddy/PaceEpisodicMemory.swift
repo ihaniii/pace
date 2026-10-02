@@ -296,6 +296,10 @@ enum PaceEpisodicFactStoreApplyOutcome: Equatable {
     /// Skipped because the fact triplet matches an unexpired
     /// tombstone.
     case skippedBecauseOfTombstone
+    /// Rejected because a persisted field carries credential-shaped
+    /// content (`PaceDurableConversationContent`). The fact is never
+    /// stored, so it cannot reach retrieval or the unified index.
+    case rejectedBecauseOfCredentialShapedContent
 }
 
 /// Pure dedup decision used by the store. Pulled out so tests can
@@ -365,6 +369,14 @@ final class PaceEpisodicFactStore {
     /// what happened so the caller can log/audit.
     @discardableResult
     func apply(_ incomingFact: PaceEpisodicFact) -> PaceEpisodicFactStoreApplyOutcome {
+        // Credential gate before everything else — a credential-bearing
+        // fact must not be stored, and must not influence dedup, the
+        // LRU cap, or tombstones on its way out. Enforced here (not
+        // only in CompanionManager) so direct callers are covered too.
+        guard !PaceDurableConversationContent.episodicFactContainsCredentialShapedContent(incomingFact) else {
+            return .rejectedBecauseOfCredentialShapedContent
+        }
+
         // Tombstone gate first — a re-extracted fact never resurrects
         // a deleted one unless its tombstone has expired.
         cleanExpiredTombstones()
@@ -390,6 +402,9 @@ final class PaceEpisodicFactStore {
         case .skippedBecauseOfTombstone:
             // Unreachable — handled above. Kept exhaustive.
             return .skippedBecauseOfTombstone
+        case .rejectedBecauseOfCredentialShapedContent:
+            // Unreachable — handled above. Kept exhaustive.
+            return .rejectedBecauseOfCredentialShapedContent
         }
         enforceLRUCap()
         return dedupOutcome

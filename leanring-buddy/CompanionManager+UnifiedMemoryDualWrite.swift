@@ -79,8 +79,14 @@ extension CompanionManager {
         for previousFactId in replacedPreviousFactIds {
             memoryIndex.tombstone(id: previousFactId, now: now)
         }
+        // Same policy the fact store enforces, re-checked here so a fact
+        // handed straight to this dual-write can't reach memory-index.json,
+        // its Spotlight mirror, or the embedder with a credential in it.
+        let durableSafeFacts = facts.filter { fact in
+            !PaceDurableConversationContent.episodicFactContainsCredentialShapedContent(fact)
+        }
         var entryIdsAndTextsToEmbed: [(id: String, text: String)] = []
-        for fact in facts {
+        for fact in durableSafeFacts {
             let factText = "\(fact.subject) \(fact.predicate) \(fact.value)"
             memoryIndex.upsert(
                 PaceMemoryEntry(
