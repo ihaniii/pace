@@ -44,28 +44,46 @@ struct PaceCompanionSettingsTab: View {
     private var iPadCompanionSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("iPad companion")
-            HStack(alignment: .center, spacing: 16) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(companionServerStatusText)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(DS.Colors.textPrimary)
-                    Text("Pairing code")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.textTertiary)
-                    Text(companionServer.pairingCode)
-                        .font(.system(size: 26, weight: .semibold, design: .monospaced))
-                        .foregroundColor(DS.Colors.localSignal)
-                        .textSelection(.enabled)
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 8) {
-                    paceSettingsButton("New code", systemName: "arrow.clockwise") {
-                        companionServer.rotatePairingCode()
-                    }
-                    if companionServer.pairedDeviceName != nil {
-                        paceSettingsButton("Unpair iPad", systemName: "link.badge.minus") {
-                            companionServer.unpairCurrentDevice()
+            paceSettingsToggleRow(
+                title: "Allow an iPad companion",
+                subtitle: "Default off. While on, Que accepts a local-network connection from the iPad you paired.",
+                isOn: Binding(
+                    get: { companionServer.isCompanionEnabled },
+                    set: { companionServer.setCompanionEnabled($0) }
+                )
+            )
+            .pointerCursor()
+
+            if companionServer.isCompanionEnabled {
+                Text(companionServerStatusText)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(DS.Colors.textPrimary)
+
+                if let pendingPairingConfirmation = companionServer.pendingPairingConfirmation {
+                    pairingConfirmationCard(pendingPairingConfirmation)
+                } else if let pairingCode = companionServer.pairingCode {
+                    openPairingWindowCard(pairingCode: pairingCode)
+                } else {
+                    HStack(spacing: 8) {
+                        paceSettingsButton(
+                            companionServer.pairedDeviceName == nil ? "Pair an iPad" : "Pair a different iPad",
+                            systemName: "link.badge.plus"
+                        ) {
+                            // The pressing event is passed through so an input event Que
+                            // synthesized itself cannot open pairing.
+                            companionServer.openPairingWindow(triggeringEvent: NSApp.currentEvent)
                         }
+                        if companionServer.pairedDeviceName != nil {
+                            paceSettingsButton("Unpair iPad", systemName: "link.badge.minus") {
+                                companionServer.unpairCurrentDevice()
+                            }
+                        }
+                        Spacer()
+                    }
+                    if let pairingWindowClosedText {
+                        Text(pairingWindowClosedText)
+                            .font(.system(size: 11))
+                            .foregroundColor(DS.Colors.textTertiary)
                     }
                 }
             }
@@ -82,11 +100,93 @@ struct PaceCompanionSettingsTab: View {
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
+    /// The pairing code, shown only while the pairing window is open.
+    private func openPairingWindowCard(pairingCode: String) -> some View {
+        HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Pairing code")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                Text(pairingCode)
+                    .font(.system(size: 26, weight: .semibold, design: .monospaced))
+                    .foregroundColor(DS.Colors.localSignal)
+                    .textSelection(.enabled)
+                if let pairingWindowExpiresAt = companionServer.pairingWindowExpiresAt {
+                    HStack(spacing: 4) {
+                        Text("Pairing closes in")
+                        Text(pairingWindowExpiresAt, style: .timer)
+                    }
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                }
+            }
+            Spacer()
+            paceSettingsButton("Cancel pairing", systemName: "xmark") {
+                companionServer.cancelPairingWindow()
+            }
+        }
+    }
+
+    /// Nothing is stored for the requesting device until "Allow" is pressed.
+    /// The name and identifier are whatever the device sent, so they are
+    /// presented as its claim.
+    private func pairingConfirmationCard(
+        _ pendingPairingConfirmation: PaceCompanionPendingPairingConfirmation
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("A device entered the pairing code and wants to pair")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Colors.textPrimary)
+            Text(
+                "It calls itself “\(pendingPairingConfirmation.deviceDisplayName)” "
+                    + "(ID ending \(pendingPairingConfirmation.deviceIdentifierDisplaySuffix))."
+            )
+            .font(.system(size: 12))
+            .foregroundColor(DS.Colors.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+            if let replacedPairedDeviceName = pendingPairingConfirmation.replacedPairedDeviceName {
+                Text("Allowing it replaces your current pairing with \(replacedPairedDeviceName).")
+                    .font(.system(size: 12))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                paceSettingsButton("Deny", systemName: "xmark") {
+                    companionServer.declinePendingPairing()
+                }
+                paceSettingsButton("Allow", systemName: "checkmark") {
+                    // The pressing event is passed through so an input event Que
+                    // synthesized itself cannot approve a pairing.
+                    companionServer.confirmPendingPairing(triggeringEvent: NSApp.currentEvent)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var pairingWindowClosedText: String? {
+        switch companionServer.lastPairingWindowCloseReason {
+        case .expired:
+            return "Pairing closed: the code expired."
+        case .tooManyFailedAttempts:
+            return "Pairing closed after too many failed attempts."
+        case .declined:
+            return "Pairing denied."
+        case .paired, .cancelled, .companionDisabled, .serverStopped, .none:
+            return nil
+        }
+    }
+
     private var companionServerStatusText: String {
         switch companionServer.connectionStatus {
         case .stopped:
-            return "iPad companion server stopped"
+            return companionServer.pairedDeviceName == nil
+                ? "No iPad paired"
+                : "iPad companion server stopped"
         case .advertising:
+            if companionServer.pairingCode != nil {
+                return "Ready to pair an iPad"
+            }
             if let pairedDeviceName = companionServer.pairedDeviceName {
                 return "Waiting for \(pairedDeviceName)"
             }
