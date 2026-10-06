@@ -296,6 +296,10 @@ extension CompanionManager {
         )
     }
 
+    /// Reached only for local turns: `PaceRemoteTurnCommandGate` refuses the
+    /// automation, Shortcut, skill, and flow commands for a remote companion
+    /// turn before any of them dispatch, and natural-language automation
+    /// matching is skipped for remote turns.
     private func dispatchAutomationCatalogEntry(
         _ catalogEntry: PaceAutomationCatalogEntry,
         typedDefinitions: [PaceAutomationDefinition],
@@ -333,6 +337,7 @@ extension CompanionManager {
                         spokenText: "running \(definition.name).",
                         executionPlan: executionPlan
                     ),
+                    turnOrigin: .local,
                     shouldRecordConversationTurn: false
                 )
             } catch {
@@ -380,6 +385,7 @@ extension CompanionManager {
                             spokenText: "running \(program.name).",
                             executionPlan: executionPlan
                         ),
+                        turnOrigin: .local,
                         shouldRecordConversationTurn: false
                     )
                 case .noActionsMatched:
@@ -430,11 +436,13 @@ extension CompanionManager {
             handleFastLocalActionPath(
                 transcript: transcript,
                 fastActionParseResult: PaceShortcutCommandParser.fastActionParseResult(for: name),
+                turnOrigin: .local,
                 shouldRecordConversationTurn: false
             )
         }
     }
 
+    /// Reached only for local turns (see `dispatchAutomationCatalogEntry`).
     func handleShortcutAutomationCommand(
         _ command: PaceShortcutCommand,
         transcript: String
@@ -482,6 +490,7 @@ extension CompanionManager {
                 fastActionParseResult: PaceShortcutCommandParser.fastActionParseResult(
                     for: installedShortcutDisplayName
                 ),
+                turnOrigin: .local,
                 shouldRecordConversationTurn: false
             )
         }

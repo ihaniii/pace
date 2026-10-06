@@ -71,6 +71,11 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
     private var pairingCandidate: PairingCandidate?
     private var activeConnection: PaceCompanionServerConnection?
     private var activeSessionIdentifier: String?
+    /// Minted here each time a connection becomes the authenticated session
+    /// (F-04b). Unlike `activeSessionIdentifier`, which the iPad chooses, this
+    /// never leaves the Mac — it is what a remote turn's origin, its lifetime,
+    /// and its reply are bound to.
+    private(set) var activeSessionIdentity: PaceCompanionSessionIdentity?
     private var activeDeviceIdentifier: String?
     private var isActiveSessionAuthenticated = false
     private var storedCredential: PaceCompanionStoredCredential?
@@ -379,9 +384,13 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
     func deliverAssistantResponse(
         turnIdentifier: String,
         spokenText: String,
-        usesOffDevicePlanner: Bool
+        usesOffDevicePlanner: Bool,
+        originatingSessionIdentity: PaceCompanionSessionIdentity
     ) -> Bool {
-        guard isActiveSessionAuthenticated else { return false }
+        // A reply belongs to the session whose utterance produced it. If that
+        // session is gone it is dropped — never rerouted to whichever session
+        // happens to be authenticated now.
+        guard isCompanionSessionActive(originatingSessionIdentity) else { return false }
         return send(
             payload: .assistantResponse(
                 PaceCompanionAssistantResponse(
@@ -389,6 +398,10 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
                     spokenText: spokenText,
                     usesOffDevicePlanner: usesOffDevicePlanner
                 )))
+    }
+
+    func isCompanionSessionActive(_ sessionIdentity: PaceCompanionSessionIdentity) -> Bool {
+        isActiveSessionAuthenticated && activeSessionIdentity == sessionIdentity
     }
 
     func deliverProactiveMessage(_ utterance: PaceProactiveUtterance) -> Bool {
@@ -822,9 +835,15 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
             let replacedConnection = activeConnection
             clearActiveSession()
             replacedConnection?.cancel()
+        } else if let supersededSessionIdentity = activeSessionIdentity {
+            // The same connection authenticated again: that is a new session
+            // too, so the previous one's in-flight turn ends with it.
+            activeSessionIdentity = nil
+            companionManager?.companionSessionDidEnd(supersededSessionIdentity)
         }
         activeConnection = connection
         activeSessionIdentifier = sessionIdentifier
+        activeSessionIdentity = .mintForNewlyAuthenticatedSession()
         activeDeviceIdentifier = deviceIdentifier
         isActiveSessionAuthenticated = true
         lastHeartbeatReceivedAt = now()
@@ -844,7 +863,14 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
                         acknowledgedSequenceNumber: heartbeat.sequenceNumber
                     )))
         case .userUtterance(let utterance):
-            process(utterance: utterance, audioData: frame.binaryPayload)
+            // The session identity is captured now, from the authenticated
+            // session this frame arrived on — before any asynchronous work.
+            guard let originatingSessionIdentity = activeSessionIdentity else { return }
+            process(
+                utterance: utterance,
+                audioData: frame.binaryPayload,
+                originatingSessionIdentity: originatingSessionIdentity
+            )
         case .presenceChanged(let presenceChange):
             guard remotePrivacyState.permitsCameraMedia else { return }
             companionManager?.companionRuntime.acceptRemotePresenceChange(
@@ -885,7 +911,8 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
 
     private func process(
         utterance: PaceCompanionUserUtterance,
-        audioData: Data
+        audioData: Data,
+        originatingSessionIdentity: PaceCompanionSessionIdentity
     ) {
         guard remotePrivacyState.permitsMicrophoneMedia else {
             sendError(
@@ -898,6 +925,10 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // Every suspension below can outlast the session. Once the session
+            // that sent this utterance is no longer the live one, the utterance
+            // is dropped: nothing more is sent, and no turn is started.
+            guard isCompanionSessionActive(originatingSessionIdentity) else { return }
             _ = send(
                 payload: .interactionState(
                     PaceCompanionInteractionStateChange(
@@ -914,6 +945,7 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
                 let transcript = try await PaceAudioFileTranscriber.transcribeAudioFile(
                     at: temporaryAudioURL
                 ).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard isCompanionSessionActive(originatingSessionIdentity) else { return }
                 guard !transcript.isEmpty else {
                     sendError(
                         code: "empty_transcript",
@@ -939,11 +971,13 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
                     )
                 }
 
+                guard isCompanionSessionActive(originatingSessionIdentity) else { return }
                 guard
                     companionManager?.submitPacePadTranscript(
                         transcript,
                         turnIdentifier: utterance.turnIdentifier,
-                        physicalSceneContext: physicalSceneContext
+                        physicalSceneContext: physicalSceneContext,
+                        originatingSessionIdentity: originatingSessionIdentity
                     ) == true
                 else {
                     sendError(
@@ -956,6 +990,7 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
                 }
             } catch {
                 try? FileManager.default.removeItem(at: temporaryAudioURL)
+                guard isCompanionSessionActive(originatingSessionIdentity) else { return }
                 sendError(
                     code: "transcription_failed",
                     message: "The iPad recording could not be transcribed locally.",
@@ -1148,6 +1183,8 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
     }
 
     private func clearActiveSession() {
+        let endedSessionIdentity = activeSessionIdentity
+        activeSessionIdentity = nil
         heartbeatTask?.cancel()
         heartbeatTask = nil
         activeConnection = nil
@@ -1161,5 +1198,10 @@ final class PaceCompanionServer: ObservableObject, PacePadOutputDelegate {
             isAllCapturePaused: true
         )
         cancelPendingCameraFrameRequests()
+        // Last, once this server no longer considers the session live: a turn
+        // the ended session started is cancelled and its reply is dropped.
+        if let endedSessionIdentity {
+            companionManager?.companionSessionDidEnd(endedSessionIdentity)
+        }
     }
 }
