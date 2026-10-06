@@ -37,6 +37,9 @@ final class CompanionManager: ObservableObject {
     @Published var voiceState: CompanionVoiceState = .idle
     weak var pacePadOutputDelegate: PacePadOutputDelegate?
     var activePacePadTurnIdentifier: String?
+    /// The companion session the active iPad turn arrived on. Reply routing
+    /// only: what a turn may DO is decided by its lease's `origin`.
+    var activePacePadTurnSessionIdentity: PaceCompanionSessionIdentity?
     var activePacePadTurnUsesOffDevicePlanner = false
     var pendingPacePadPhysicalSceneContext: String?
     @Published var lastTranscript: String?

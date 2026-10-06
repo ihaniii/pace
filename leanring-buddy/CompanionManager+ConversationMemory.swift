@@ -45,12 +45,22 @@ extension CompanionManager {
         guard !trimmedTranscript.isEmpty, !trimmedResponse.isEmpty else { return }
 
         if let activePacePadTurnIdentifier {
-            _ = pacePadOutputDelegate?.deliverAssistantResponse(
-                turnIdentifier: activePacePadTurnIdentifier,
-                spokenText: assistantResponse,
-                usesOffDevicePlanner: activePacePadTurnUsesOffDevicePlanner
-            )
+            // The reply goes back only to the companion session the turn came
+            // from, and only while that turn still owns the lease — never to
+            // a replacement session, and never for a turn of another origin.
+            if let activePacePadTurnSessionIdentity,
+                turnLeaseRegistry.currentTurnOrigin
+                    == .remoteCompanion(sessionIdentity: activePacePadTurnSessionIdentity)
+            {
+                _ = pacePadOutputDelegate?.deliverAssistantResponse(
+                    turnIdentifier: activePacePadTurnIdentifier,
+                    spokenText: assistantResponse,
+                    usesOffDevicePlanner: activePacePadTurnUsesOffDevicePlanner,
+                    originatingSessionIdentity: activePacePadTurnSessionIdentity
+                )
+            }
             self.activePacePadTurnIdentifier = nil
+            activePacePadTurnSessionIdentity = nil
             activePacePadTurnUsesOffDevicePlanner = false
         }
         // The committed user message is about to land in the chat transcript,

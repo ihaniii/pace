@@ -239,7 +239,9 @@ extension CompanionManager {
         clearLastSpokenReplyState()
         responseOverlayManager.finishStreaming()
         currentTurnHUDState = .understanding("using \(option.lowercased())")
-        sendTranscriptToPlannerWithScreenshot(transcript: clarifiedTranscript)
+        // Intent clarifications are only ever raised for local turns (a remote
+        // companion turn skips them), so the clarified turn is local too.
+        sendTranscriptToPlannerWithScreenshot(transcript: clarifiedTranscript, origin: .local)
     }
 
     /// Visual-target ambiguity raise (PRD
@@ -831,7 +833,8 @@ extension CompanionManager {
         print("⚡️ Speculative fast-action: executing \"\(transcript)\" before PTT release")
         handleFastLocalActionPath(
             transcript: transcript,
-            fastActionParseResult: fastActionParseResult
+            fastActionParseResult: fastActionParseResult,
+            turnOrigin: .local
         )
     }
 
@@ -843,6 +846,7 @@ extension CompanionManager {
     func handleFastLocalActionPath(
         transcript: String,
         fastActionParseResult: PaceFastActionParseResult,
+        turnOrigin: PaceTurnOrigin,
         shouldRecordConversationTurn: Bool = true
     ) {
         let spokenText = fastActionParseResult.spokenText
@@ -883,7 +887,8 @@ extension CompanionManager {
             if actionExecutor.actionsAreEnabled {
                 if requestUserApprovalForActionPlan(
                     fastActionParseResult.executionPlan,
-                    preflightIssues: preflightIssues
+                    preflightIssues: preflightIssues,
+                    turnOrigin: turnOrigin
                 ) {
                     // approvalAlreadyObtained: true — reached only inside the
                     // requestUserApprovalForActionPlan(...) branch above, which just returned
@@ -1077,9 +1082,23 @@ extension CompanionManager {
     /// subsequent turns get a fixed "continue the task" prompt so the
     /// planner re-anchors on the conversation history rather than a
     /// repeated user statement.
-    func sendTranscriptToPlannerWithScreenshot(transcript: String) {
+    /// `origin` is required so every caller states where the turn came from.
+    /// Only `submitPacePadTranscript` may pass a remote origin.
+    func sendTranscriptToPlannerWithScreenshot(transcript: String, origin: PaceTurnOrigin) {
         cancelActiveTurnTasks()
-        let turnLease = turnLeaseRegistry.beginTurn()
+        // A remote turn whose companion session has already ended never starts.
+        guard isTurnOriginStillValid(origin) else {
+            abandonActivePacePadTurn()
+            voiceState = .idle
+            currentTurnHUDState = .idle
+            return
+        }
+        // An iPad turn that was superseded by a turn of another origin must
+        // not receive that turn's reply.
+        if activePacePadTurnSessionIdentity != origin.originatingCompanionSessionIdentity {
+            abandonActivePacePadTurn()
+        }
+        let turnLease = turnLeaseRegistry.beginTurn(origin: origin)
         // Phase 4.1: Evaluate immutable engine mode once at turn creation
         let engineMode = PaceUserPreferencesStore.executionEngineMode()
         currentTurnDispatchTask = Task { @MainActor [weak self] in
@@ -1150,11 +1169,17 @@ extension CompanionManager {
     ) async {
         guard isActiveTurn(turnLease) else { return }
 
+        // Remote companion turns always run on the legacy engine: that is the
+        // engine whose pre-planner command gate and forced local approval are
+        // origin-aware. The Q-core engine does not carry the turn origin.
+        let engineModeForTurnOrigin: QExecutionEngineMode =
+            turnLease.origin.isRemote ? .legacyAuthoritative : engineMode
+
         let turnContext = buildTurnContext(transcript: transcript, turnLease: turnLease)
         let request = QTurnExecutionRequest(
             turnId: turnLease.turnId,
             transcript: transcript,
-            engineMode: engineMode,
+            engineMode: engineModeForTurnOrigin,
             context: turnContext,
             createdAt: Date()
         )
@@ -1258,6 +1283,20 @@ extension CompanionManager {
             return
         }
 
+        // A remote companion turn may not use the privileged voice commands
+        // below: they change capture, scheduling, automation, and memory, or
+        // type into the Mac, and none of them passes through the approval alert.
+        if turnLease.origin.isRemote,
+            let refusedCommand = PaceRemoteTurnCommandGate.refusedCommand(
+                forTranscript: transcript,
+                meetingNoteProfiles: PaceMeetingNoteProfileLibrary.loadProfiles(),
+                recordedFlowExists: { [flowStore] flowName in flowStore.load(named: flowName) != nil }
+            )
+        {
+            refuseRemoteTurnCommand(refusedCommand, turnLease: turnLease)
+            return
+        }
+
         if let watchModeCommand = PaceWatchModeCommandParser.parse(transcript) {
             print("👀 Watch mode voice command: \(watchModeCommand)")
             handleWatchModeCommand(watchModeCommand, transcript: transcript)
@@ -1348,14 +1387,21 @@ extension CompanionManager {
         // Both typed chat and finalized voice recognition use this same seam.
         // Weak/ambiguous outcomes return false and preserve every existing
         // parser/classifier/planner fallback below.
-        if activeSkillRun == nil,
+        if !turnLease.origin.isRemote,
+            activeSkillRun == nil,
             await dispatchNaturalLanguageAutomationIfConfident(transcript: transcript)
         {
             return
         }
         guard isActiveTurn(turnLease) else { return }
 
-        if let flowCommand = PaceFlowCommandParser.parse(transcript) {
+        // The flow branch replays without the approval alert ("the voice
+        // command IS the approval"), so it is for local turns only. A remote
+        // "run <existing flow>" was already refused above; any other remote
+        // "run …" / "do …" sentence continues to the planner.
+        if !turnLease.origin.isRemote,
+            let flowCommand = PaceFlowCommandParser.parse(transcript)
+        {
             print("🔁 Flow voice command: \(flowCommand)")
             handleFlowCommand(flowCommand, transcript: transcript)
             return
@@ -1363,7 +1409,9 @@ extension CompanionManager {
 
         // "remember this as the cloudflare dashboard" — capture the current
         // tab URL under a user-chosen name (Tier 1 × Tier 3).
-        if let rememberSiteCommand = PaceRememberSiteCommandParser.parse(transcript: transcript) {
+        if !turnLease.origin.isRemote,
+            let rememberSiteCommand = PaceRememberSiteCommandParser.parse(transcript: transcript)
+        {
             print("🔖 Remember-site command: \(rememberSiteCommand)")
             handleRememberSiteCommand(rememberSiteCommand, transcript: transcript)
             return
@@ -1379,7 +1427,8 @@ extension CompanionManager {
                 fastActionParseResult: PaceFastActionParseResult(
                     spokenText: "opening \(destination.displayName).",
                     executionPlan: .serial(actions: [.openURL(destination.url)])
-                )
+                ),
+                turnOrigin: turnLease.origin
             )
             return
         }
@@ -1454,7 +1503,11 @@ extension CompanionManager {
         PaceLatencyBudget.shared.mark(.intentClassified)
         lastIntentRouteForEpisodicExtraction = intentPrediction.intent
         currentTurnHUDState = .understanding(routeHUDDetail(for: intentPrediction))
-        if let clarification = PaceIntentClarifier.clarification(for: transcript) {
+        // The clarification chips are answered on the Mac, and answering one
+        // starts a new local turn — so a remote turn never raises them.
+        if !turnLease.origin.isRemote,
+            let clarification = PaceIntentClarifier.clarification(for: transcript)
+        {
             print("❔ Intent clarification: \(clarification.question)")
             handleClarificationTurn(transcript: transcript, clarification: clarification)
             return
@@ -1694,14 +1747,18 @@ extension CompanionManager {
             print("🎯 Intent: fastLocalAction — skipping screenshot, VLM, and planner")
             handleFastLocalActionPath(
                 transcript: transcript,
-                fastActionParseResult: fastActionParseResult
+                fastActionParseResult: fastActionParseResult,
+                turnOrigin: turnLease.origin
             )
             return
         }
         // Subagent decomposition: "research X, Y, and Z" → 3 parallel
         // subagents. Routed before the planner so it doesn't burn a
         // single-agent round-trip first.
+        // Subagents run detached from the turn lease and report on the Mac,
+        // so a remote companion turn answers through the normal planner instead.
         if researchTurnPlannerOverride == nil,
+            !turnLease.origin.isRemote,
             let subagentCommand = PaceSubagentCommandParser.parse(transcript)
         {
             print("🎯 Intent: subagentDecomposition — \(subagentCommand.subtasks.count) parallel subagents")
@@ -1711,6 +1768,7 @@ extension CompanionManager {
         // Dictation fast path: "type ..." / "dictate ..." → STT cleanup
         // → paste, no planner. Zero-latency text input.
         if researchTurnPlannerOverride == nil,
+            !turnLease.origin.isRemote,
             let dictationText = PaceDictationFastPath.extractDictationText(from: transcript)
         {
             print("🎯 Intent: dictationFastPath — skipping planner, typing directly")
@@ -2292,6 +2350,7 @@ extension CompanionManager {
                         // of the agent loop here. See PRD
                         // docs/prds/hud-intent-disambiguator.md.
                         if actionExecutor.actionsAreEnabled,
+                            !turnLease.origin.isRemote,
                             raiseClickTargetClarificationIfAmbiguous(
                                 actionExecutionPlan: actionParseResult.executionPlan,
                                 screenCaptures: screenCaptures
@@ -2303,7 +2362,8 @@ extension CompanionManager {
                         if actionExecutor.actionsAreEnabled {
                             if requestUserApprovalForActionPlan(
                                 actionParseResult.executionPlan,
-                                preflightIssues: preflightIssues
+                                preflightIssues: preflightIssues,
+                                turnOrigin: turnLease.origin
                             ) {
                                 // Brief settle so the cursor flight visibly arrives
                                 // before the synthetic click fires.
@@ -3134,7 +3194,9 @@ extension CompanionManager {
                     let prompt = PaceSkillLoader.toPlannerPrompt(skill)
                     Task { try? await ttsClient.speakText("Running the \(skill.name) skill.") }
                     // Route through the normal planner pipeline.
-                    sendTranscriptToPlannerWithScreenshot(transcript: prompt)
+                    // Skill commands are refused for remote companion turns
+                    // before they reach here, so a skill run is a local turn.
+                    sendTranscriptToPlannerWithScreenshot(transcript: prompt, origin: .local)
                 }
             } else {
                 Task {
