@@ -26,10 +26,25 @@ responsibilities live in [`../development/key-files.md`](../development/key-file
   bounded message-ID window handle connection health and replayed frames;
   shared policy also validates semantic payloads, stale sessions, privacy gates,
   heartbeat expiry, and bounded reconnect timing.
+- The companion listener is LAN-reachable (all interfaces, peer-to-peer
+  included), so it is off by default. A listener exists only when the user has
+  turned on "Allow an iPad companion" in Settings → Companion, the app has
+  attached the server, and there is a key a peer could authenticate with. It is
+  never created in a unit-test host. An opted-in but unpaired Mac with pairing
+  closed listens for nothing.
 - Pairing uses a six-digit, in-memory code only to establish TLS 1.3 PSK
-  transport. The Mac then issues a random 256-bit credential stored in each
-  device's Keychain. Reconnect PSKs and a session HMAC derive from that
-  credential; no secret is stored in UserDefaults or logged.
+  transport, and only inside an explicit pairing window: opened from Settings,
+  open for 120 seconds, closed after 5 failed attempts, on success, on cancel,
+  on deny, on opt-out, and on stop; never reopened by inbound traffic or by a
+  relaunch. A device that enters the code is held unauthenticated until the
+  user allows it on the Mac; only then does the Mac issue a random 256-bit
+  credential stored in each device's Keychain, replacing any earlier pairing.
+  Reconnect PSKs and a session HMAC derive from that credential; no secret is
+  stored in UserDefaults or logged.
+- Every inbound connection starts unauthenticated and isolated (bounded in
+  number and in time). It cannot read state from, send on behalf of, or close
+  the authenticated session; the session is replaced only after the
+  replacement has authenticated.
 - The iPad sends ordinary utterance audio and semantic presence events. JPEG
   bytes are sent only in response to an expiring `camera_frame_request` created
   by the conservative explicit physical-scene request parser. Pause or camera

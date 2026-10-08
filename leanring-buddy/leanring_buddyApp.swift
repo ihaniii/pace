@@ -105,7 +105,12 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
         PaceAnalytics.configure()
         PaceAnalytics.trackAppOpened()
-        PaceCompanionServer.shared.start(companionManager: companionManager)
+        // The iPad companion server is never attached in a unit-test host.
+        // Attaching does not open a listener by itself: that still needs the
+        // user's explicit opt-in in Settings → Companion (off by default).
+        if !PaceTestHostDataIsolation.isRunningUnderTestHost {
+            PaceCompanionServer.shared.start(companionManager: companionManager)
+        }
 
         // Auto-load the configured planner + VLM into LM Studio so the
         // user's first push-to-talk doesn't pay the cold-load tax.
