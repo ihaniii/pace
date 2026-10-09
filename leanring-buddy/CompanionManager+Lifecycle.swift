@@ -71,7 +71,8 @@ extension CompanionManager {
         isChatModeMutedForCurrentTurn = chatSession.isChatTTSMuted
         submitChatTranscript(
             transcript,
-            optimisticMessageIdentifier: optimisticMessageIdentifier
+            optimisticMessageIdentifier: optimisticMessageIdentifier,
+            origin: .local
         )
     }
 
@@ -80,17 +81,33 @@ extension CompanionManager {
     /// retrieval injection, and — critically — the same action-approval
     /// policy, so a deeplink can do nothing the user's own voice couldn't.
     func submitChatTranscriptFromDeepLink(_ transcript: String) {
-        submitChatTranscript(transcript, optimisticMessageIdentifier: nil)
+        submitChatTranscript(transcript, optimisticMessageIdentifier: nil, origin: .local)
+    }
+
+    /// Entry point for an utterance from the paired iPad. The only place a
+    /// turn is given a remote origin; the session identity comes from the
+    /// companion server, never from anything the iPad sent.
+    func submitChatTranscriptFromRemoteCompanion(
+        _ transcript: String,
+        originatingSessionIdentity: PaceCompanionSessionIdentity
+    ) {
+        submitChatTranscript(
+            transcript,
+            optimisticMessageIdentifier: nil,
+            origin: .remoteCompanion(sessionIdentity: originatingSessionIdentity)
+        )
     }
 
     private func submitChatTranscript(
         _ transcript: String,
-        optimisticMessageIdentifier: String?
+        optimisticMessageIdentifier: String?,
+        origin: PaceTurnOrigin
     ) {
         let queuedTurn = PaceQueuedChatTurn(
             transcript: transcript,
             shouldMuteTTS: isChatModeMutedForCurrentTurn,
-            optimisticMessageIdentifier: optimisticMessageIdentifier
+            optimisticMessageIdentifier: optimisticMessageIdentifier,
+            origin: origin
         )
         isChatModeMutedForCurrentTurn = false
 
@@ -164,7 +181,7 @@ extension CompanionManager {
         PaceLatencyBudget.shared.startTurn(trigger: .deeplink)
         PaceLatencyBudget.shared.mark(.sttComplete)
         voiceState = .processing
-        sendTranscriptToPlannerWithScreenshot(transcript: transcript)
+        sendTranscriptToPlannerWithScreenshot(transcript: transcript, origin: queuedTurn.origin)
     }
 
     func clearQueuedChatTurns() {

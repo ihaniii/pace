@@ -106,17 +106,33 @@ extension CompanionManager {
     func requestUserApprovalForActionPlan(
         _ actionExecutionPlan: PaceActionExecutionPlan,
         preflightIssues: [PaceToolPreflightIssue] = [],
+        turnOrigin: PaceTurnOrigin = .local,
         smokeAutoCancelAfter: TimeInterval? = nil,
         approvalModalRunner: ((NSAlert) -> NSApplication.ModalResponse)? = nil
     ) -> Bool {
-        let requiresApproval = PaceActionApprovalPolicy.requiresExplicitApproval(
-            for: actionExecutionPlan,
-            preflightIssues: preflightIssues
-        )
+        // F-04b: a plan from a remote companion turn always needs the alert on
+        // this Mac, whatever its actions are. A paired iPad is authenticated,
+        // not trusted with local privileges, so the routine-action exemption
+        // below is for local turns only. `PaceActionApprovalPolicy` itself is
+        // unchanged.
+        let isRemoteTurnPlanWithActions =
+            turnOrigin.isRemote && !actionExecutionPlan.flattenedActions.isEmpty
+        let requiresApproval =
+            isRemoteTurnPlanWithActions
+            || PaceActionApprovalPolicy.requiresExplicitApproval(
+                for: actionExecutionPlan,
+                preflightIssues: preflightIssues
+            )
 
         // Routine local actions do not require explicit approval popup by product doctrine.
         guard requiresApproval else {
             return true
+        }
+
+        // Nothing is asked, and nothing runs, for a remote turn whose
+        // companion session has already ended.
+        guard isTurnOriginStillValid(turnOrigin) else {
+            return false
         }
 
         // Under Que security doctrine (F-01), model output is untrusted and actions requiring approval
@@ -134,7 +150,10 @@ extension CompanionManager {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = approvalRequest.messageText
-        alert.informativeText = approvalRequest.informativeText
+        alert.informativeText =
+            turnOrigin.isRemote
+            ? approvalRequest.informativeText + "\n\nThis was requested from your paired iPad, not at this Mac."
+            : approvalRequest.informativeText
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Allow Once")
 
@@ -160,6 +179,13 @@ extension CompanionManager {
             decision: approvalDecision,
             approvalSummary: approvalRequest.approvalSummary
         )
+        if turnOrigin.isRemote {
+            // `shouldExecutePlan` lets a routine plan run whatever the decision
+            // was, so a remote plan is decided here: only "Allow Once", and
+            // only if the session that asked is still the live one — the alert
+            // may have been open while the iPad disconnected or was replaced.
+            return approvalDecision == .allowOnce && isTurnOriginStillValid(turnOrigin)
+        }
         return PaceActionApprovalPolicy.shouldExecutePlan(
             actionExecutionPlan,
             preflightIssues: preflightIssues,

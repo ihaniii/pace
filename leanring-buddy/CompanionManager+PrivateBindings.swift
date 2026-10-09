@@ -580,7 +580,7 @@ extension CompanionManager {
                             PaceAnalytics.trackUserMessageSent(transcript: finalTranscript)
                             self.currentTurnHUDState = .understanding("classifying intent")
                             self.responseOverlayManager.updateStreamingText(finalTranscript)
-                            self.sendTranscriptToPlannerWithScreenshot(transcript: finalTranscript)
+                            self.sendTranscriptToPlannerWithScreenshot(transcript: finalTranscript, origin: .local)
                         }
                     },
                     speculativeFastAction: { [weak self] stablePartial in
@@ -648,7 +648,7 @@ extension CompanionManager {
                         PaceAnalytics.trackUserMessageSent(transcript: rescuedPartial)
                         self.currentTurnHUDState = .understanding("classifying intent")
                         self.responseOverlayManager.updateStreamingText(rescuedPartial)
-                        self.sendTranscriptToPlannerWithScreenshot(transcript: rescuedPartial)
+                        self.sendTranscriptToPlannerWithScreenshot(transcript: rescuedPartial, origin: .local)
                         return
                     }
                     print("⚠️ Transcript didn't arrive within 12s — resetting state")

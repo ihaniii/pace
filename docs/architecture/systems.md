@@ -45,6 +45,20 @@ responsibilities live in [`../development/key-files.md`](../development/key-file
   number and in time). It cannot read state from, send on behalf of, or close
   the authenticated session; the session is replaced only after the
   replacement has authenticated.
+- A paired iPad is authenticated, not trusted with local privileges. Every turn
+  carries a `PaceTurnOrigin` on its lease, assigned where the input was
+  accepted: `.local`, or `.remoteCompanion` bound to a session identity the Mac
+  mints when a connection authenticates (never the iPad-chosen wire session
+  identifier). For a remote turn: the privileged pre-planner voice commands
+  (watch mode, always-listening, meeting recording, memory preferences,
+  scheduling, background agents, automations, Shortcuts, skills, recorded
+  flows, saved sites, dictation) are refused with a fixed answer; every action
+  plan needs the approval alert on the Mac, including the routine actions a
+  local turn runs without one; and the turn always runs on the legacy engine.
+  A remote turn ends when its session ends, and its reply is delivered only to
+  that session — never to a replacement. A remote turn still receives the same
+  screen, selection, and memory context as a local one; whether that should be
+  narrowed is an open product decision.
 - The iPad sends ordinary utterance audio and semantic presence events. JPEG
   bytes are sent only in response to an expiring `camera_frame_request` created
   by the conservative explicit physical-scene request parser. Pause or camera
